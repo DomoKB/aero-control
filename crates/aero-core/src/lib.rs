@@ -36,7 +36,10 @@ pub use mode::{
     custom_prefix, fan_point_writes, gaming_script, normal_script, quiet_script, script_for,
     FanMode, ModeScript, PlannedWrite,
 };
-pub use preset::{builtin_config, curve_from_percent, presets, Preset, PresetKind};
+pub use preset::{
+    builtin_config, curve_from_percent, factory_curve, gcc_floor_raw, presets, Preset, PresetKind,
+    FACTORY_YB_CHIP_RAW, FACTORY_YB_PERCENT,
+};
 pub use profile::{Config, CurvePointToml, Profile};
 pub use scale::{clamp_fixed_duty, percent_to_raw, raw_to_percent, DUTY_MAX, FIXED_FLOOR_PERCENT};
 

@@ -33,25 +33,65 @@ notes = "One duty for both fans. Floor is 35% unless expert_mode is true."
 [[profiles]]
 name = "Deep Control"
 fan_mode = "custom"
-provisional = true
-notes = "PROVISIONAL stand-in. Control Center does not publish the factory Deep Control points."
+provisional = false
+notes = "Control Center Default for YB-family models (DeepFan.dll setDefault_Click), matching GetFanIndexValue 0..14 on this AERO 17 YB (P77YB, BIOS FB10). Upload rounds percent half-up; the chip stores Control Center's truncation, so 30% is raw 69 here and raw 68 on the chip."
 
 [[profiles.curve]]
-temp_c = 45
+temp_c = 0
+duty_percent = 25
+
+[[profiles.curve]]
+temp_c = 50
+duty_percent = 30
+
+[[profiles.curve]]
+temp_c = 53
 duty_percent = 35
 
 [[profiles.curve]]
-temp_c = 60
+temp_c = 56
+duty_percent = 40
+
+[[profiles.curve]]
+temp_c = 59
 duty_percent = 45
 
 [[profiles.curve]]
-temp_c = 75
+temp_c = 62
+duty_percent = 50
+
+[[profiles.curve]]
+temp_c = 65
+duty_percent = 55
+
+[[profiles.curve]]
+temp_c = 68
 duty_percent = 60
 
 [[profiles.curve]]
-temp_c = 85
+temp_c = 71
+duty_percent = 65
+
+[[profiles.curve]]
+temp_c = 74
+duty_percent = 70
+
+[[profiles.curve]]
+temp_c = 77
+duty_percent = 75
+
+[[profiles.curve]]
+temp_c = 80
 duty_percent = 80
 
 [[profiles.curve]]
-temp_c = 90
+temp_c = 83
+duty_percent = 85
+
+[[profiles.curve]]
+temp_c = 86
+duty_percent = 90
+
+[[profiles.curve]]
+temp_c = 89
 duty_percent = 100

@@ -32,9 +32,9 @@ cargo run -p aero-gui
 
 `--mock` prints a JSON dump of a fake AERO 17 YB. `setters_invoked` is 0. RPM values in the fixture are byte-swapped on the wire; the report shows raw, swapped, and the decoded RPM.
 
-The GUI is a mock. Status refresh only calls getters. **Upload curve** and the firmware-mode buttons run the real command sequences against that mock, including the 15-slot upload and the readback.
+On Linux the GUI is a mock (`--mock` is forced). Status refresh only calls getters. **Upload** and the firmware-mode tiles run the real command sequences against that mock, including the 15-slot upload and the readback.
 
-`cargo check --workspace --target x86_64-pc-windows-gnu` and the same command for `x86_64-pc-windows-msvc` both typecheck, including the Windows WMI backend. That backend uses `wmi` 0.14's `exec_method_native_wrapper` (this crate's name for `IWbemServices::ExecMethod`: class object, method signature, spawned in-params, `VT_UI1`, then exec). Newer `wmi` releases rename it to `exec_method`; 0.18 does not typecheck against the `windows` crates this workspace resolves.
+`cargo check --workspace --target x86_64-pc-windows-gnu` and the same command for `x86_64-pc-windows-msvc` both typecheck, including the Windows WMI backend. Calls go to the first WMI instance path, with `NULL` in-params when a method has no inputs, and integer width taken from the CIM signature. The `wmi` crate stays on 0.14; 0.18 does not typecheck against the `windows` crates this workspace resolves.
 
 ## Windows
 
@@ -92,15 +92,16 @@ That MOF only declares a few setters. The probe wants the full getter class, whi
 | Max | Both fans raw **229** | Duty 229 and the fixed-mode shape |
 | Fixed | Same shape as Max, with your duty | Floor is 35% (raw 80) unless the profile sets `expert_mode` |
 | Upload curve | Full 15-slot write, then readback | Sequence is the §5.1 bugfix |
+| Factory / Deep Control | YB default custom curve | DeepFan `setDefault_Click` and this laptop's `GetFanIndexValue` |
 
-Editor curves (Silent, Balanced, Performance, Max-ish, Deep Control) are **provisional stand-ins**. Control Center's manual does not publish the factory Deep Control points. They are not loaded into the EC until you press **Upload curve**.
+The curve editor opens on that factory table. **Reset to Factory** reloads it into the editor and does not send it. **Upload** is what writes the EC. Percents round half up, so 30% is raw 69. Control Center truncates, and this chip currently stores raw 68 for that point. Readback is exact, so uploading the rounded table can miss by one count and then restore firmware auto. The difference is listed in [docs/SOURCES.md](docs/SOURCES.md).
 
 What the upload does, and Control Center does not:
 
 - Sends all 15 slots in order. Unused slots are `(0, 0)`, which is the terminator, so an old point cannot linger after it.
 - Reads every slot back with `GetFanIndexValue`. One mismatch retries the whole upload once, then restores firmware auto.
 - Clears auto, fixed, the current step, and (if the method exists) the custom cap before the points. Control Center's apply path skipped `SetCurrentFanStep(0)` and never cleared that cap.
-- Rounds percent ↔ raw half up. 50% is raw 115. Control Center truncates 50% to 114 (`50 * 229 / 100`).
+- Rounds percent ↔ raw half up. 50% is raw 115, and 30% is raw 69. Control Center truncates (`percent * 229 / 100`), so those two are 114 and 68 on this chip.
 - Rejects a `(0, 0)` point anywhere in the curve, including the middle, because the firmware treats it as the end of the table.
 
 Pasting `HKLM\SOFTWARE\Gigabyte\SmartManager\CustomFanTable` into the curve tab parses it. On a Windows build, **Read CustomFanTable from the registry** opens that key read-only. Nothing in this repo writes the Gigabyte registry.
@@ -109,11 +110,12 @@ Profiles are TOML. `profiles/config.toml` binds Gaming to AC and Quiet to DC. `c
 
 ## What is still stubbed
 
-- The GUI and the service are not connected to a live EC. `WindowsReader` / `WindowsWriter` in `aero-wmi` are compiled only for Windows and are what the probe (reader) and a later apply path use.
 - No Windows service, no named pipe, no SDDL, no resume listener. `aero-svc` dispatches the same apply engine in-process and exits if you run the binary. Power-event re-apply is implemented and tested; nothing yet subscribes to `WM_POWERBROADCAST`.
-- No tray icon, global hotkey, XTU/PL1/PL2 bridge, charge-limit or GPU WMI writes, MOF installer, or GCC coexistence wizard.
+- No tray icon, global hotkey, XTU/PL1/PL2 bridge, charge-limit or GPU WMI writes, MOF installer, or GCC coexistence wizard. The Power and Battery pages only say those fields are stored and not sent.
 - `SetDeepFan` (the old 5-point call) and `TurnOffFan` are known and never called. `TurnOffFan` is refused if something asks for it.
 
-## Suggested next step
+## On the laptop
 
-Run `aero-probe.exe` from an elevated shell on the AERO 17 YB and keep the JSON. That shows which getters exist, whether RPM bytes are actually swapped, and what `GetFanIndexValue` returns for indexes 0..14. Then one supervised write: Max, read the flags back, restore auto. After that, point the GUI at `WindowsWriter` instead of the mock.
+Rebuild after this tree. The GUI manifest asks for administrator (`/MANIFESTUAC:NO` so the linker does not also embed `asInvoker`). `aero-probe.exe --diag` prints method signatures and the instance path, then still calls only getters. The window shows **REAL** when it is talking to the EC and **MOCK** with `--mock`. A process that is not elevated stays read-only.
+
+The first supervised write is still **Test: Max for 10 s**. Uploading Factory will not bit-match the current chip table where rounding and truncation disagree; the upload then restores auto. That is the documented difference, not a second curve.

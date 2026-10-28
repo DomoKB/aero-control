@@ -473,12 +473,12 @@ mod tests {
     use super::*;
     use crate::curve::CurvePoint;
     use crate::percent_to_raw;
-    use crate::preset::curve_from_percent;
+    use crate::preset::factory_curve;
     use aero_wmi::{CountPacer, MockAcpi, NoPacer, WriteParams};
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     fn sample() -> FanCurve {
-        curve_from_percent(&[(45, 35), (60, 45), (75, 60), (85, 80), (90, 100)])
+        factory_curve()
     }
 
     fn methods(mock: &MockAcpi) -> Vec<String> {
@@ -504,7 +504,8 @@ mod tests {
             assert_eq!(params[1], ("Temperture".to_string(), slots[index].0));
             assert_eq!(params[2], ("Value".to_string(), slots[index].1));
         }
-        assert!(slots[5..].iter().all(|slot| *slot == (0, 0)));
+        assert!(slots.iter().all(|slot| *slot != (0, 0)));
+        assert_eq!(slots[1], (50, percent_to_raw(30)));
         assert_eq!(mock.calls_named("GetFanIndexValue").count(), 15);
         assert_eq!(pacer.pauses, mock.calls.len() - 1);
         assert_eq!(mock.auto, 0);
@@ -551,7 +552,7 @@ mod tests {
         assert_eq!(report.attempts, 2);
         assert!(!report.restored_auto);
         assert_eq!(mock.calls_named("SetFanIndexValue").count(), 30);
-        assert_eq!(mock.curve[0], (45, percent_to_raw(35)));
+        assert_eq!(mock.curve[0], (0, percent_to_raw(25)));
     }
 
     #[test]

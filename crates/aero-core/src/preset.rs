@@ -1,8 +1,8 @@
-//! Built-in Control Center modes and editor curves.
+//! Built-in Control Center modes and the YB factory fan curve.
 //!
-//! Firmware modes send a WMI script. Curve presets are custom tables. Where
-//! the factory points were not published, the curve is a safe stand-in and
-//! `provisional` is set. Those points are not a dump of Control Center.
+//! Quiet, Normal, Gaming, and Max are firmware switches, not curves. Control
+//! Center ships one default custom curve per model family. This crate only
+//! includes the YB table.
 
 use crate::curve::{CurvePoint, FanCurve};
 use crate::mode::FanMode;
@@ -63,47 +63,41 @@ pub fn presets() -> Vec<Preset> {
             kind: PresetKind::Fixed { duty_percent: 50 },
         },
         curve_preset(
-            "deep-control",
-            "Deep Control",
-            true,
-            "PROVISIONAL. Control Center's manual describes a 15-point Deep Control editor and does not publish the factory points. The 46°C / 44% sentence in that manual is an example of a broken rule, not a default. This stand-in is the Balanced curve.",
-            &BALANCED,
-        ),
-        curve_preset(
-            "silent",
-            "Silent",
-            true,
-            "PROVISIONAL editor curve. It still obeys the 85°C and last-point floors, so it will not stay quiet once the CPU is hot.",
-            &SILENT,
-        ),
-        curve_preset(
-            "balanced",
-            "Balanced",
-            true,
-            "PROVISIONAL editor curve. Not a Control Center dump.",
-            &BALANCED,
-        ),
-        curve_preset(
-            "performance",
-            "Performance",
-            true,
-            "PROVISIONAL editor curve shaped like a gaming table. The Gaming button does not upload this; Upload curve does.",
-            &PERFORMANCE,
-        ),
-        curve_preset(
-            "max-ish",
-            "Max-ish",
-            true,
-            "PROVISIONAL aggressive custom table. Firmware Max is the Max button, which sends raw 229 rather than this curve.",
-            &MAXISH,
+            "factory",
+            "Factory",
+            false,
+            FACTORY_NOTES,
+            FACTORY_YB_PERCENT,
         ),
     ]
 }
 
-const SILENT: &[(u8, u8)] = &[(55, 35), (70, 40), (80, 48), (85, 55), (90, 80)];
-const BALANCED: &[(u8, u8)] = &[(45, 35), (60, 45), (75, 60), (85, 80), (90, 100)];
-const PERFORMANCE: &[(u8, u8)] = &[(40, 40), (55, 55), (70, 75), (80, 90), (90, 100)];
-const MAXISH: &[(u8, u8)] = &[(35, 55), (50, 70), (65, 85), (75, 95), (90, 100)];
+/// Control Center `setDefault_Click` for model names containing `yb`.
+/// Confirmed by `GetFanIndexValue` 0..14 on AERO 17 YB P77YB BIOS FB10.
+pub const FACTORY_YB_PERCENT: &[(u8, u8)] = &[
+    (0, 25),
+    (50, 30),
+    (53, 35),
+    (56, 40),
+    (59, 45),
+    (62, 50),
+    (65, 55),
+    (68, 60),
+    (71, 65),
+    (74, 70),
+    (77, 75),
+    (80, 80),
+    (83, 85),
+    (86, 90),
+    (89, 100),
+];
+
+/// Raw duty bytes read from that laptop. They are `floor(percent * 229 / 100)`.
+pub const FACTORY_YB_CHIP_RAW: &[u8] = &[
+    57, 68, 80, 91, 103, 114, 125, 137, 148, 160, 171, 183, 194, 206, 229,
+];
+
+const FACTORY_NOTES: &str = "Control Center Default for YB-family models (DeepFan.dll setDefault_Click), matching GetFanIndexValue 0..14 on this AERO 17 YB (P77YB, BIOS FB10). Quiet, Normal, Gaming, and Max are firmware switches, not curves. Upload rounds percent half-up; the chip currently stores Control Center's truncation, so 30% is raw 69 here and raw 68 on the chip.";
 
 fn curve_preset(
     id: &'static str,
@@ -119,6 +113,16 @@ fn curve_preset(
         notes,
         kind: PresetKind::Curve(curve_from_percent(points)),
     }
+}
+
+pub fn factory_curve() -> FanCurve {
+    curve_from_percent(FACTORY_YB_PERCENT)
+}
+
+/// Control Center truncates percent to the 0–229 duty byte.
+pub fn gcc_floor_raw(percent: u8) -> u8 {
+    let percent = u16::from(percent.min(100));
+    ((percent * 229) / 100) as u8
 }
 
 pub fn curve_from_percent(points: &[(u8, u8)]) -> FanCurve {
@@ -140,7 +144,11 @@ pub fn builtin_config() -> Config {
         profiles: presets()
             .into_iter()
             .map(|preset| Profile {
-                name: preset.name.to_string(),
+                name: if preset.id == "factory" {
+                    "Deep Control".to_string()
+                } else {
+                    preset.name.to_string()
+                },
                 fan_mode: match &preset.kind {
                     PresetKind::Firmware(mode) => *mode,
                     PresetKind::Fixed { .. } => FanMode::Fixed,
@@ -184,26 +192,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_builtin_curve_validates_and_unconfirmed_ones_are_marked() {
+    fn factory_curve_is_the_only_custom_preset_and_is_confirmed() {
         let presets = presets();
-        assert!(presets
+        let curves: Vec<_> = presets
             .iter()
-            .any(|preset| preset.id == "deep-control" && preset.provisional));
-        assert!(presets
+            .filter(|preset| matches!(preset.kind, PresetKind::Curve(_)))
+            .collect();
+        assert_eq!(curves.len(), 1);
+        assert_eq!(curves[0].id, "factory");
+        assert!(!curves[0].provisional);
+        assert!(presets.iter().any(|preset| preset.id == "quiet" && preset.provisional));
+        assert!(presets.iter().any(|preset| preset.id == "normal" && !preset.provisional));
+        let curve = factory_curve();
+        assert_eq!(curve.points().len(), 15);
+        assert!(curve
+            .points()
             .iter()
-            .any(|preset| preset.id == "quiet" && preset.provisional));
-        assert!(presets
-            .iter()
-            .any(|preset| preset.id == "normal" && !preset.provisional));
-        for preset in &presets {
-            if let PresetKind::Curve(curve) = &preset.kind {
-                assert!(preset.provisional, "{}", preset.id);
-                assert!(curve
-                    .points()
-                    .iter()
-                    .all(|point| !(point.temp_c == 0 && point.duty_raw == 0)));
-            }
+            .all(|point| !(point.temp_c == 0 && point.duty_raw == 0)));
+        for ((temp, percent), chip) in FACTORY_YB_PERCENT.iter().zip(FACTORY_YB_CHIP_RAW) {
+            assert_eq!(gcc_floor_raw(*percent), *chip, "{temp}°C");
         }
+        assert_eq!(percent_to_raw(30), 69);
+        assert_eq!(gcc_floor_raw(30), 68);
+        assert_eq!(curve.points()[1].duty_raw, 69);
+        assert_eq!(curve.points()[1].temp_c, 50);
     }
 
     #[test]
@@ -214,9 +226,10 @@ mod tests {
         assert_eq!(parsed.dc_profile.as_deref(), Some("Quiet"));
         let deep = parsed.profile("Deep Control").unwrap();
         assert_eq!(deep.fan_mode, FanMode::Custom);
-        assert!(deep.provisional);
+        assert!(!deep.provisional);
         let curve = deep.fan_curve().unwrap();
-        assert_eq!(curve.points().len(), BALANCED.len());
-        assert_eq!(curve.points()[0].duty_raw, percent_to_raw(35));
+        assert_eq!(curve.points().len(), FACTORY_YB_PERCENT.len());
+        assert_eq!(curve.points()[0].duty_raw, percent_to_raw(25));
+        assert_eq!(curve.points()[1].duty_raw, percent_to_raw(30));
     }
 }

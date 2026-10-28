@@ -198,19 +198,21 @@ mod tests {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../profiles");
         let config =
             Config::from_toml(&std::fs::read_to_string(root.join("config.toml")).unwrap()).unwrap();
-        assert!(config.profile("Deep Control").unwrap().fan_curve().is_ok());
-        assert!(config.profile("Deep Control").unwrap().provisional);
-        for name in [
-            "silent.toml",
-            "balanced.toml",
-            "performance.toml",
-            "max-ish.toml",
-            "pairs.toml",
-        ] {
-            let profile =
-                Profile::from_toml(&std::fs::read_to_string(root.join(name)).unwrap()).unwrap();
-            assert!(profile.fan_curve().is_ok(), "{name}");
-            assert!(profile.provisional, "{name}");
-        }
+        let deep = config.profile("Deep Control").unwrap();
+        assert!(!deep.provisional);
+        let curve = deep.fan_curve().unwrap();
+        assert_eq!(curve.points().len(), 15);
+        assert_eq!(curve.points()[1].temp_c, 50);
+        assert_eq!(curve.points()[1].duty_raw, crate::percent_to_raw(30));
+        assert!(std::fs::read_dir(&root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .all(|entry| {
+                let name = entry.file_name().to_string_lossy().to_string();
+                !matches!(
+                    name.as_str(),
+                    "silent.toml" | "balanced.toml" | "performance.toml" | "max-ish.toml" | "pairs.toml"
+                )
+            }));
     }
 }

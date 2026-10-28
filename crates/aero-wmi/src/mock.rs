@@ -68,7 +68,7 @@ impl MockAcpi {
     /// values, not a recording from that laptop.
     pub fn aero_17_yb_fixture() -> Self {
         let mut curve = [(0, 0); FAN_CURVE_SLOTS];
-        // Provisional balanced table, raw duties from round(percent * 229 / 100).
+        // Probe fixture table. Not the YB factory curve.
         let points = [(45, 80), (60, 103), (75, 137), (85, 183), (90, 229)];
         for (slot, point) in curve.iter_mut().zip(points) {
             *slot = point;

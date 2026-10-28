@@ -47,8 +47,9 @@ fn main() -> Result<(), eframe::Error> {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("aero-control")
-            .with_inner_size([1120.0, 760.0])
-            .with_min_inner_size([760.0, 560.0]),
+            .with_inner_size([1280.0, 820.0])
+            .with_min_inner_size([880.0, 620.0])
+            .with_icon(app_icon()),
         ..Default::default()
     };
     eframe::run_native(
@@ -58,4 +59,44 @@ fn main() -> Result<(), eframe::Error> {
     )?;
     let _ = ExitCode::SUCCESS;
     Ok(())
+}
+
+fn app_icon() -> egui::IconData {
+    const N: u32 = 64;
+    let mut rgba = vec![0u8; (N * N * 4) as usize];
+    let cx = 31.5_f32;
+    let cy = 31.5_f32;
+    for y in 0..N {
+        for x in 0..N {
+            let dx = x as f32 - cx;
+            let dy = y as f32 - cy;
+            let d = (dx * dx + dy * dy).sqrt();
+            let i = ((y * N + x) * 4) as usize;
+            if d > 30.0 {
+                continue;
+            }
+            rgba[i] = 16;
+            rgba[i + 1] = 22;
+            rgba[i + 2] = 28;
+            rgba[i + 3] = 255;
+            if (d - 22.0).abs() < 2.4 || d < 5.0 {
+                rgba[i] = 64;
+                rgba[i + 1] = 196;
+                rgba[i + 2] = 168;
+            }
+            let sector = dy.atan2(dx).rem_euclid(std::f32::consts::TAU / 3.0);
+            let blade =
+                (sector - std::f32::consts::TAU / 6.0).abs() < 0.32 && (7.0..20.0).contains(&d);
+            if blade {
+                rgba[i] = 236;
+                rgba[i + 1] = 242;
+                rgba[i + 2] = 240;
+            }
+        }
+    }
+    egui::IconData {
+        rgba,
+        width: N,
+        height: N,
+    }
 }

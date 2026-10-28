@@ -35,7 +35,29 @@ That packing is the Linux WMBC selector (`0x68`), which is a different entry poi
 
 ## Mode names
 
-The Control Center quick-start manual names Normal, Gaming, Quiet, Customize (fixed or max), and Deep Control (15 points). It does not publish the factory Deep Control numbers. The "46°C / 44%" sentence there is an example of a rule violation, not a default curve.
+The Control Center quick-start manual names Normal, Gaming, Quiet, Customize (fixed or max), and Deep Control (15 points). The "46°C / 44%" sentence there is an example of a rule violation, not a default curve.
+
+The factory custom curve for model names containing `yb` (the same branch as `xa` / `va` / `ya` and the rest of that family) is the `setDefault_Click` table in DeepFan.dll. On this AERO 17 YB (P77YB, BIOS FB10), `GetFanIndexValue` 0..14 returned the same temperatures with duty bytes equal to `floor(percent * 229 / 100)`:
+
+| °C | % | Chip raw | aero-control raw |
+|---|---|---|---|
+| 0 | 25 | 57 | 57 |
+| 50 | 30 | 68 | 69 |
+| 53 | 35 | 80 | 80 |
+| 56 | 40 | 91 | 92 |
+| 59 | 45 | 103 | 103 |
+| 62 | 50 | 114 | 115 |
+| 65 | 55 | 125 | 126 |
+| 68 | 60 | 137 | 137 |
+| 71 | 65 | 148 | 149 |
+| 74 | 70 | 160 | 160 |
+| 77 | 75 | 171 | 172 |
+| 80 | 80 | 183 | 183 |
+| 83 | 85 | 194 | 195 |
+| 86 | 90 | 206 | 206 |
+| 89 | 100 | 229 | 229 |
+
+Quiet, Normal, Gaming, and Max are firmware switches, not other curves. Control Center ships this one default custom table per model family. aero-control keeps half-up rounding, so an upload of the percent table will not bit-match the chip's truncated bytes (30% is raw 69 here and raw 68 on the chip). Readback compares the raw byte, so that one-count difference restores firmware auto.
 
 ## What is provisional
 
@@ -45,15 +67,15 @@ The Control Center quick-start manual names Normal, Gaming, Quiet, Customize (fi
 | Gaming's fan script matching Normal | The Aero 16 Gaming trace uses the same fan flags as Creator/Normal. The gaming change there is Dynamic Boost / `NvPowerConfig`, which is not applied yet. AERO 17 YB DeepFan may differ. |
 | `SetFanAdjustStatus(0)` and `SetSuperQuiet(0)` as extra clears | Defensive. Not part of the scope's three-call restore tail. |
 | `SetFanCustomStatus` | Named in the scope, absent from the Aero 16 MOF. |
-| Silent, Balanced, Performance, Max-ish, and the Deep Control stand-in | No published factory point list. They are safe curves that pass validation, not a Control Center dump. |
 | `CustomFanTable` byte layouts | The registry path is from the scope. The binary layouts are inferred and labelled in the parser warnings. |
-| Stair-step drawing | The chip may step or it may interpolate. The plot draws steps until a diagnostic log says otherwise. |
-| Curve index base `0..14` | Matches the Linux driver. Confirm with the probe's `GetFanIndexValue` dump on this laptop. |
+| Stair-step drawing | The editor draws the duty holding until the next temperature. Whether the EC interpolates is not separately confirmed. |
 
 ## Confirmed enough to send
 
 - Normal / restore tail: `SetFixedFanStatus 0`, `SetStepFanStatus 0`, `SetAutoFanStatus 1` (scope), plus `SetCurrentFanStep 0` (scope §5.1 and the Aero 16 traces).
 - Max / fixed shape: auto off, fixed off then on, step on, `SetFixedFanSpeed` and `SetGPUFanDuty`. Max uses 229.
 - Custom upload: clear auto and fixed, `SetCurrentFanStep 0`, `SetStepFanStatus 1`, then all 15 `SetFanIndexValue` calls, then `GetFanIndexValue` for every slot.
-- Percent conversion rounds half up. 50% is raw 115, not the truncated 114.
+- Percent conversion rounds half up. 50% is raw 115, not the truncated 114. 30% is raw 69, not the chip's 68.
+- Curve index base `0..14` on this P77YB: `GetFanIndexValue` returned the 15 factory points above.
+- The YB factory percent table is the DeepFan `setDefault_Click` default, not a guessed curve.
 - A `(0, 0)` point is rejected anywhere in a user curve because it terminates the table.
