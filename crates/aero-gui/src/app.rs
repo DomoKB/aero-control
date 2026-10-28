@@ -17,6 +17,9 @@ use eframe::egui::{
 
 use crate::session::{BackendChoice, FanSession, SensorSnapshot};
 
+mod keyboard;
+use keyboard::KeyboardTab;
+
 const PLOT_X_END: f64 = 100.0;
 const HISTORY_SECS: f64 = 60.0;
 
@@ -58,6 +61,7 @@ pub struct AeroApp {
     started: Instant,
     active_mode: Option<FanMode>,
     pending_mode: Option<FanMode>,
+    keyboard: KeyboardTab,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -66,6 +70,7 @@ enum Page {
     Curve,
     Power,
     Battery,
+    Keyboard,
     Log,
 }
 
@@ -125,6 +130,7 @@ impl History {
 impl AeroApp {
     pub fn new(cc: &eframe::CreationContext<'_>, choice: BackendChoice) -> Self {
         install_theme(&cc.egui_ctx);
+        let keyboard = KeyboardTab::new(matches!(choice, BackendChoice::Mock));
 
         let points = aero_core::factory_curve().points().to_vec();
         let issues = issues(&points);
@@ -180,6 +186,7 @@ impl AeroApp {
             started: Instant::now(),
             active_mode,
             pending_mode: None,
+            keyboard,
         }
     }
 
@@ -315,6 +322,13 @@ impl eframe::App for AeroApp {
                         Page::Curve => self.curve_ui(ui),
                         Page::Power => self.power_ui(ui),
                         Page::Battery => self.battery_ui(ui),
+                        Page::Keyboard => {
+                            self.keyboard.ui(ui);
+                            if let Some((text, error)) = self.keyboard.new_status() {
+                                self.report = text;
+                                self.report_error = error;
+                            }
+                        }
                         Page::Log => self.log_ui(ui),
                     });
             });
@@ -380,6 +394,7 @@ impl AeroApp {
             ("Curve", Page::Curve),
             ("Power", Page::Power),
             ("Battery", Page::Battery),
+            ("Keyboard", Page::Keyboard),
             ("Log", Page::Log),
         ] {
             nav_item(ui, label, self.page == page, &mut self.page, page);

@@ -10,6 +10,7 @@ description = "egui status view and fan-curve editor for aero-control"
 [dependencies]
 aero-core = { path = "../aero-core" }
 aero-wmi = { path = "../aero-wmi" }
+aero-kbd = { path = "../aero-kbd" }
 eframe = "0.29"
 egui_plot = "0.29"
 

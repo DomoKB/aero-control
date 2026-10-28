@@ -131,11 +131,19 @@ name = "aero-gui"
 version = "0.1.0"
 dependencies = [
  "aero-core",
+ "aero-kbd",
  "aero-wmi",
  "eframe",
  "egui_plot",
  "windows 0.59.0",
  "winresource",
+]
+
+[[package]]
+name = "aero-kbd"
+version = "0.1.0"
+dependencies = [
+ "windows 0.59.0",
 ]
 
 [[package]]
