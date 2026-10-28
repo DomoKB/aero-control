@@ -1,29 +1,29 @@
 //! Windows `GB_WMIACPI` backend.
 //!
-//! `wmi` 0.14 calls `IWbemServices::ExecMethod` through
-//! [`WMIConnection::exec_method_native_wrapper`]. That function loads the
-//! class (`GetObject`), loads the method signature (`GetMethod`), spawns an
-//! in-parameter instance, `Put`s each value, and executes. We pass
-//! [`Variant::UI1`], which the crate converts with `VARIANT::from(u8)` —
-//! `VT_UI1`, matching the MOF's `uint8` parameters.
-//!
-//! A class-level call is tried first. On failure the same call is repeated
-//! against the first instance path. `method_class` stays the class name so
-//! `GetMethod` still resolves.
+//! Calls go to an **instance** path (`__PATH` from `CreateInstanceEnum` /
+//! `GetInstances`), never the class path. The AERO 17 YB returns
+//! `0x8004102F` (`WBEM_E_INVALID_METHOD_PARAMETERS`) for class-path calls.
+//! Methods whose signature has no non-system in-params are executed with a
+//! NULL in-params pointer. When in-params exist, each value is coerced from
+//! the signature's CIM type and `Put` with that CIM type.
 //!
 //! `WindowsReader` only ever executes methods on `GB_WMIACPI_Get`.
-//! `WindowsWriter` is the only type that touches `GB_WMIACPI_Set`, and it is
-//! compiled out unless the `writer` feature is on.
-//!
-//! The process has to be elevated. The crate initialises COM with
-//! impersonation (`RPC_C_IMP_LEVEL_IMPERSONATE`). .NET's `EnablePrivileges`
-//! flag has no separate switch here.
+//! `WindowsWriter` is the only type that touches `GB_WMIACPI_Set`.
+#![allow(unsafe_code)]
 
 use std::collections::HashMap;
 
+use windows::core::{BSTR, HSTRING, PCWSTR};
+use windows::Win32::System::Variant::VARIANT;
+use windows::Win32::System::Wmi::{
+    IWbemClassObject, IWbemContext, WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY,
+    WBEM_GENERIC_FLAG_TYPE, WBEM_INFINITE,
+};
 use wmi::result_enumerator::IWbemClassWrapper;
 use wmi::{COMLibrary, Variant, WMIConnection};
 
+use crate::cim::{cim_type_name, coerce_byte, pass_null_inparams, CoercedInt};
+use crate::diag::{AcpiDiag, MethodSignature, ParamField};
 use crate::error::WmiError;
 use crate::read::{refuse_setter, AcpiReader, ClassStatus};
 use crate::sku::{SkuInfo, SkuSource};
@@ -36,6 +36,8 @@ use crate::write::{refuse_forbidden, AcpiWriter, SetOutcome, WriteParams};
 pub struct WindowsReader {
     wmi: WMIConnection,
     cimv2: WMIConnection,
+    /// Class name → `__PATH` (or `__RELPATH`) of the first instance.
+    instance_paths: HashMap<String, String>,
 }
 
 impl WindowsReader {
@@ -47,6 +49,7 @@ impl WindowsReader {
         Ok(Self {
             wmi: connect(WMI_NAMESPACE, com)?,
             cimv2: connect(r"ROOT\CIMV2", com)?,
+            instance_paths: HashMap::new(),
         })
     }
 }
@@ -72,7 +75,28 @@ impl AcpiReader for WindowsReader {
 
     fn get(&mut self, method: &str, params: &[(&str, u8)]) -> Result<WmiOutput, WmiError> {
         refuse_setter(method)?;
-        exec(&self.wmi, GET_CLASS, method, params)
+        invoke(
+            &self.wmi,
+            &mut self.instance_paths,
+            GET_CLASS,
+            method,
+            params,
+        )
+    }
+}
+
+impl AcpiDiag for WindowsReader {
+    fn method_signature(&mut self, class: &str, method: &str) -> Result<MethodSignature, WmiError> {
+        let path = instance_path(&self.wmi, &mut self.instance_paths, class)?;
+        let class_obj = load_class(&self.wmi, class)?;
+        let (in_params, out_params) = signature_fields(&class_obj, method)?;
+        Ok(MethodSignature {
+            class: class.to_string(),
+            method: method.to_string(),
+            instance_path: path,
+            in_params,
+            out_params,
+        })
     }
 }
 
@@ -154,7 +178,13 @@ impl AcpiWriter for WindowsWriter {
         refuse_forbidden(method)?;
         let pairs = params.pairs();
         let refs: Vec<(&str, u8)> = pairs.iter().map(|(name, value)| (*name, *value)).collect();
-        match exec(&self.inner.wmi, SET_CLASS, method, &refs) {
+        match invoke(
+            &self.inner.wmi,
+            &mut self.inner.instance_paths,
+            SET_CLASS,
+            method,
+            &refs,
+        ) {
             Ok(_) => Ok(SetOutcome { threw: None }),
             // A delivered call that WMI rejected. The EC often still applies it.
             Err(WmiError::CallFailed { detail, .. }) => Ok(SetOutcome {
@@ -172,30 +202,272 @@ impl SkuSource for WindowsWriter {
     }
 }
 
-fn exec(
+fn invoke(
     conn: &WMIConnection,
+    paths: &mut HashMap<String, String>,
     class: &str,
     method: &str,
     params: &[(&str, u8)],
 ) -> Result<WmiOutput, WmiError> {
-    let in_params = ui1_params(params);
-    match conn.exec_method_native_wrapper(class, class, method, in_params.clone()) {
-        Ok(output) => convert_output(method, output),
-        Err(class_err) => match first_instance_path(conn, class)? {
-            Some(path) => match conn.exec_method_native_wrapper(class, &path, method, in_params) {
-                Ok(output) => convert_output(method, output),
-                Err(err) => Err(map_method_error(method, err)),
-            },
-            None => Err(map_method_error(method, class_err)),
-        },
+    let path = instance_path(conn, paths, class)?;
+    let class_obj = load_class(conn, class)?;
+    let (in_fields, _) = signature_fields(&class_obj, method)?;
+    let in_params = if pass_null_inparams(in_fields.len()) {
+        None
+    } else {
+        let sig = in_signature(&class_obj, method)?;
+        let spawned = unsafe { sig.SpawnInstance(0) }.map_err(|err| WmiError::CallFailed {
+            method: method.to_string(),
+            detail: format!("SpawnInstance on {path}: {err}"),
+        })?;
+        for (name, value) in params {
+            let Some(field) = in_fields
+                .iter()
+                .find(|field| field.name.eq_ignore_ascii_case(name))
+            else {
+                continue;
+            };
+            put_byte(&spawned, name, *value, field.cim_type).map_err(|err| {
+                WmiError::CallFailed {
+                    method: method.to_string(),
+                    detail: format!("Put {name} ({}) on {path}: {err}", field.cim_type_name),
+                }
+            })?;
+        }
+        Some(spawned)
+    };
+    let mut output = None;
+    let exec = unsafe {
+        conn.svc.ExecMethod(
+            &BSTR::from(path.as_str()),
+            &BSTR::from(method),
+            WBEM_GENERIC_FLAG_TYPE(0),
+            None::<&IWbemContext>,
+            in_params.as_ref(),
+            Some(&mut output),
+            None,
+        )
+    };
+    exec.map_err(|err| map_method_error(method, format!("{err} (instance {path})")))?;
+    convert_output(method, output.map(IWbemClassWrapper::new))
+}
+
+fn instance_path(
+    conn: &WMIConnection,
+    paths: &mut HashMap<String, String>,
+    class: &str,
+) -> Result<String, WmiError> {
+    if let Some(path) = paths.get(class) {
+        return Ok(path.clone());
+    }
+    let path =
+        enumerate_instance_path(conn, class).or_else(|_| query_instance_path(conn, class))?;
+    paths.insert(class.to_string(), path.clone());
+    Ok(path)
+}
+
+fn enumerate_instance_path(conn: &WMIConnection, class: &str) -> Result<String, WmiError> {
+    let flags = WBEM_GENERIC_FLAG_TYPE(WBEM_FLAG_FORWARD_ONLY.0 | WBEM_FLAG_RETURN_IMMEDIATELY.0);
+    let enumerator = unsafe {
+        conn.svc
+            .CreateInstanceEnum(&BSTR::from(class), flags, None::<&IWbemContext>)
+    }
+    .map_err(|err| WmiError::CallFailed {
+        method: class.to_string(),
+        detail: format!("CreateInstanceEnum: {err}"),
+    })?;
+    let mut batch = [None];
+    let mut returned = 0u32;
+    let hr = unsafe { enumerator.Next(WBEM_INFINITE, &mut batch, &mut returned) };
+    if hr.is_err() || returned == 0 {
+        return Err(WmiError::CallFailed {
+            method: class.to_string(),
+            detail: format!("CreateInstanceEnum returned no {class} instance ({hr:?})"),
+        });
+    }
+    let object = batch[0].take().ok_or_else(|| WmiError::CallFailed {
+        method: class.to_string(),
+        detail: format!("CreateInstanceEnum returned an empty {class} slot"),
+    })?;
+    read_path_property(&object, "__PATH")
+        .or_else(|| read_path_property(&object, "__RELPATH"))
+        .ok_or_else(|| WmiError::CallFailed {
+            method: class.to_string(),
+            detail: format!("{class} instance has no __PATH or __RELPATH"),
+        })
+}
+
+fn query_instance_path(conn: &WMIConnection, class: &str) -> Result<String, WmiError> {
+    let query = format!("SELECT __PATH, __RELPATH, InstanceName FROM {class}");
+    let rows = conn
+        .raw_query::<HashMap<String, Variant>>(&query)
+        .map_err(|err| WmiError::CallFailed {
+            method: class.to_string(),
+            detail: err.to_string(),
+        })?;
+    let row = rows.first().ok_or_else(|| WmiError::CallFailed {
+        method: class.to_string(),
+        detail: format!("{class} query returned no instances"),
+    })?;
+    row_string(row, "__PATH")
+        .or_else(|| row_string(row, "__Path"))
+        .or_else(|| row_string(row, "__RELPATH"))
+        .or_else(|| row_string(row, "__Relpath"))
+        .or_else(|| {
+            row_string(row, "InstanceName").map(|name| format!("{class}.InstanceName=\"{name}\""))
+        })
+        .ok_or_else(|| WmiError::CallFailed {
+            method: class.to_string(),
+            detail: format!("{class} row had no path property"),
+        })
+}
+
+fn load_class(conn: &WMIConnection, class: &str) -> Result<IWbemClassObject, WmiError> {
+    let mut object = None;
+    unsafe {
+        conn.svc.GetObject(
+            &BSTR::from(class),
+            WBEM_GENERIC_FLAG_TYPE(0),
+            None::<&IWbemContext>,
+            Some(&mut object),
+            None,
+        )
+    }
+    .map_err(|err| WmiError::ClassMissing {
+        class: class.to_string(),
+        detail: err.to_string(),
+    })?;
+    object.ok_or_else(|| WmiError::ClassMissing {
+        class: class.to_string(),
+        detail: "GetObject returned no class".to_string(),
+    })
+}
+
+fn signature_fields(
+    class_obj: &IWbemClassObject,
+    method: &str,
+) -> Result<(Vec<ParamField>, Vec<ParamField>), WmiError> {
+    let (in_sig, out_sig) = method_signatures(class_obj, method)?;
+    let in_params = match &in_sig {
+        Some(sig) => fields_of(sig)?,
+        None => Vec::new(),
+    };
+    let out_params = match &out_sig {
+        Some(sig) => fields_of(sig)?,
+        None => Vec::new(),
+    };
+    Ok((in_params, out_params))
+}
+
+fn in_signature(class_obj: &IWbemClassObject, method: &str) -> Result<IWbemClassObject, WmiError> {
+    let (in_sig, _) = method_signatures(class_obj, method)?;
+    in_sig.ok_or_else(|| WmiError::CallFailed {
+        method: method.to_string(),
+        detail: "method has no in-signature to spawn".to_string(),
+    })
+}
+
+fn method_signatures(
+    class_obj: &IWbemClassObject,
+    method: &str,
+) -> Result<(Option<IWbemClassObject>, Option<IWbemClassObject>), WmiError> {
+    let mut in_sig = None;
+    let mut out_sig = None;
+    let name = wide(method);
+    unsafe {
+        class_obj.GetMethod(
+            PCWSTR::from_raw(name.as_ptr()),
+            0,
+            &mut in_sig,
+            &mut out_sig,
+        )
+    }
+    .map_err(|err| map_method_error(method, err))?;
+    Ok((in_sig, out_sig))
+}
+
+fn fields_of(sig: &IWbemClassObject) -> Result<Vec<ParamField>, WmiError> {
+    let wrapper = IWbemClassWrapper::new(sig.clone());
+    let names = wrapper
+        .list_properties()
+        .map_err(|err| WmiError::CallFailed {
+            method: "signature".to_string(),
+            detail: err.to_string(),
+        })?;
+    let mut fields = Vec::new();
+    for name in names {
+        let cim_type = cim_type_of(sig, &name).unwrap_or(0);
+        fields.push(ParamField {
+            cim_type_name: cim_type_name(cim_type).to_string(),
+            name,
+            cim_type,
+        });
+    }
+    Ok(fields)
+}
+
+fn cim_type_of(object: &IWbemClassObject, name: &str) -> Result<i32, WmiError> {
+    let wide_name = wide(name);
+    let mut value = VARIANT::default();
+    let mut cim_type = 0i32;
+    unsafe {
+        object.Get(
+            PCWSTR::from_raw(wide_name.as_ptr()),
+            0,
+            &mut value,
+            Some(&mut cim_type),
+            None,
+        )
+    }
+    .map_err(|err| WmiError::CallFailed {
+        method: name.to_string(),
+        detail: err.to_string(),
+    })?;
+    Ok(cim_type)
+}
+
+fn put_byte(object: &IWbemClassObject, name: &str, value: u8, cim_type: i32) -> Result<(), String> {
+    let coerced = coerce_byte(value, cim_type);
+    let variant = match coerced {
+        CoercedInt::Ui1(byte) => VARIANT::from(byte),
+        CoercedInt::I2(number) => VARIANT::from(number),
+        CoercedInt::I4(number) => VARIANT::from(number),
+    };
+    let wide_name = wide(name);
+    unsafe {
+        object.Put(
+            PCWSTR::from_raw(wide_name.as_ptr()),
+            0,
+            &variant,
+            crate::cim::cim_base(cim_type),
+        )
+    }
+    .map_err(|err| err.to_string())
+}
+
+fn read_path_property(object: &IWbemClassObject, name: &str) -> Option<String> {
+    let wide_name = wide(name);
+    let mut value = VARIANT::default();
+    let mut cim_type = 0i32;
+    unsafe {
+        object
+            .Get(
+                PCWSTR::from_raw(wide_name.as_ptr()),
+                0,
+                &mut value,
+                Some(&mut cim_type),
+                None,
+            )
+            .ok()?;
+    }
+    match Variant::from_variant(&value).ok()? {
+        Variant::String(text) if !text.is_empty() => Some(text),
+        _ => None,
     }
 }
 
-fn ui1_params(params: &[(&str, u8)]) -> HashMap<String, Variant> {
-    params
-        .iter()
-        .map(|(name, value)| ((*name).to_string(), Variant::UI1(*value)))
-        .collect()
+fn wide(text: &str) -> HSTRING {
+    HSTRING::from(text)
 }
 
 fn convert_output(method: &str, output: Option<IWbemClassWrapper>) -> Result<WmiOutput, WmiError> {
@@ -244,17 +516,6 @@ fn parse_number_string(text: &str) -> Option<WmiNumber> {
     } else {
         Some(WmiNumber::U32(value))
     }
-}
-
-fn first_instance_path(conn: &WMIConnection, class: &str) -> Result<Option<String>, WmiError> {
-    let query = format!("SELECT __Path FROM {class}");
-    let rows = match conn.raw_query::<HashMap<String, Variant>>(&query) {
-        Ok(rows) => rows,
-        Err(_) => return Ok(None),
-    };
-    Ok(rows
-        .first()
-        .and_then(|row| row_string(row, "__Path").or_else(|| row_string(row, "__PATH"))))
 }
 
 fn first_row(conn: &WMIConnection, query: &str) -> Option<HashMap<String, Variant>> {

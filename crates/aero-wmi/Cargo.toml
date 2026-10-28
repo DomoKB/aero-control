@@ -19,9 +19,13 @@ thiserror = "1"
 tracing = "0.1"
 
 [target.'cfg(windows)'.dependencies]
-# 0.14 is the last release whose `windows` dependency typechecks in this
-# workspace. Its ExecMethod entry point is `exec_method_native_wrapper`
-# (newer releases rename that to `exec_method`). It still does
-# GetObject → GetMethod → SpawnInstance → Put(VT_UI1) → ExecMethod.
+# 0.14 is the release that typechecks here. Calls do not use its
+# exec_method_native_wrapper: that helper spawns an empty in-params object
+# and can target the class path, which this laptop rejects with 0x8004102F.
 wmi = "0.14"
+windows = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Variant",
+    "Win32_System_Wmi",
+] }
 serde_json = "1"

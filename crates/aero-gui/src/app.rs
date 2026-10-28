@@ -1,23 +1,25 @@
 //! Status view and curve editor.
 //!
-//! The window talks to [`aero_wmi::MockAcpi`]. Sensor refreshes only call
-//! getters. Uploading a curve or a firmware mode goes through `aero-core`,
-//! which writes the embedded-controller commands and reads them back. There is
-//! no loop that turns a temperature into a duty.
+//! On Windows the default backend is `WindowsWriter`. `--mock` and non-Windows
+//! builds keep the fake controller. Sensor refreshes only call getters.
 
 use aero_core::{
-    apply_mode, constrain_drag, insert_point, issues, parse_custom_fan_table_text, presets,
-    remove_point, stair_polyline, upload_curve, CurveIssue, CurvePoint, FanCurve, FanMode,
-    PresetKind,
+    constrain_drag, insert_point, issues, parse_custom_fan_table_text, presets, remove_point,
+    stair_polyline, CurveIssue, CurvePoint, FanCurve, FanMode, PresetKind,
 };
-use aero_wmi::{decode_rpm, AcpiReader, MockAcpi, NoPacer, RpmOrder};
 use eframe::egui;
 use egui_plot::{Line, Plot, PlotPoints, Points, VLine};
+
+use crate::session::{BackendChoice, FanSession, SensorSnapshot};
 
 const PLOT_X_END: f64 = 100.0;
 
 pub struct AeroApp {
-    backend: MockAcpi,
+    session: FanSession,
+    busy: bool,
+    report_error: bool,
+    sensor_error: Option<String>,
+    arm_max_test: bool,
     tab: Tab,
     points: Vec<CurvePoint>,
     issues: Vec<CurveIssue>,
@@ -47,7 +49,7 @@ struct Sensors {
 }
 
 impl AeroApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>, choice: BackendChoice) -> Self {
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = egui::Color32::from_rgb(16, 20, 26);
         visuals.window_fill = egui::Color32::from_rgb(22, 27, 34);
@@ -57,8 +59,37 @@ impl AeroApp {
             aero_core::curve_from_percent(&[(45, 35), (60, 45), (75, 60), (85, 80), (90, 100)]);
         let points = curve.points().to_vec();
         let issues = issues(&points);
-        let mut app = Self {
-            backend: MockAcpi::aero_17_yb_fixture(),
+        let session = FanSession::start(choice);
+        let report = session.banner.clone().unwrap_or_else(|| {
+            format!(
+                "{} backend. Log: {}",
+                session.backend_label, session.log_path
+            )
+        });
+        let mut sensors = Sensors {
+            cpu: "—".into(),
+            gpu: "—".into(),
+            gpu2: "—".into(),
+            rpm1: "—".into(),
+            rpm2: "—".into(),
+            flags: "—".into(),
+        };
+        let mut sensor_error = None;
+        if let Some(snapshot) = session.initial_sensors.clone() {
+            sensor_error = snapshot.error.clone();
+            sensors.cpu = snapshot.cpu;
+            sensors.gpu = snapshot.gpu;
+            sensors.gpu2 = snapshot.gpu2;
+            sensors.rpm1 = snapshot.rpm1;
+            sensors.rpm2 = snapshot.rpm2;
+            sensors.flags = snapshot.flags;
+        }
+        let app = Self {
+            session,
+            busy: false,
+            report_error: false,
+            sensor_error,
+            arm_max_test: false,
             tab: Tab::Status,
             points,
             issues,
@@ -68,106 +99,123 @@ impl AeroApp {
             arm_max: false,
             import_text: "45,35;60,45;0,0;85,80;90,100".to_string(),
             import_note: String::new(),
-            report: "Mock backend. Nothing has been sent to a laptop.".to_string(),
-            sensors: Sensors {
-                cpu: "—".into(),
-                gpu: "—".into(),
-                gpu2: "—".into(),
-                rpm1: "—".into(),
-                rpm2: "—".into(),
-                flags: "—".into(),
-            },
+            report,
+            sensors,
         };
-        app.refresh_sensors();
         app
     }
 
-    fn refresh_sensors(&mut self) {
-        self.sensors.cpu = read_temp(&mut self.backend, "getCpuTemp");
-        self.sensors.gpu = read_temp(&mut self.backend, "getGpuTemp1");
-        self.sensors.gpu2 = read_temp(&mut self.backend, "getGpuTemp2");
-        self.sensors.rpm1 = read_rpm(&mut self.backend, "getRpm1");
-        self.sensors.rpm2 = read_rpm(&mut self.backend, "getRpm2");
-        self.sensors.flags = format!(
-            "auto {} · fixed {} · step {} · super quiet {} · adjust {}",
-            read_flag(&mut self.backend, "GetAutoFanStatus"),
-            read_flag(&mut self.backend, "GetFixedFanStatus"),
-            read_flag(&mut self.backend, "GetStepFanStatus"),
-            read_flag(&mut self.backend, "GetSuperQuiet"),
-            read_flag(&mut self.backend, "GetFanAdjustStatus"),
-        );
+    fn poll_session(&mut self) {
+        while let Some(event) = self.session.poll() {
+            self.busy = event.busy;
+            if let Some(snapshot) = event.sensors {
+                self.apply_snapshot(snapshot);
+            }
+            if let Some(message) = event.message {
+                self.report = message;
+                self.report_error = event.error;
+            }
+        }
+    }
+
+    fn apply_snapshot(&mut self, snapshot: SensorSnapshot) {
+        self.sensors.cpu = snapshot.cpu;
+        self.sensors.gpu = snapshot.gpu;
+        self.sensors.gpu2 = snapshot.gpu2;
+        self.sensors.rpm1 = snapshot.rpm1;
+        self.sensors.rpm2 = snapshot.rpm2;
+        self.sensors.flags = snapshot.flags;
+        self.sensor_error = snapshot.error;
     }
 
     fn recompute(&mut self) {
         self.issues = issues(&self.points);
     }
 
+    fn writes_allowed(&self) -> bool {
+        self.session.writes_enabled && !self.busy
+    }
+
     fn apply_firmware(&mut self, mode: FanMode) {
-        let raw = aero_core::percent_to_raw(self.fixed_percent);
-        match apply_mode(&mut self.backend, &mut NoPacer, mode, raw, self.expert) {
-            Ok(report) => {
-                self.report = format!(
-                    "{mode:?} applied in {} attempt(s). {}",
-                    report.attempts,
-                    report.warnings.join(" ")
-                );
-            }
-            Err(err) => self.report = err.to_string(),
+        if !self.writes_allowed() {
+            self.report = if self.busy {
+                "A firmware command is already running.".to_string()
+            } else {
+                "Fan writes are off. Run aero-gui as Administrator.".to_string()
+            };
+            self.report_error = true;
+            return;
         }
+        let raw = aero_core::percent_to_raw(self.fixed_percent);
+        self.busy = true;
+        self.session.apply(mode, raw, self.expert);
         self.arm_max = false;
-        self.refresh_sensors();
+        self.arm_max_test = false;
     }
 
     fn upload(&mut self) {
+        if !self.writes_allowed() {
+            self.report = "Curve upload needs an elevated aero-gui.".to_string();
+            self.report_error = true;
+            return;
+        }
         match FanCurve::try_new(self.points.clone()) {
-            Ok(curve) => match upload_curve(&mut self.backend, &mut NoPacer, &curve) {
-                Ok(report) => {
-                    self.report = format!(
-                        "Uploaded all 15 slots and the readback matched ({} attempt(s)). {}",
-                        report.attempts,
-                        report.warnings.join(" ")
-                    );
-                }
-                Err(err) => self.report = err.to_string(),
-            },
+            Ok(curve) => {
+                self.busy = true;
+                self.session.upload(curve.points().to_vec());
+            }
             Err(issues) => {
                 self.issues = issues;
                 self.report = "Upload stayed disabled: the curve is not valid.".to_string();
+                self.report_error = true;
             }
         }
-        self.refresh_sensors();
     }
 }
 
 impl eframe::App for AeroApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(std::time::Duration::from_secs(2));
-        if ctx.input(|input| input.time) > 0.0 && ctx.input(|input| input.stable_dt) > 0.0 {
-            // The repaint is display-only. Refresh reads getters and does not set a duty.
-        }
+        self.poll_session();
+        ctx.request_repaint_after(std::time::Duration::from_millis(400));
         egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("aero-control");
-                ui.label("AERO 17 YB · mock embedded controller");
+                let (label, color) = if self.session.backend_label == "REAL" {
+                    if self.session.writes_enabled {
+                        ("REAL", egui::Color32::from_rgb(120, 200, 140))
+                    } else {
+                        ("REAL · read-only", egui::Color32::from_rgb(220, 170, 90))
+                    }
+                } else {
+                    ("MOCK", egui::Color32::from_rgb(140, 170, 210))
+                };
+                ui.colored_label(color, label);
                 ui.selectable_value(&mut self.tab, Tab::Status, "Status");
                 ui.selectable_value(&mut self.tab, Tab::Curve, "Fan curve");
             });
-            ui.label("Fans are firmware-controlled. This window never runs a software fan loop.");
+            ui.label(
+                "Fans are firmware-controlled. Sensor reads are display only and never set a duty.",
+            );
+            if let Some(banner) = &self.session.banner {
+                ui.colored_label(egui::Color32::from_rgb(220, 140, 90), banner);
+            }
         });
         egui::TopBottomPanel::bottom("disclaimer").show(ctx, |ui| {
             ui.small("Thermal shutdown still belongs to the CPU, GPU, and embedded controller (PROCHOT and GPU slowdown). aero-control validates curves and restores firmware auto if an upload fails. Quiet, Gaming, and the editor curves are marked provisional where the factory values were not published.");
-            ui.label(self.report.as_str());
+            if self.report_error {
+                ui.colored_label(egui::Color32::from_rgb(220, 120, 110), self.report.as_str());
+            } else {
+                ui.label(self.report.as_str());
+            }
+            if let Some(error) = &self.sensor_error {
+                ui.colored_label(egui::Color32::from_rgb(220, 120, 110), error);
+            }
+            ui.small(format!("WMI log: {}", self.session.log_path));
         });
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Status => self.status_ui(ui),
             Tab::Curve => self.curve_ui(ui),
         });
-
-        // Re-read sensors on a timer without writing. `request_repaint_after` above
-        // schedules the next frame; the reads happen every frame the timer fires.
-        if ctx.input(|input| input.time).fract() < 0.05 {
-            self.refresh_sensors();
-        }
     }
 }
 
@@ -185,20 +233,30 @@ impl AeroApp {
         ui.add_space(12.0);
         ui.label("Firmware modes");
         ui.horizontal_wrapped(|ui| {
-            if ui.button("Normal").clicked() {
-                self.apply_firmware(FanMode::Normal);
-            }
-            if ui.button("Quiet (Super Quiet)").clicked() {
-                self.apply_firmware(FanMode::Quiet);
-            }
-            if ui.button("Gaming").clicked() {
-                self.apply_firmware(FanMode::Gaming);
-            }
-            if ui.button("Restore auto").clicked() {
+            let allow = self.writes_allowed();
+            if ui.add_enabled(allow, egui::Button::new("Normal")).clicked() {
                 self.apply_firmware(FanMode::Normal);
             }
             if ui
-                .button(if self.arm_max { "Confirm Max" } else { "Max" })
+                .add_enabled(allow, egui::Button::new("Quiet (Super Quiet)"))
+                .clicked()
+            {
+                self.apply_firmware(FanMode::Quiet);
+            }
+            if ui.add_enabled(allow, egui::Button::new("Gaming")).clicked() {
+                self.apply_firmware(FanMode::Gaming);
+            }
+            if ui
+                .add_enabled(self.writes_allowed(), egui::Button::new("Restore auto"))
+                .clicked()
+            {
+                self.apply_firmware(FanMode::Normal);
+            }
+            if ui
+                .add_enabled(
+                    allow,
+                    egui::Button::new(if self.arm_max { "Confirm Max" } else { "Max" }),
+                )
                 .clicked()
             {
                 if self.arm_max {
@@ -213,14 +271,38 @@ impl AeroApp {
         ui.horizontal(|ui| {
             ui.label("Fixed duty");
             ui.add(egui::Slider::new(&mut self.fixed_percent, 0..=100).suffix("%"));
-            if ui.button("Apply fixed").clicked() {
+            if ui
+                .add_enabled(self.writes_allowed(), egui::Button::new("Apply fixed"))
+                .clicked()
+            {
                 self.apply_firmware(FanMode::Fixed);
             }
             ui.checkbox(&mut self.expert, "Expert floor override");
         });
-        ui.label("Fixed mode stays at or above 35% (raw 80) unless expert is on. Gaming's firmware fan flags match Normal until an AERO 17 YB probe says otherwise.");
-        if ui.button("Refresh sensors").clicked() {
-            self.refresh_sensors();
+        ui.label("Fixed mode stays at or above 35% (raw 80) unless expert is on. Closing the window restores firmware auto if the last command was Fixed or Max.");
+        if ui
+            .add_enabled(
+                self.writes_allowed(),
+                egui::Button::new(if self.arm_max_test {
+                    "Confirm: Max for 10 s then Auto"
+                } else {
+                    "Test: Max for 10 s then restore Auto"
+                }),
+            )
+            .clicked()
+        {
+            if self.arm_max_test {
+                self.busy = true;
+                self.session.max_test();
+                self.arm_max_test = false;
+                self.arm_max = false;
+            } else {
+                self.arm_max_test = true;
+                self.report =
+                    "This sets both fans to raw 229 for 10 seconds, then restores firmware auto. Click the confirm button."
+                        .to_string();
+                self.report_error = false;
+            }
         }
     }
 
@@ -469,43 +551,4 @@ fn stat(ui: &mut egui::Ui, title: &str, value: &str) {
         ui.label(title);
         ui.heading(value);
     });
-}
-
-fn read_temp(reader: &mut MockAcpi, method: &str) -> String {
-    match reader.get(method, &[]) {
-        Ok(output) => output
-            .get("Data")
-            .and_then(|value| value.as_u32())
-            .map(|temp| format!("{temp}°C"))
-            .unwrap_or_else(|| "—".to_string()),
-        Err(_) => "—".to_string(),
-    }
-}
-
-fn read_rpm(reader: &mut MockAcpi, method: &str) -> String {
-    match reader.get(method, &[]) {
-        Ok(output) => match output.get("Data").and_then(|value| value.as_u32()) {
-            Some(raw) => {
-                let reading = decode_rpm(raw, RpmOrder::AutoPreferSwap);
-                if reading.ambiguous {
-                    format!("{} RPM (ambiguous)", reading.rpm)
-                } else {
-                    format!("{} RPM", reading.rpm)
-                }
-            }
-            None => "—".to_string(),
-        },
-        Err(_) => "—".to_string(),
-    }
-}
-
-fn read_flag(reader: &mut MockAcpi, method: &str) -> String {
-    match reader.get(method, &[]) {
-        Ok(output) => output
-            .get("Data")
-            .and_then(|value| value.as_u32())
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "?".to_string()),
-        Err(_) => "?".to_string(),
-    }
 }

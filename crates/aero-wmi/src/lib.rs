@@ -11,7 +11,9 @@
 #![deny(unsafe_code)]
 
 mod catalog;
+mod cim;
 mod decode;
+mod diag;
 mod error;
 mod mock;
 mod pace;
@@ -26,7 +28,9 @@ mod write;
 mod platform;
 
 pub use catalog::{MethodSpec, GETTERS, NEVER_CALL, SETTERS};
+pub use cim::{cim_type_name, coerce_byte, pass_null_inparams, CoercedInt, CIM_UINT8};
 pub use decode::{decode_fan_index, decode_rpm, swap_u16, FanIndexReading, RpmOrder, RpmReading};
+pub use diag::{AcpiDiag, MethodSignature, ParamField};
 pub use error::WmiError;
 pub use mock::MockAcpi;
 pub use pace::{CountPacer, FixedPacer, NoPacer, Pacer, WMI_PACE};

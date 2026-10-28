@@ -16,7 +16,7 @@ crates/aero-core/    Modes, curve rules, TOML profiles, upload and restore
 crates/aero-proto/   Versioned JSON messages for a future pipe
 crates/aero-svc/     Dispatch for that pipe. The Windows service host is not wired.
 crates/aero-probe/   Getter-only capability dump. The writer feature is off.
-crates/aero-gui/     egui status view and curve editor, on the mock
+crates/aero-gui/     egui status view and curve editor (real WMI on Windows, mock otherwise)
 profiles/            Example TOML profiles
 ```
 
@@ -46,7 +46,20 @@ cargo build --release -p aero-probe
 .\target\release\aero-probe.exe
 ```
 
-`cargo build --release -p aero-gui` builds the same mock UI. It does not open the real EC yet.
+`cargo build --release -p aero-gui` embeds an administrator manifest. Launch the exe from an elevated shell (or accept the UAC prompt). The window shows **REAL** and talks to `GB_WMIACPI` on the instance path. `--mock` keeps the fake controller. If the process is not elevated, the window stays read-only and says so.
+
+Every WMI call is appended to `%ProgramData%\AeroCtl\logs\aero-control.log` (or `logs` next to the exe). Closing the window restores firmware auto when the last command was Fixed or Max.
+
+The first supervised write is **Test: Max for 10 s then restore Auto**.
+
+```powershell
+cargo build --release -p aero-probe
+.\target\release\aero-probe.exe --diag
+cargo build --release -p aero-gui
+.\target\release\aero-gui.exe
+```
+
+`--diag` prints each getter and setter signature (names and CIM types) and the instance path, then still calls only getters.
 
 Useful probe flags:
 

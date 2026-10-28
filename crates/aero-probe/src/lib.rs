@@ -7,9 +7,9 @@
 use std::collections::BTreeMap;
 
 use aero_wmi::{
-    decode_fan_index, decode_rpm, is_setter_name, AcpiReader, ClassStatus, FanIndexReading,
-    MethodSpec, Pacer, RpmOrder, RpmReading, SkuInfo, SkuSource, WmiNumber, WmiOutput,
-    FAN_CURVE_SLOTS, GETTERS, GET_CLASS, SETTERS, SET_CLASS,
+    decode_fan_index, decode_rpm, is_setter_name, AcpiDiag, AcpiReader, ClassStatus,
+    FanIndexReading, MethodSignature, MethodSpec, Pacer, RpmOrder, RpmReading, SkuInfo, SkuSource,
+    WmiNumber, WmiOutput, FAN_CURVE_SLOTS, GETTERS, GET_CLASS, SETTERS, SET_CLASS,
 };
 use serde::Serialize;
 
@@ -28,6 +28,8 @@ pub struct ProbeReport {
     pub gpu_temp2_c: Option<u32>,
     pub curve: Vec<FanIndexReading>,
     pub setters_not_called: Vec<&'static str>,
+    /// Populated by `--diag`. Signatures only; setters are not executed.
+    pub diag: Vec<MethodSignature>,
     pub note: &'static str,
 }
 
@@ -52,9 +54,14 @@ pub struct GetterCall {
     pub properties: BTreeMap<String, WmiNumber>,
 }
 
-pub fn run_probe<R, P>(reader: &mut R, pacer: &mut P, rpm_order: RpmOrder) -> ProbeReport
+pub fn run_probe<R, P>(
+    reader: &mut R,
+    pacer: &mut P,
+    rpm_order: RpmOrder,
+    diag: bool,
+) -> ProbeReport
 where
-    R: AcpiReader + SkuSource,
+    R: AcpiReader + SkuSource + AcpiDiag,
     P: Pacer,
 {
     let mof_get = class_report(reader, GET_CLASS);
@@ -69,6 +76,16 @@ where
             error: Some(err.to_string()),
         },
     };
+
+    let mut signatures = Vec::new();
+    if diag {
+        for spec in GETTERS {
+            signatures.push(read_signature(reader, GET_CLASS, spec.name));
+        }
+        for spec in SETTERS {
+            signatures.push(read_signature(reader, SET_CLASS, spec.name));
+        }
+    }
 
     let mut getters = Vec::new();
     let mut started = false;
@@ -101,7 +118,25 @@ where
         curve: curve_from(&getters),
         getters,
         setters_not_called: SETTERS.iter().map(|spec| spec.name).collect(),
-        note: "getter only; no GB_WMIACPI_Set method was invoked",
+        diag: signatures,
+        note: "getter only; calls use the instance path and NULL in-params when the signature has none",
+    }
+}
+
+fn read_signature<R: AcpiDiag>(reader: &mut R, class: &str, method: &str) -> MethodSignature {
+    match reader.method_signature(class, method) {
+        Ok(signature) => signature,
+        Err(err) => MethodSignature {
+            class: class.to_string(),
+            method: method.to_string(),
+            instance_path: String::new(),
+            in_params: Vec::new(),
+            out_params: vec![aero_wmi::ParamField {
+                name: format!("error: {err}"),
+                cim_type: 0,
+                cim_type_name: "empty".to_string(),
+            }],
+        },
     }
 }
 
@@ -218,7 +253,8 @@ mod tests {
     #[test]
     fn probe_never_calls_a_setter_and_decodes_swapped_rpm() {
         let mut mock = MockAcpi::aero_17_yb_fixture();
-        let report = run_probe(&mut mock, &mut NoPacer, RpmOrder::AutoPreferSwap);
+        let report = run_probe(&mut mock, &mut NoPacer, RpmOrder::AutoPreferSwap, false);
+        assert!(report.diag.is_empty());
         assert_eq!(report.setters_invoked, 0);
         assert!(mock.calls.iter().all(|call| !is_setter_name(&call.method)));
         assert!(mock.calls.iter().all(|call| call.class == GET_CLASS));
@@ -248,5 +284,30 @@ mod tests {
             Some("AERO 17 YB")
         );
         assert!(report.fan_flags.get("GetAutoFanStatus").unwrap().is_some());
+    }
+
+    #[test]
+    fn diag_lists_signatures_without_calling_setters() {
+        let mut mock = MockAcpi::aero_17_yb_fixture();
+        let report = run_probe(&mut mock, &mut NoPacer, RpmOrder::AutoPreferSwap, true);
+        assert_eq!(report.setters_invoked, 0);
+        assert!(mock.calls.iter().all(|call| !is_setter_name(&call.method)));
+        let cpu = report
+            .diag
+            .iter()
+            .find(|sig| sig.method == "getCpuTemp")
+            .unwrap();
+        assert!(cpu.in_params.is_empty());
+        assert!(cpu.instance_path.contains("mock:"));
+        let index = report
+            .diag
+            .iter()
+            .find(|sig| sig.method == "GetFanIndexValue")
+            .unwrap();
+        assert_eq!(index.in_params[0].name, "Index");
+        assert!(report
+            .diag
+            .iter()
+            .any(|sig| sig.method == "SetFanIndexValue"));
     }
 }

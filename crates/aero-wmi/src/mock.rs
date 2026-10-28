@@ -9,7 +9,9 @@ use std::collections::HashSet;
 
 use crate::sku::{SkuInfo, SkuSource};
 
-use crate::catalog::find_getter;
+use crate::catalog::{find_getter, GETTERS, SETTERS};
+use crate::cim::{cim_type_name, CIM_UINT8};
+use crate::diag::{AcpiDiag, MethodSignature, ParamField};
 use crate::error::WmiError;
 use crate::read::{refuse_setter, AcpiReader, ClassStatus};
 use crate::value::{WmiNumber, WmiOutput};
@@ -251,6 +253,30 @@ impl AcpiWriter for MockAcpi {
             .contains(method)
             .then(|| "WBEM error (mock: write was still applied)".to_string());
         Ok(SetOutcome { threw })
+    }
+}
+
+impl AcpiDiag for MockAcpi {
+    fn method_signature(&mut self, class: &str, method: &str) -> Result<MethodSignature, WmiError> {
+        let spec = GETTERS
+            .iter()
+            .chain(SETTERS.iter())
+            .find(|spec| spec.name == method)
+            .ok_or_else(|| WmiError::MethodNotFound {
+                method: method.to_string(),
+            })?;
+        let field = |name: &str| ParamField {
+            name: name.to_string(),
+            cim_type: CIM_UINT8,
+            cim_type_name: cim_type_name(CIM_UINT8).to_string(),
+        };
+        Ok(MethodSignature {
+            class: class.to_string(),
+            method: method.to_string(),
+            instance_path: format!("mock:{class}.InstanceName=\"fixture\""),
+            in_params: spec.inputs.iter().copied().map(field).collect(),
+            out_params: spec.outputs.iter().copied().map(field).collect(),
+        })
     }
 }
 

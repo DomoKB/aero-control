@@ -9,11 +9,13 @@ use aero_wmi::{MockAcpi, NoPacer, RpmOrder, SkuSource};
 fn main() -> ExitCode {
     let mut mock = false;
     let mut pace = true;
+    let mut diag = false;
     let mut rpm_order = RpmOrder::AutoPreferSwap;
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--mock" => mock = true,
+            "--diag" => diag = true,
             "--no-pace" => pace = false,
             "--rpm-order" => {
                 let Some(value) = args.next() else {
@@ -41,7 +43,7 @@ fn main() -> ExitCode {
     if mock {
         let mut device = MockAcpi::aero_17_yb_fixture();
         let _ = device.read_sku();
-        let report = run_probe(&mut device, &mut NoPacer, rpm_order);
+        let report = run_probe(&mut device, &mut NoPacer, rpm_order, diag);
         return finish(report);
     }
 
@@ -56,16 +58,16 @@ fn main() -> ExitCode {
             }
         };
         if pace {
-            let report = run_probe(&mut reader, &mut FixedPacer::standard(), rpm_order);
+            let report = run_probe(&mut reader, &mut FixedPacer::standard(), rpm_order, diag);
             return finish(report);
         }
-        let report = run_probe(&mut reader, &mut NoPacer, rpm_order);
+        let report = run_probe(&mut reader, &mut NoPacer, rpm_order, diag);
         return finish(report);
     }
 
     #[cfg(not(windows))]
     {
-        let _ = pace;
+        let _ = (pace, diag);
         eprintln!("this build has no Windows WMI backend.");
         eprintln!("pass --mock to dump the AERO 17 YB fixture, or build aero-probe on Windows.");
         ExitCode::from(2)
@@ -108,9 +110,10 @@ fn print_help() {
     eprintln!(
         "aero-probe — getter-only GB_WMIACPI dump\n\
          \n\
-         aero-probe [--mock] [--no-pace] [--rpm-order auto-swap|auto-native|swap|native]\n\
+         aero-probe [--mock] [--diag] [--no-pace] [--rpm-order auto-swap|auto-native|swap|native]\n\
          \n\
          On Windows, run from an elevated shell. The probe never calls a setter.\n\
+         --diag adds each method's in/out CIM signature and the instance path.\n\
          Real hardware calls are spaced 500 ms apart unless --no-pace is set.\n\
          --mock works on Linux and does not touch WMI."
     );
