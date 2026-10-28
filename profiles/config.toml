@@ -1,0 +1,57 @@
+active = "Normal"
+ac_profile = "Gaming"
+dc_profile = "Quiet"
+
+[[profiles]]
+name = "Quiet"
+fan_mode = "quiet"
+provisional = true
+notes = "PROVISIONAL. Firmware Super Quiet. Auto is left on; see docs/SOURCES.md."
+
+[[profiles]]
+name = "Normal"
+fan_mode = "normal"
+notes = "Firmware automatic fan control."
+
+[[profiles]]
+name = "Gaming"
+fan_mode = "gaming"
+provisional = true
+notes = "PROVISIONAL. Fan commands match Normal until an AERO 17 YB probe shows a distinct gaming script."
+
+[[profiles]]
+name = "Max"
+fan_mode = "max"
+notes = "Both fans at raw 229."
+
+[[profiles]]
+name = "Fixed"
+fan_mode = "fixed"
+fixed_duty_percent = 50
+notes = "One duty for both fans. Floor is 35% unless expert_mode is true."
+
+[[profiles]]
+name = "Deep Control"
+fan_mode = "custom"
+provisional = true
+notes = "PROVISIONAL stand-in. Control Center does not publish the factory Deep Control points."
+
+[[profiles.curve]]
+temp_c = 45
+duty_percent = 35
+
+[[profiles.curve]]
+temp_c = 60
+duty_percent = 45
+
+[[profiles.curve]]
+temp_c = 75
+duty_percent = 60
+
+[[profiles.curve]]
+temp_c = 85
+duty_percent = 80
+
+[[profiles.curve]]
+temp_c = 90
+duty_percent = 100

@@ -1,0 +1,14 @@
+[package]
+name = "aero-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "egui status view and fan-curve editor for aero-control"
+
+[dependencies]
+aero-core = { path = "../aero-core" }
+aero-wmi = { path = "../aero-wmi" }
+eframe = "0.29"
+egui_plot = "0.29"

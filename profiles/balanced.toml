@@ -1,0 +1,24 @@
+name = "Balanced"
+fan_mode = "custom"
+provisional = true
+notes = "PROVISIONAL editor curve. Not a Control Center dump."
+
+[[curve]]
+temp_c = 45
+duty_percent = 35
+
+[[curve]]
+temp_c = 60
+duty_percent = 45
+
+[[curve]]
+temp_c = 75
+duty_percent = 60
+
+[[curve]]
+temp_c = 85
+duty_percent = 80
+
+[[curve]]
+temp_c = 90
+duty_percent = 100

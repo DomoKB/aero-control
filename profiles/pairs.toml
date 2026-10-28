@@ -1,0 +1,5 @@
+name = "Pairs example"
+fan_mode = "deep-control"
+provisional = true
+notes = "Percent pairs. Raw duty is round(percent * 229 / 100), not the truncation Control Center uses."
+curve_pairs = [[45, 35], [60, 45], [75, 60], [85, 80], [90, 100]]

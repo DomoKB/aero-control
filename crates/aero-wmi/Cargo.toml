@@ -1,0 +1,27 @@
+[package]
+name = "aero-wmi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "GB_WMIACPI get/set transport for aero-control, with a hardware-free mock"
+
+[features]
+# The writer talks to GB_WMIACPI_Set. aero-probe leaves this off so the
+# probe binary does not contain a setter implementation.
+default = ["writer"]
+writer = []
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+thiserror = "1"
+tracing = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+# 0.14 is the last release whose `windows` dependency typechecks in this
+# workspace. Its ExecMethod entry point is `exec_method_native_wrapper`
+# (newer releases rename that to `exec_method`). It still does
+# GetObject → GetMethod → SpawnInstance → Put(VT_UI1) → ExecMethod.
+wmi = "0.14"
+serde_json = "1"

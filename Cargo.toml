@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/aero-wmi",
+    "crates/aero-core",
+    "crates/aero-proto",
+    "crates/aero-svc",
+    "crates/aero-probe",
+    "crates/aero-gui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+rust-version = "1.85"

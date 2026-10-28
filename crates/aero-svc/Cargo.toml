@@ -1,0 +1,14 @@
+[package]
+name = "aero-svc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+description = "Apply-engine entry points for the future Windows service"
+
+[dependencies]
+aero-core = { path = "../aero-core" }
+aero-proto = { path = "../aero-proto" }
+aero-wmi = { path = "../aero-wmi" }
+thiserror = "1"

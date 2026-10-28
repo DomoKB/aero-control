@@ -1,0 +1,24 @@
+name = "Performance"
+fan_mode = "custom"
+provisional = true
+notes = "PROVISIONAL gaming-shaped custom table. The Gaming firmware button does not upload it."
+
+[[curve]]
+temp_c = 40
+duty_percent = 40
+
+[[curve]]
+temp_c = 55
+duty_percent = 55
+
+[[curve]]
+temp_c = 70
+duty_percent = 75
+
+[[curve]]
+temp_c = 80
+duty_percent = 90
+
+[[curve]]
+temp_c = 90
+duty_percent = 100
