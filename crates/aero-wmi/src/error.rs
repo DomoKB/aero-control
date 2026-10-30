@@ -23,6 +23,12 @@ pub enum WmiError {
     #[error("fan curve index {index} is outside 0..15")]
     IndexOutOfRange { index: u8 },
 
+    #[error("access denied: run as administrator")]
+    AccessDenied,
+
+    #[error("firmware interface not found on this model")]
+    FirmwareMissing,
+
     #[error("this build has no Windows WMI backend ({0})")]
     NotAvailable(&'static str),
 }

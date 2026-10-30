@@ -52,7 +52,7 @@ fn main() -> ExitCode {
         let mut reader = match aero_wmi::WindowsReader::connect() {
             Ok(reader) => reader,
             Err(err) => {
-                eprintln!("could not open root\\WMI: {err}");
+                eprintln!("could not open the GB_WMIACPI_Get firmware block: {err}");
                 eprintln!("run this from an elevated PowerShell, or pass --mock");
                 return ExitCode::from(1);
             }
@@ -100,7 +100,7 @@ fn finish(report: aero_probe::ProbeReport) -> ExitCode {
         return ExitCode::from(1);
     }
     if missing {
-        eprintln!("GB_WMIACPI_Get is not registered. Install Gigabyte Control Center's acpimof.dll, or compile the clean-room aero_fan.mof from the MIT aero-keyboard-fan project with: mofcomp aero_fan.mof");
+        eprintln!("GB_WMIACPI_Get firmware block was not found on this model");
         return ExitCode::from(4);
     }
     ExitCode::SUCCESS
@@ -113,7 +113,7 @@ fn print_help() {
          aero-probe [--mock] [--diag] [--no-pace] [--rpm-order auto-swap|auto-native|swap|native]\n\
          \n\
          On Windows, run from an elevated shell. The probe never calls a setter.\n\
-         --diag adds each method's in/out CIM signature and the instance path.\n\
+         --diag adds each method's in/out layout and the instance name.\n\
          Real hardware calls are spaced 500 ms apart unless --no-pace is set.\n\
          --mock works on Linux and does not touch WMI."
     );

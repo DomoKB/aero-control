@@ -6,16 +6,15 @@ use crate::error::WmiError;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ParamField {
     pub name: String,
-    pub cim_type: i32,
-    pub cim_type_name: String,
+    pub ty: String,
 }
 
-/// Instance path plus the in/out signature. This does not call the method.
+/// Instance name plus the in/out layout. This does not call the method.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MethodSignature {
     pub class: String,
     pub method: String,
-    pub instance_path: String,
+    pub instance: String,
     pub in_params: Vec<ParamField>,
     pub out_params: Vec<ParamField>,
 }

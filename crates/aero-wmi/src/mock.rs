@@ -9,8 +9,7 @@ use std::collections::HashSet;
 
 use crate::sku::{SkuInfo, SkuSource};
 
-use crate::catalog::{find_getter, GETTERS, SETTERS};
-use crate::cim::{cim_type_name, CIM_UINT8};
+use crate::catalog::{find_getter, Width, GETTERS, SETTERS};
 use crate::diag::{AcpiDiag, MethodSignature, ParamField};
 use crate::error::WmiError;
 use crate::read::{refuse_setter, AcpiReader, ClassStatus};
@@ -41,7 +40,6 @@ pub struct MockAcpi {
     pub super_quiet: u8,
     pub fan_adjust: u8,
     pub current_step: u8,
-    pub custom_cap: u8,
     pub fixed_speed: u8,
     pub gpu_duty: u8,
     pub curve: [(u8, u8); FAN_CURVE_SLOTS],
@@ -85,7 +83,6 @@ impl MockAcpi {
             super_quiet: 0,
             fan_adjust: 0,
             current_step: 0,
-            custom_cap: 0,
             fixed_speed: 0,
             gpu_duty: 0,
             curve,
@@ -136,7 +133,7 @@ impl MockAcpi {
             method: method.to_string(),
         })?;
         let mut output = WmiOutput::new();
-        for name in spec.outputs {
+        for (name, _) in spec.outputs {
             output.insert(name, WmiNumber::U8(0));
         }
         Ok(output)
@@ -193,8 +190,6 @@ impl AcpiReader for MockAcpi {
             "GetFixedFanStatus" => self.output_u8("Data", self.fixed),
             "GetStepFanStatus" => self.output_u8("Data", self.step),
             "GetFanAdjustStatus" => self.output_u8("Data", self.fan_adjust),
-            "GetSuperQuiet" => self.output_u8("Data", self.super_quiet),
-            "GetFanCustomStatus" => self.output_u8("Data", self.custom_cap),
             "GetFixedFanSpeed" => self.output_u16("Data", u16::from(self.fixed_speed)),
             "GetCPUFanDuty" => self.output_u8("Data", self.fixed_speed),
             "GetGPUFanDuty" => self.output_u8("Data", self.gpu_duty),
@@ -234,7 +229,6 @@ impl AcpiWriter for MockAcpi {
             ("SetCurrentFanStep", WriteParams::Data(value)) => self.current_step = *value,
             ("SetSuperQuiet", WriteParams::Data(value)) => self.super_quiet = *value,
             ("SetFanAdjustStatus", WriteParams::Data(value)) => self.fan_adjust = *value,
-            ("SetFanCustomStatus", WriteParams::Data(value)) => self.custom_cap = *value,
             ("SetFanIndexValue", WriteParams::FanPoint { index, temp, duty }) => {
                 if *index as usize >= FAN_CURVE_SLOTS {
                     return Err(WmiError::IndexOutOfRange { index: *index });
@@ -265,17 +259,24 @@ impl AcpiDiag for MockAcpi {
             .ok_or_else(|| WmiError::MethodNotFound {
                 method: method.to_string(),
             })?;
-        let field = |name: &str| ParamField {
+        let field = |name: &str, width: Width| ParamField {
             name: name.to_string(),
-            cim_type: CIM_UINT8,
-            cim_type_name: cim_type_name(CIM_UINT8).to_string(),
+            ty: width.name().to_string(),
         };
         Ok(MethodSignature {
             class: class.to_string(),
             method: method.to_string(),
-            instance_path: format!("mock:{class}.InstanceName=\"fixture\""),
-            in_params: spec.inputs.iter().copied().map(field).collect(),
-            out_params: spec.outputs.iter().copied().map(field).collect(),
+            instance: format!("mock:{class}:fixture"),
+            in_params: spec
+                .inputs
+                .iter()
+                .map(|name| field(name, Width::U8))
+                .collect(),
+            out_params: spec
+                .outputs
+                .iter()
+                .map(|(name, width)| field(name, *width))
+                .collect(),
         })
     }
 }

@@ -479,11 +479,10 @@ fn snapshot<R: AcpiReader>(reader: &mut R) -> SensorSnapshot {
     let rpm1 = read_rpm(reader, "getRpm1", &mut errors);
     let rpm2 = read_rpm(reader, "getRpm2", &mut errors);
     let flags = format!(
-        "auto {} · fixed {} · step {} · super quiet {} · adjust {}",
+        "auto {} · fixed {} · step {} · adjust {}",
         read_flag(reader, "GetAutoFanStatus", &mut errors),
         read_flag(reader, "GetFixedFanStatus", &mut errors),
         read_flag(reader, "GetStepFanStatus", &mut errors),
-        read_flag(reader, "GetSuperQuiet", &mut errors),
         read_flag(reader, "GetFanAdjustStatus", &mut errors),
     );
     SensorSnapshot {

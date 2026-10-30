@@ -33,7 +33,6 @@ pub enum FanMode {
 pub struct PlannedWrite {
     pub method: &'static str,
     pub params: WriteParams,
-    pub optional: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,38 +43,33 @@ pub struct ModeScript {
     pub writes: Vec<PlannedWrite>,
 }
 
-fn data(method: &'static str, value: u8, optional: bool) -> PlannedWrite {
+fn data(method: &'static str, value: u8) -> PlannedWrite {
     PlannedWrite {
         method,
         params: WriteParams::Data(value),
-        optional,
     }
 }
 
-/// Clears that stop a leftover step, fixed duty, quiet flag, or custom cap
-/// from overriding the mode we're about to enter.
-///
-/// `SetFanCustomStatus` is named in the scope and is not in the Aero 16 MOF,
-/// so a missing method is skipped. `SetFanAdjustStatus` is in the MOF; clearing
-/// it is a defensive extra and is marked provisional in the notes.
+/// Clears that stop a leftover step, fixed duty, or quiet flag from overriding
+/// the mode we're about to enter. Clearing `SetFanAdjustStatus` is a defensive
+/// extra and is marked provisional in the notes.
 fn clears(super_quiet: u8) -> Vec<PlannedWrite> {
     vec![
-        data("SetFanCustomStatus", 0, true),
-        data("SetFanAdjustStatus", 0, false),
-        data("SetSuperQuiet", super_quiet, false),
-        data("SetCurrentFanStep", 0, false),
-        data("SetFixedFanStatus", 0, false),
-        data("SetStepFanStatus", 0, false),
+        data("SetFanAdjustStatus", 0),
+        data("SetSuperQuiet", super_quiet),
+        data("SetCurrentFanStep", 0),
+        data("SetFixedFanStatus", 0),
+        data("SetStepFanStatus", 0),
     ]
 }
 
 pub fn normal_script() -> ModeScript {
     let mut writes = clears(0);
-    writes.push(data("SetAutoFanStatus", 1, false));
+    writes.push(data("SetAutoFanStatus", 1));
     ModeScript {
         name: "normal",
         provisional: false,
-        notes: "Firmware automatic mode. The tail (fixed off, step off, auto on) is the scope's restore sequence. SetCurrentFanStep(0) is the §5.1 bugfix. SetFanCustomStatus is best-effort. SetFanAdjustStatus(0) and SetSuperQuiet(0) drop leftover overrides.",
+        notes: "Firmware automatic mode. The tail (fixed off, step off, auto on) is the scope's restore sequence. SetCurrentFanStep(0) is the §5.1 bugfix. SetFanAdjustStatus(0) and SetSuperQuiet(0) drop leftover overrides.",
         writes,
     }
 }
@@ -85,8 +79,8 @@ pub fn quiet_script() -> ModeScript {
     // Auto stays on so a missing SuperQuiet method cannot leave the fans with
     // no governor. The Aero 16 "Silence" trace turns auto off as part of a
     // larger power-mode sequence (whisper + thermal target) that we do not send.
-    writes.push(data("SetAutoFanStatus", 1, false));
-    writes.push(data("SetSuperQuiet", 1, false));
+    writes.push(data("SetAutoFanStatus", 1));
+    writes.push(data("SetSuperQuiet", 1));
     ModeScript {
         name: "quiet",
         provisional: true,
@@ -107,18 +101,17 @@ pub fn fixed_script(duty_raw: u8) -> ModeScript {
     ModeScript {
         name: "fixed",
         provisional: false,
-        notes: "Scope Max sequence, with SetCurrentFanStep(0) from §5.1 and the Aero 16 Turbo trace. Duty 229 is 100% (scope and that trace). SetFanCustomStatus is best-effort.",
+        notes: "Scope Max sequence, with SetCurrentFanStep(0) from §5.1 and the Aero 16 Turbo trace. Duty 229 is 100% (scope and that trace).",
         writes: vec![
-            data("SetFanCustomStatus", 0, true),
-            data("SetSuperQuiet", 0, false),
-            data("SetFanAdjustStatus", 0, false),
-            data("SetCurrentFanStep", 0, false),
-            data("SetAutoFanStatus", 0, false),
-            data("SetFixedFanStatus", 0, false),
-            data("SetStepFanStatus", 1, false),
-            data("SetFixedFanStatus", 1, false),
-            data("SetFixedFanSpeed", duty_raw, false),
-            data("SetGPUFanDuty", duty_raw, false),
+                data("SetSuperQuiet", 0),
+            data("SetFanAdjustStatus", 0),
+            data("SetCurrentFanStep", 0),
+            data("SetAutoFanStatus", 0),
+            data("SetFixedFanStatus", 0),
+            data("SetStepFanStatus", 1),
+            data("SetFixedFanStatus", 1),
+            data("SetFixedFanSpeed", duty_raw),
+            data("SetGPUFanDuty", duty_raw),
         ],
     }
 }
@@ -127,15 +120,14 @@ pub fn custom_prefix() -> ModeScript {
     ModeScript {
         name: "custom",
         provisional: false,
-        notes: "Full re-apply from §5.1: clear auto, fixed, and the custom cap, SetCurrentFanStep(0), SetStepFanStatus(1), then all 15 slots. SetSuperQuiet(0) and SetFanAdjustStatus(0) are extra clears so a latched flag cannot hide the table. SetFanCustomStatus is best-effort.",
+        notes: "Full re-apply from §5.1: clear auto and fixed, SetCurrentFanStep(0), SetStepFanStatus(1), then all 15 slots. SetSuperQuiet(0) and SetFanAdjustStatus(0) are extra clears so a latched flag cannot hide the table.",
         writes: vec![
-            data("SetFanCustomStatus", 0, true),
-            data("SetAutoFanStatus", 0, false),
-            data("SetFixedFanStatus", 0, false),
-            data("SetSuperQuiet", 0, false),
-            data("SetFanAdjustStatus", 0, false),
-            data("SetCurrentFanStep", 0, false),
-            data("SetStepFanStatus", 1, false),
+                data("SetAutoFanStatus", 0),
+            data("SetFixedFanStatus", 0),
+            data("SetSuperQuiet", 0),
+            data("SetFanAdjustStatus", 0),
+            data("SetCurrentFanStep", 0),
+            data("SetStepFanStatus", 1),
         ],
     }
 }
@@ -163,7 +155,6 @@ pub fn fan_point_writes(curve: &FanCurve) -> Vec<PlannedWrite> {
                 temp,
                 duty,
             },
-            optional: false,
         })
         .collect()
 }

@@ -298,11 +298,10 @@ fn read_flags<W: AcpiWriter, P: Pacer>(
     mode: FanMode,
     duty: u8,
 ) -> Result<Vec<SlotDiff>, ApplyError> {
-    let (auto, fixed, step, quiet, speed) = match mode {
-        FanMode::Normal | FanMode::Gaming => (1, 0, 0, 0, None),
-        FanMode::Quiet => (1, 0, 0, 1, None),
-        FanMode::Max | FanMode::Fixed => (0, 1, 1, 0, Some(duty)),
-        FanMode::Custom => (0, 0, 1, 0, None),
+    let (auto, fixed, step, speed) = match mode {
+        FanMode::Normal | FanMode::Gaming | FanMode::Quiet => (1, 0, 0, None),
+        FanMode::Max | FanMode::Fixed => (0, 1, 1, Some(duty)),
+        FanMode::Custom => (0, 0, 1, None),
     };
     let mut diffs = Vec::new();
     check_flag(writer, pacer, gate, "GetAutoFanStatus", 0, auto, &mut diffs)?;
@@ -316,7 +315,6 @@ fn read_flags<W: AcpiWriter, P: Pacer>(
         &mut diffs,
     )?;
     check_flag(writer, pacer, gate, "GetStepFanStatus", 2, step, &mut diffs)?;
-    check_flag(writer, pacer, gate, "GetSuperQuiet", 3, quiet, &mut diffs)?;
     if let Some(duty) = speed {
         check_flag(writer, pacer, gate, "GetFixedFanSpeed", 4, duty, &mut diffs)?;
         check_flag(writer, pacer, gate, "GetGPUFanDuty", 5, duty, &mut diffs)?;
@@ -348,8 +346,6 @@ fn check_flag<W: AcpiWriter, P: Pacer>(
             }
             Ok(())
         }
-        // GetSuperQuiet is not in the Aero 16 MOF. A missing getter is not a mismatch.
-        Err(WmiError::MethodNotFound { .. }) => Ok(()),
         Err(err) => Err(err.into()),
     }
 }
@@ -384,13 +380,6 @@ fn exec_write<W: AcpiWriter, P: Pacer>(
                     write.method
                 ));
             }
-            Ok(())
-        }
-        Err(WmiError::MethodNotFound { .. }) if write.optional => {
-            warnings.push(format!(
-                "{} is not on this firmware and was skipped",
-                write.method
-            ));
             Ok(())
         }
         Err(err) => Err(err.into()),
@@ -529,7 +518,6 @@ mod tests {
         assert!(names[..first_point].contains(&"SetCurrentFanStep".to_string()));
         assert!(names[..first_point].contains(&"SetAutoFanStatus".to_string()));
         assert!(names[..first_point].contains(&"SetFixedFanStatus".to_string()));
-        assert!(names[..first_point].contains(&"SetFanCustomStatus".to_string()));
     }
 
     #[test]
@@ -582,17 +570,6 @@ mod tests {
             .iter()
             .any(|warning| warning.contains("SetStepFanStatus")));
         assert_eq!(mock.step, 1);
-    }
-
-    #[test]
-    fn missing_custom_cap_method_is_skipped() {
-        let mut mock = MockAcpi::aero_17_yb_fixture();
-        mock.custom_cap = 1;
-        mock.missing_setters
-            .insert("SetFanCustomStatus".to_string());
-        upload_curve(&mut mock, &mut NoPacer, &sample()).unwrap();
-        assert_eq!(mock.custom_cap, 1);
-        assert!(mock.calls_named("SetFanCustomStatus").count() >= 1);
     }
 
     #[test]

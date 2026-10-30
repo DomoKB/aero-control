@@ -119,7 +119,8 @@ where
         getters,
         setters_not_called: SETTERS.iter().map(|spec| spec.name).collect(),
         diag: signatures,
-        note: "getter only; calls use the instance path and NULL in-params when the signature has none",
+        note:
+            "getter only; allow-listed GB_WMIACPI_Get methods called through the WMI data-block API",
     }
 }
 
@@ -129,12 +130,11 @@ fn read_signature<R: AcpiDiag>(reader: &mut R, class: &str, method: &str) -> Met
         Err(err) => MethodSignature {
             class: class.to_string(),
             method: method.to_string(),
-            instance_path: String::new(),
+            instance: String::new(),
             in_params: Vec::new(),
             out_params: vec![aero_wmi::ParamField {
                 name: format!("error: {err}"),
-                cim_type: 0,
-                cim_type_name: "empty".to_string(),
+                ty: "empty".to_string(),
             }],
         },
     }
@@ -219,8 +219,6 @@ fn fan_flags(calls: &[GetterCall]) -> BTreeMap<String, Option<u32>> {
         "GetFixedFanStatus",
         "GetStepFanStatus",
         "GetFanAdjustStatus",
-        "GetSuperQuiet",
-        "GetFanCustomStatus",
         "GetFixedFanSpeed",
         "GetCPUFanDuty",
         "GetGPUFanDuty",
@@ -277,7 +275,6 @@ mod tests {
         assert_eq!(report.curve[5].temperature_c, Some(0));
         assert_eq!(report.curve[5].duty_raw, Some(0));
         assert!(report.mof_get.present);
-        assert!(report.setters_not_called.contains(&"TurnOffFan"));
         assert!(report.setters_not_called.contains(&"SetFanIndexValue"));
         assert_eq!(
             report.sku.info.unwrap().model.as_deref(),
@@ -298,7 +295,7 @@ mod tests {
             .find(|sig| sig.method == "getCpuTemp")
             .unwrap();
         assert!(cpu.in_params.is_empty());
-        assert!(cpu.instance_path.contains("mock:"));
+        assert!(cpu.instance.contains("mock:"));
         let index = report
             .diag
             .iter()

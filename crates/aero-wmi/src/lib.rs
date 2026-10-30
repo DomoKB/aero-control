@@ -1,4 +1,4 @@
-//! Gigabyte `GB_WMIACPI` transport.
+//! Gigabyte `GB_WMIACPI` transport, called through the WMI data-block API.
 //!
 //! Fan speeds are decided by the laptop's embedded controller. This crate only
 //! sends the same get/set commands Gigabyte Control Center sends. It never
@@ -11,7 +11,6 @@
 #![deny(unsafe_code)]
 
 mod catalog;
-mod cim;
 mod decode;
 mod diag;
 mod error;
@@ -27,8 +26,10 @@ mod write;
 #[cfg(windows)]
 mod platform;
 
-pub use catalog::{MethodSpec, GETTERS, NEVER_CALL, SETTERS};
-pub use cim::{cim_type_name, coerce_byte, pass_null_inparams, CoercedInt, CIM_UINT8};
+pub use catalog::{
+    decode_output, find_getter, find_setter, pack_input, Block, MethodSpec, Width, GETTERS,
+    NEVER_CALL, SETTERS,
+};
 pub use decode::{decode_fan_index, decode_rpm, swap_u16, FanIndexReading, RpmOrder, RpmReading};
 pub use diag::{AcpiDiag, MethodSignature, ParamField};
 pub use error::WmiError;
@@ -47,8 +48,6 @@ pub use platform::WindowsReader;
 #[cfg(all(windows, feature = "writer"))]
 pub use platform::WindowsWriter;
 
-/// `root\WMI`, the namespace Control Center uses.
-pub const WMI_NAMESPACE: &str = r"ROOT\WMI";
 pub const GET_CLASS: &str = "GB_WMIACPI_Get";
 pub const SET_CLASS: &str = "GB_WMIACPI_Set";
 
