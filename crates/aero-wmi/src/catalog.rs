@@ -116,9 +116,9 @@ pub static SETTERS: &[MethodSpec] = &[
     set("SetDynamicBoostStatus", 231, &[]),
 ];
 
-/// wmiacpi hands the input buffer to the ACPI method as a buffer argument;
-/// short buffers are padded to one DWORD, as Gigabyte's own tool does.
-const MIN_INPUT: usize = 4;
+/// Getter inputs are padded to one DWORD, as Gigabyte's own tool does.
+/// Setters only store the value when the buffer holds exactly their in-parameters.
+const MIN_GET_INPUT: usize = 4;
 
 pub fn find_getter(name: &str) -> Option<&'static MethodSpec> {
     GETTERS.iter().find(|spec| spec.name == name)
@@ -129,6 +129,7 @@ pub fn find_setter(name: &str) -> Option<&'static MethodSpec> {
 }
 
 /// In-parameters packed in MOF order. All are `uint8`, so no padding between them.
+/// Getter buffers are padded to a DWORD; setter buffers are not padded.
 pub fn pack_input(spec: &MethodSpec, params: &[(&str, u8)]) -> Result<Vec<u8>, WmiError> {
     let mut buf = spec
         .inputs
@@ -144,7 +145,9 @@ pub fn pack_input(spec: &MethodSpec, params: &[(&str, u8)]) -> Result<Vec<u8>, W
                 })
         })
         .collect::<Result<Vec<u8>, _>>()?;
-    buf.resize(buf.len().max(MIN_INPUT), 0);
+    if spec.block == Block::Get {
+        buf.resize(buf.len().max(MIN_GET_INPUT), 0);
+    }
     Ok(buf)
 }
 
@@ -198,18 +201,26 @@ mod tests {
     }
 
     #[test]
-    fn data_setter_packs_one_byte_padded_to_a_dword() {
+    fn data_setters_pack_exactly_one_byte() {
         let spec = find_setter("SetAutoFanStatus").unwrap();
-        assert_eq!(pack_input(spec, &[("Data", 1)]).unwrap(), [1, 0, 0, 0]);
+        assert_eq!(pack_input(spec, &[("Data", 1)]).unwrap(), [1]);
         let spec = find_setter("SetFixedFanSpeed").unwrap();
-        assert_eq!(pack_input(spec, &[("Data", 229)]).unwrap(), [229, 0, 0, 0]);
+        assert_eq!(pack_input(spec, &[("Data", 229)]).unwrap(), [229]);
+        for spec in SETTERS.iter().filter(|spec| spec.inputs == ["Data"]) {
+            assert_eq!(
+                pack_input(spec, &[("Data", 7)]).unwrap(),
+                [7],
+                "{}",
+                spec.name
+            );
+        }
     }
 
     #[test]
     fn fan_index_setter_packs_index_temp_value_in_mof_order() {
         let spec = find_setter("SetFanIndexValue").unwrap();
         let params = [("Value", 0x50), ("Index", 3), ("Temperture", 0x2d)];
-        assert_eq!(pack_input(spec, &params).unwrap(), [3, 0x2d, 0x50, 0]);
+        assert_eq!(pack_input(spec, &params).unwrap(), [3, 0x2d, 0x50]);
     }
 
     #[test]

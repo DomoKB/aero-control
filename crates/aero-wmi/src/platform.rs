@@ -385,10 +385,14 @@ impl AcpiWriter for WindowsWriter {
         })?;
         let pairs = params.pairs();
         match self.inner.call(Some(&self.set), spec, &pairs) {
-            Ok(_) => Ok(SetOutcome { threw: None }),
+            Ok(returned) => Ok(SetOutcome {
+                threw: None,
+                returned,
+            }),
             // A delivered call the firmware rejected. The EC often still applies it.
             Err(WmiError::CallFailed { detail, .. }) => Ok(SetOutcome {
                 threw: Some(detail),
+                returned: Vec::new(),
             }),
             Err(other) => Err(other),
         }

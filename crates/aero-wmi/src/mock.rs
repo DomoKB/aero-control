@@ -246,7 +246,10 @@ impl AcpiWriter for MockAcpi {
             .throw_setters
             .contains(method)
             .then(|| "WBEM error (mock: write was still applied)".to_string());
-        Ok(SetOutcome { threw })
+        Ok(SetOutcome {
+            threw,
+            returned: Vec::new(),
+        })
     }
 }
 

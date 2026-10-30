@@ -595,14 +595,29 @@ impl<T: AcpiWriter> AcpiWriter for Logged<T> {
             .join(",");
         let result = self.inner.set(method, params);
         let text = match &result {
-            Ok(outcome) => match &outcome.threw {
-                Some(err) => format!("ERR-AFTER-APPLY {err}"),
-                None => "OK".to_string(),
-            },
+            Ok(outcome) => {
+                let returned = fmt_bytes(&outcome.returned);
+                match &outcome.threw {
+                    Some(err) => format!("ERR-AFTER-APPLY {err} returned={returned}"),
+                    None => format!("OK returned={returned}"),
+                }
+            }
             Err(err) => format!("ERR {err}"),
         };
         self.log.record(&format_call("SET", method, &shown, &text));
         result
+    }
+}
+
+fn fmt_bytes(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        "-".to_string()
+    } else {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 

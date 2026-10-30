@@ -6,10 +6,12 @@ use crate::read::AcpiReader;
 ///
 /// Some Gigabyte setters return a WBEM error while the embedded controller
 /// still applies the write. `threw` records that. Callers verify with a getter
-/// instead of trusting the return code.
+/// instead of trusting the return code. `returned` is the firmware's output
+/// buffer, which echoes the stored value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetOutcome {
     pub threw: Option<String>,
+    pub returned: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
