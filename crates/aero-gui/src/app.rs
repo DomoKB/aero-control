@@ -8,7 +8,7 @@ use std::time::Instant;
 
 use aero_core::{
     constrain_drag, insert_point, issues, parse_custom_fan_table_text, remove_point,
-    stair_polyline, CurveIssue, CurvePoint, FanCurve, FanMode,
+    stair_polyline, CurveIssue, CurvePoint, FanCurve, FanMode, FIXED_FLOOR_PERCENT,
 };
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Frame, Layout, Margin, Pos2, RichText, Rounding, Sense,
@@ -17,6 +17,7 @@ use eframe::egui::{
 
 use crate::session::{BackendChoice, FanSession, SensorSnapshot};
 
+mod gauge;
 mod keyboard;
 use keyboard::KeyboardTab;
 
@@ -35,9 +36,7 @@ const ACCENT: Color32 = Color32::from_rgb(64, 196, 168);
 const ON_ACCENT: Color32 = Color32::from_rgb(10, 24, 22);
 const WARN: Color32 = Color32::from_rgb(214, 154, 72);
 const DANGER: Color32 = Color32::from_rgb(214, 96, 88);
-const COOL: Color32 = Color32::from_rgb(88, 186, 214);
 const AMBER: Color32 = Color32::from_rgb(232, 184, 74);
-const ORANGE: Color32 = Color32::from_rgb(232, 122, 58);
 const HOT: Color32 = Color32::from_rgb(220, 72, 64);
 
 pub struct AeroApp {
@@ -62,6 +61,45 @@ pub struct AeroApp {
     active_mode: Option<FanMode>,
     pending_mode: Option<FanMode>,
     keyboard: KeyboardTab,
+}
+
+const MODES: [(&str, FanMode, &str); 6] = [
+    (
+        "Normal",
+        FanMode::Normal,
+        "Normal: firmware automatic control.",
+    ),
+    (
+        "Quiet",
+        FanMode::Quiet,
+        "Quiet: Super Quiet. The flag sequence is still provisional.",
+    ),
+    (
+        "Gaming",
+        FanMode::Gaming,
+        "Gaming: fan writes currently match Normal. Still provisional.",
+    ),
+    (
+        "Fixed",
+        FanMode::Fixed,
+        "Fixed: one duty for both fans, set with the dial below.",
+    ),
+    (
+        "Max",
+        FanMode::Max,
+        "Max: both fans at raw 229 (100%). Click twice.",
+    ),
+    (
+        "Custom",
+        FanMode::Custom,
+        "Custom: the uploaded curve. Opens the Curve editor.",
+    ),
+];
+
+#[derive(Clone, Copy)]
+enum Reading {
+    Temp(Option<f32>),
+    Rpm(Option<f32>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -403,262 +441,253 @@ impl AeroApp {
     }
 
     fn fans_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Fans").size(22.0).strong().color(TEXT));
-        ui.label(RichText::new("Live readings. The firmware still runs the fans.").color(MUTED));
-        ui.add_space(14.0);
+        page_header(
+            ui,
+            "Fans",
+            "Live readings. The firmware still runs the fans.",
+        );
         if let Some(error) = &self.sensor_error {
             banner(ui, error, DANGER);
-            ui.add_space(10.0);
+            ui.add_space(12.0);
         }
-        self.metric_row(ui);
-        ui.add_space(8.0);
-        ui.label(RichText::new(format!("GPU sensor 2  {}", self.sensors.gpu2)).color(MUTED));
-        ui.add_space(18.0);
-        ui.label(RichText::new("Fan mode").size(16.0).strong().color(TEXT));
-        ui.add_space(8.0);
-        self.mode_row(ui);
-        ui.add_space(14.0);
+        self.gauge_row(ui);
+        ui.add_space(16.0);
+        self.mode_card(ui);
+        ui.add_space(16.0);
         self.fixed_card(ui);
-        ui.add_space(12.0);
+        ui.add_space(10.0);
         ui.label(RichText::new(&self.sensors.flags).size(13.0).color(MUTED));
     }
 
-    fn metric_row(&self, ui: &mut egui::Ui) {
-        let gap = 12.0;
-        let card_h = 148.0;
+    fn gauge_row(&self, ui: &mut egui::Ui) {
+        let gap = 16.0;
+        let card_h = 252.0;
         let width = ui.available_width();
-        let cols: usize = if width > 980.0 {
+        let cols: usize = if width > 960.0 {
             4
-        } else if width > 560.0 {
+        } else if width > 480.0 {
             2
         } else {
             1
         };
-        let col_w = ((width - gap * (cols as f32 - 1.0)) / cols as f32).max(140.0);
-        let cpu_c = temp_color(parse_temp(&self.sensors.cpu));
-        let gpu_c = temp_color(parse_temp(&self.sensors.gpu));
+        let col_w = (width - gap * (cols as f32 - 1.0)) / cols as f32;
+        let gpu2 = parse_temp(&self.sensors.gpu2)
+            .filter(|c| *c > 0.0)
+            .map(|c| format!("sensor 2  {c:.0}°C"));
+        let rpm_note = |raw: &str| raw.ends_with('?').then(|| "byte order guessed".to_string());
         let cards = [
             (
                 "CPU",
-                self.sensors.cpu.as_str(),
-                cpu_c,
+                Reading::Temp(parse_temp(&self.sensors.cpu)),
                 &self.history.cpu,
-                30.0_f32,
-                100.0_f32,
+                None,
             ),
             (
                 "GPU",
-                self.sensors.gpu.as_str(),
-                gpu_c,
+                Reading::Temp(parse_temp(&self.sensors.gpu)),
                 &self.history.gpu,
-                30.0_f32,
-                100.0_f32,
+                gpu2,
             ),
             (
-                "Fan 1",
-                self.sensors.rpm1.as_str(),
-                ACCENT,
+                "CPU fan",
+                Reading::Rpm(parse_rpm(&self.sensors.rpm1)),
                 &self.history.rpm1,
-                0.0_f32,
-                5000.0_f32,
+                rpm_note(&self.sensors.rpm1),
             ),
             (
-                "Fan 2",
-                self.sensors.rpm2.as_str(),
-                ACCENT,
+                "GPU fan",
+                Reading::Rpm(parse_rpm(&self.sensors.rpm2)),
                 &self.history.rpm2,
-                0.0_f32,
-                5000.0_f32,
+                rpm_note(&self.sensors.rpm2),
             ),
         ];
         let rows = cards.len().div_ceil(cols);
         let origin = ui.cursor().min;
-        for (index, (title, raw, color, trace, y_lo, y_hi)) in cards.into_iter().enumerate() {
-            let col = index % cols;
-            let row = index / cols;
+        for (index, (title, reading, trace, note)) in cards.into_iter().enumerate() {
             let rect = egui::Rect::from_min_size(
-                origin + Vec2::new(col as f32 * (col_w + gap), row as f32 * (card_h + gap)),
+                origin
+                    + Vec2::new(
+                        (index % cols) as f32 * (col_w + gap),
+                        (index / cols) as f32 * (card_h + gap),
+                    ),
                 Vec2::new(col_w, card_h),
             );
-            paint_metric(ui, rect, title, raw, color, &trace.samples, y_lo, y_hi);
+            paint_gauge_card(
+                ui.painter(),
+                rect,
+                title,
+                reading,
+                &trace.samples,
+                note.as_deref(),
+            );
         }
-        let total_h = rows as f32 * card_h + (rows.saturating_sub(1) as f32) * gap;
-        ui.add_space(total_h);
+        ui.add_space(rows as f32 * card_h + rows.saturating_sub(1) as f32 * gap);
     }
 
-    fn mode_row(&mut self, ui: &mut egui::Ui) {
+    fn mode_card(&mut self, ui: &mut egui::Ui) {
         let allow = self.writes_allowed();
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            self.mode_tile(
-                ui,
-                "Normal",
-                "Firmware automatic control.",
-                FanMode::Normal,
-                allow,
-                false,
-            );
-            self.mode_tile(
-                ui,
-                "Quiet",
-                "Super Quiet. The flag sequence is still provisional.",
-                FanMode::Quiet,
-                allow,
-                false,
-            );
-            self.mode_tile(
-                ui,
-                "Gaming",
-                "Fan writes currently match Normal. Still provisional.",
-                FanMode::Gaming,
-                allow,
-                false,
-            );
-            self.mode_tile(
-                ui,
-                "Fixed",
-                "One duty for both fans. Floor is 35% unless expert is on.",
-                FanMode::Fixed,
-                allow,
-                false,
-            );
-            let max_label = if self.arm_max { "Confirm Max" } else { "Max" };
-            self.mode_tile(
-                ui,
-                max_label,
-                "Both fans at raw 229 (100%). Click twice.",
-                FanMode::Max,
-                allow,
-                self.arm_max,
-            );
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                section_title(ui, "Fan mode");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    self.max_test_button(ui, allow);
+                    if ui
+                        .add_enabled(allow, secondary_button("Restore auto"))
+                        .on_hover_text("Sends the Normal sequence: fixed off, step off, auto on.")
+                        .clicked()
+                    {
+                        self.apply_firmware(FanMode::Normal);
+                    }
+                });
+            });
+            ui.add_space(10.0);
+            self.mode_segments(ui, allow);
+            ui.add_space(10.0);
+            let hint = MODES
+                .iter()
+                .find(|(_, mode, _)| self.active_mode == Some(*mode))
+                .map_or(
+                    "Mode unknown until the firmware flags are read.",
+                    |(_, _, tip)| tip,
+                );
+            ui.label(RichText::new(hint).size(13.0).color(MUTED));
         });
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    allow,
-                    egui::Button::new(RichText::new("Restore auto").color(TEXT))
-                        .fill(CARD_RAISED)
-                        .min_size(Vec2::new(140.0, 36.0))
-                        .rounding(Rounding::same(10.0)),
+    }
+
+    fn mode_segments(&mut self, ui: &mut egui::Ui, allow: bool) {
+        let height = 46.0;
+        let (rect, _) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+        ui.painter()
+            .rect(rect, Rounding::same(12.0), BG, Stroke::new(1.0_f32, STROKE));
+        let seg_w = rect.width() / MODES.len() as f32;
+        for (index, (label, mode, tip)) in MODES.iter().enumerate() {
+            let seg = egui::Rect::from_min_size(
+                rect.min + Vec2::new(index as f32 * seg_w, 0.0),
+                Vec2::new(seg_w, height),
+            )
+            .shrink(4.0);
+            let navigates = *mode == FanMode::Custom;
+            let enabled = allow || navigates;
+            let id = ui.id().with(("mode", index));
+            let response = ui
+                .interact(
+                    seg,
+                    id,
+                    if enabled {
+                        Sense::click()
+                    } else {
+                        Sense::hover()
+                    },
                 )
-                .on_hover_text("Sends the Normal sequence: fixed off, step off, auto on.")
-                .clicked()
-            {
-                self.apply_firmware(FanMode::Normal);
-            }
-            let test_label = if self.arm_max_test {
-                "Confirm: Max for 10 s"
+                .on_hover_text(*tip);
+            let armed = *mode == FanMode::Max && self.arm_max;
+            let on = self.active_mode == Some(*mode);
+            let (fill, fg) = if armed {
+                (WARN, ON_ACCENT)
+            } else if on {
+                (ACCENT, ON_ACCENT)
+            } else if response.hovered() && enabled {
+                (CARD_RAISED, TEXT)
             } else {
-                "Test: Max for 10 s"
+                (Color32::TRANSPARENT, if enabled { TEXT } else { MUTED })
             };
-            if ui
-                .add_enabled(
-                    allow,
-                    egui::Button::new(RichText::new(test_label).color(TEXT))
-                        .fill(CARD_RAISED)
-                        .min_size(Vec2::new(180.0, 36.0))
-                        .rounding(Rounding::same(10.0))
-                        .stroke(Stroke::new(1.0_f32, WARN)),
-                )
-                .on_hover_text(
-                    "Sets both fans to raw 229 for 10 seconds, then restores firmware auto. Click twice.",
-                )
-                .clicked()
-            {
-                if self.arm_max_test {
-                    self.busy = true;
-                    self.session.max_test();
-                    self.arm_max_test = false;
-                    self.arm_max = false;
-                } else {
-                    self.arm_max_test = true;
-                    self.report =
-                        "This sets both fans to raw 229 for 10 seconds, then restores firmware auto. Click the confirm button."
-                            .to_string();
-                    self.report_error = false;
+            ui.painter().rect_filled(seg, Rounding::same(9.0), fill);
+            let label = if armed { "Confirm" } else { *label };
+            ui.painter().text(
+                seg.center(),
+                Align2::CENTER_CENTER,
+                label,
+                FontId::proportional(15.0),
+                fg,
+            );
+            if response.clicked() {
+                match mode {
+                    FanMode::Custom => self.page = Page::Curve,
+                    FanMode::Max if !self.arm_max => {
+                        self.arm_max = true;
+                        self.report = "Max sets both fans to raw 229 (100%). Click Confirm.".into();
+                        self.report_error = false;
+                    }
+                    mode => self.apply_firmware(*mode),
                 }
             }
-        });
+        }
     }
 
-    fn mode_tile(
-        &mut self,
-        ui: &mut egui::Ui,
-        label: &str,
-        tip: &str,
-        mode: FanMode,
-        enabled: bool,
-        armed: bool,
-    ) {
-        let on = self.active_mode == Some(mode) || (armed && mode == FanMode::Max);
-        let fill = if armed && mode == FanMode::Max {
-            WARN
-        } else if on {
-            ACCENT
+    fn max_test_button(&mut self, ui: &mut egui::Ui, allow: bool) {
+        let label = if self.arm_max_test {
+            "Confirm: Max for 10 s"
         } else {
-            CARD_RAISED
+            "Test: Max for 10 s"
         };
-        let fg = if on || (armed && mode == FanMode::Max) {
-            ON_ACCENT
-        } else {
-            TEXT
-        };
-        let button = egui::Button::new(RichText::new(label).size(16.0).strong().color(fg))
-            .fill(fill)
-            .min_size(Vec2::new(128.0, 64.0))
-            .rounding(Rounding::same(12.0))
-            .stroke(if on {
-                Stroke::NONE
+        if ui
+            .add_enabled(allow, secondary_button(label).stroke(Stroke::new(1.0_f32, WARN)))
+            .on_hover_text(
+                "Sets both fans to raw 229 for 10 seconds, then restores firmware auto. Click twice.",
+            )
+            .clicked()
+        {
+            if self.arm_max_test {
+                self.busy = true;
+                self.session.max_test();
+                self.arm_max_test = false;
+                self.arm_max = false;
             } else {
-                Stroke::new(1.0_f32, STROKE)
-            });
-        if ui.add_enabled(enabled, button).on_hover_text(tip).clicked() {
-            if mode == FanMode::Max && !self.arm_max {
-                self.arm_max = true;
-                self.report = "Max sets both fans to raw 229 (100%). Click Confirm Max.".into();
+                self.arm_max_test = true;
+                self.report =
+                    "This sets both fans to raw 229 for 10 seconds, then restores firmware auto. Click the confirm button."
+                        .to_string();
                 self.report_error = false;
-            } else if mode == FanMode::Fixed {
-                self.apply_firmware(FanMode::Fixed);
-            } else {
-                self.apply_firmware(mode);
             }
         }
     }
 
     fn fixed_card(&mut self, ui: &mut egui::Ui) {
-        Frame::none()
-            .fill(CARD)
-            .rounding(Rounding::same(12.0))
-            .stroke(Stroke::new(1.0_f32, STROKE))
-            .inner_margin(Margin::same(14.0))
-            .show(ui, |ui| {
-                ui.label(RichText::new("Fixed duty").strong().color(TEXT));
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::Slider::new(&mut self.fixed_percent, 0..=100)
-                            .suffix("%")
-                            .trailing_fill(true),
+        let floor = if self.expert { 0 } else { FIXED_FLOOR_PERCENT };
+        self.fixed_percent = self.fixed_percent.max(floor);
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                gauge::knob(ui, &mut self.fixed_percent, floor, 170.0);
+                ui.add_space(12.0);
+                ui.vertical(|ui| {
+                    ui.add_space(8.0);
+                    section_title(ui, "Fixed duty");
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(format!(
+                            "Both fans at {}% (raw {} of 229).",
+                            self.fixed_percent,
+                            aero_core::percent_to_raw(self.fixed_percent)
+                        ))
+                        .color(TEXT),
                     );
-                    if ui
-                        .add_enabled(
-                            self.writes_allowed(),
-                            egui::Button::new(RichText::new("Apply fixed").color(ON_ACCENT))
-                                .fill(ACCENT)
-                                .min_size(Vec2::new(120.0, 32.0))
-                                .rounding(Rounding::same(10.0)),
-                        )
-                        .on_hover_text(
-                            "Sends this duty to both fans. Stays at or above 35% (raw 80) unless expert is on.",
-                        )
-                        .clicked()
-                    {
-                        self.apply_firmware(FanMode::Fixed);
-                    }
-                    ui.checkbox(&mut self.expert, "Expert floor override")
-                        .on_hover_text("Allows a fixed duty below 35% (raw 80).");
+                    ui.label(
+                        RichText::new(format!(
+                            "Drag the dial or scroll. The floor is {FIXED_FLOOR_PERCENT}% unless expert is on."
+                        ))
+                        .size(13.0)
+                        .color(MUTED),
+                    );
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add_enabled(self.writes_allowed(), primary_button("Apply fixed"))
+                            .on_hover_text(
+                                "Sends this duty to both fans. Stays at or above 35% (raw 80) unless expert is on.",
+                            )
+                            .clicked()
+                        {
+                            self.apply_firmware(FanMode::Fixed);
+                        }
+                        ui.checkbox(&mut self.expert, "Expert floor override")
+                            .on_hover_text("Allows a fixed duty below 35% (raw 80).");
+                    });
                 });
             });
+        });
     }
 
     fn curve_ui(&mut self, ui: &mut egui::Ui) {
@@ -785,7 +814,7 @@ impl AeroApp {
             .and_then(|index| percent_points.get(index).map(|(x, y)| [*x, *y]));
         let cpu_now = parse_temp(&self.sensors.cpu).map(f64::from);
         let accent = ACCENT;
-        let hot = temp_color(parse_temp(&self.sensors.cpu));
+        let hot = parse_temp(&self.sensors.cpu).map_or(MUTED, gauge::temp_band);
 
         let response = egui_plot::Plot::new("fan_curve")
             .height(380.0)
@@ -1067,48 +1096,91 @@ fn nav_item(ui: &mut egui::Ui, label: &str, on: bool, page: &mut Page, value: Pa
     );
 }
 
-fn paint_metric(
-    ui: &egui::Ui,
+fn page_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
+    ui.label(RichText::new(title).size(24.0).strong().color(TEXT));
+    ui.label(RichText::new(subtitle).color(MUTED));
+    ui.add_space(16.0);
+}
+
+fn section_title(ui: &mut egui::Ui, text: &str) {
+    ui.label(RichText::new(text).size(17.0).strong().color(TEXT));
+}
+
+fn card() -> Frame {
+    Frame::none()
+        .fill(CARD)
+        .rounding(Rounding::same(16.0))
+        .stroke(Stroke::new(1.0_f32, STROKE))
+        .inner_margin(Margin::same(18.0))
+}
+
+fn primary_button(text: &str) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(text).strong().color(ON_ACCENT))
+        .fill(ACCENT)
+        .min_size(Vec2::new(132.0, 36.0))
+        .rounding(Rounding::same(10.0))
+}
+
+fn secondary_button(text: &str) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(text).color(TEXT))
+        .fill(CARD_RAISED)
+        .min_size(Vec2::new(132.0, 36.0))
+        .rounding(Rounding::same(10.0))
+        .stroke(Stroke::new(1.0_f32, STROKE))
+}
+
+fn paint_gauge_card(
+    painter: &egui::Painter,
     rect: egui::Rect,
     title: &str,
-    raw: &str,
-    color: Color32,
+    reading: Reading,
     samples: &VecDeque<(f64, f32)>,
-    y_lo: f32,
-    y_hi: f32,
+    note: Option<&str>,
 ) {
-    let painter = ui.painter();
     painter.rect(
         rect,
-        Rounding::same(14.0),
+        Rounding::same(16.0),
         CARD,
         Stroke::new(1.0_f32, STROKE),
     );
-    let (number, unit) = split_metric(raw);
-    let number_pos = rect.left_top() + Vec2::new(16.0, 36.0);
+    let top = rect.left_top() + Vec2::new(18.0, 16.0);
     painter.text(
-        rect.left_top() + Vec2::new(16.0, 12.0),
+        top,
         Align2::LEFT_TOP,
         title,
-        FontId::proportional(13.0),
+        FontId::proportional(15.0),
+        TEXT,
+    );
+    let kind = match reading {
+        Reading::Temp(_) => "TEMPERATURE",
+        Reading::Rpm(_) => "FAN SPEED",
+    };
+    painter.text(
+        Pos2::new(rect.right() - 18.0, top.y + 2.0),
+        Align2::RIGHT_TOP,
+        note.unwrap_or(kind),
+        FontId::proportional(11.0),
         MUTED,
     );
-    let number_galley = painter.layout_no_wrap(number, FontId::proportional(34.0), color);
-    painter.galley(number_pos, number_galley.clone(), color);
-    if !unit.is_empty() {
-        painter.text(
-            number_pos + Vec2::new(number_galley.size().x + 8.0, 16.0),
-            Align2::LEFT_TOP,
-            unit,
-            FontId::proportional(14.0),
-            MUTED,
-        );
-    }
-    let spark = egui::Rect::from_min_max(
-        Pos2::new(rect.left() + 16.0, rect.bottom() - 46.0),
-        Pos2::new(rect.right() - 16.0, rect.bottom() - 14.0),
+    let dial = egui::Rect::from_min_max(
+        Pos2::new(rect.left() + 14.0, rect.top() + 40.0),
+        Pos2::new(rect.right() - 14.0, rect.bottom() - 50.0),
     );
-    sparkline(painter, spark, samples, color, y_lo, y_hi);
+    let spark = egui::Rect::from_min_max(
+        Pos2::new(rect.left() + 18.0, rect.bottom() - 40.0),
+        Pos2::new(rect.right() - 18.0, rect.bottom() - 14.0),
+    );
+    match reading {
+        Reading::Temp(celsius) => {
+            gauge::temperature(painter, dial, celsius);
+            let color = celsius.map_or(MUTED, gauge::temp_band);
+            sparkline(painter, spark, samples, color, 30.0, 100.0);
+        }
+        Reading::Rpm(rpm) => {
+            gauge::rpm(painter, dial, rpm);
+            sparkline(painter, spark, samples, ACCENT, 0.0, gauge::RPM_MAX);
+        }
+    }
 }
 
 fn sparkline(
@@ -1158,16 +1230,12 @@ fn sparkline(
 }
 
 fn info_card(ui: &mut egui::Ui, title: &str, body: &str) {
-    Frame::none()
-        .fill(CARD)
-        .rounding(Rounding::same(12.0))
-        .stroke(Stroke::new(1.0_f32, STROKE))
-        .inner_margin(Margin::same(14.0))
-        .show(ui, |ui| {
-            ui.label(RichText::new(title).strong().color(TEXT));
-            ui.add_space(4.0);
-            ui.label(RichText::new(body).color(MUTED));
-        });
+    card().show(ui, |ui| {
+        ui.set_width(ui.available_width());
+        section_title(ui, title);
+        ui.add_space(4.0);
+        ui.label(RichText::new(body).color(MUTED));
+    });
 }
 
 fn banner(ui: &mut egui::Ui, text: &str, color: Color32) {
@@ -1184,19 +1252,6 @@ fn banner(ui: &mut egui::Ui, text: &str, color: Color32) {
         .show(ui, |ui| {
             ui.colored_label(color, text);
         });
-}
-
-fn temp_color(celsius: Option<f32>) -> Color32 {
-    let Some(c) = celsius else {
-        return MUTED;
-    };
-    if c < 55.0 {
-        mix(COOL, AMBER, (c - 40.0) / 15.0)
-    } else if c < 75.0 {
-        mix(AMBER, ORANGE, (c - 55.0) / 20.0)
-    } else {
-        mix(ORANGE, HOT, (c - 75.0) / 15.0)
-    }
 }
 
 fn mix(a: Color32, b: Color32, t: f32) -> Color32 {
@@ -1220,20 +1275,6 @@ fn parse_rpm(text: &str) -> Option<f32> {
         .trim_end_matches('?')
         .parse()
         .ok()
-}
-
-fn split_metric(raw: &str) -> (String, String) {
-    let raw = raw.trim();
-    if let Some(number) = raw.strip_suffix("°C") {
-        return (number.trim().to_string(), "°C".into());
-    }
-    if let Some(number) = raw.split_whitespace().next() {
-        if number.trim_end_matches('?').parse::<f32>().is_ok() {
-            let unit = raw[number.len()..].trim();
-            return (number.trim_end_matches('?').to_string(), unit.to_string());
-        }
-    }
-    (raw.to_string(), String::new())
 }
 
 fn mode_from_flags(flags: &str) -> Option<FanMode> {
