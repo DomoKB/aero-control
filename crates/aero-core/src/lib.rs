@@ -25,7 +25,7 @@ mod registry;
 
 pub use apply::{
     apply_fixed_duty, apply_mode, apply_profile, curve_drift, reason_for, restore_firmware_auto,
-    upload_curve, ApplyError, ApplyReason, ApplyReport, PowerEvent, SlotDiff,
+    update_curve, upload_curve, ApplyError, ApplyReason, ApplyReport, PowerEvent, SlotDiff,
 };
 pub use curve::{
     constrain_drag, duty_at, insert_point, issues, planned_slots, remove_point, stair_polyline,

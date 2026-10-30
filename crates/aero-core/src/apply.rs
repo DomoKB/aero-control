@@ -150,19 +150,45 @@ pub fn upload_curve<W: AcpiWriter, P: Pacer>(
     curve: &FanCurve,
 ) -> Result<ApplyReport, ApplyError> {
     guarded(writer, pacer, |writer, pacer| {
-        upload_inner(writer, pacer, curve)
+        upload_inner(writer, pacer, &mut Gate { started: false }, Vec::new(), curve)
+    })
+}
+
+pub fn update_curve<W: AcpiWriter, P: Pacer>(
+    writer: &mut W,
+    pacer: &mut P,
+    curve: &FanCurve,
+) -> Result<ApplyReport, ApplyError> {
+    guarded(writer, pacer, |writer, pacer| {
+        let mut gate = Gate { started: false };
+        let mut warnings = Vec::new();
+        for write in fan_point_writes(curve) {
+            exec_write(writer, pacer, &mut gate, &write, &mut warnings)?;
+        }
+        let mut diffs = read_curve(writer, pacer, &mut gate, curve)?;
+        diffs.extend(read_flags(writer, pacer, &mut gate, FanMode::Custom, 0)?);
+        if diffs.is_empty() {
+            return Ok(ApplyReport {
+                attempts: 1,
+                warnings,
+                restored_auto: false,
+                diffs,
+            });
+        }
+        warnings.push("curve readback mismatched; running the full upload".to_string());
+        upload_inner(writer, pacer, &mut gate, warnings, curve)
     })
 }
 
 fn upload_inner<W: AcpiWriter, P: Pacer>(
     writer: &mut W,
     pacer: &mut P,
+    gate: &mut Gate,
+    mut warnings: Vec<String>,
     curve: &FanCurve,
 ) -> Result<ApplyReport, ApplyError> {
-    let mut warnings = Vec::new();
-    let mut gate = Gate { started: false };
-    run_custom_once(writer, pacer, &mut gate, curve, &mut warnings)?;
-    let diffs = read_curve(writer, pacer, &mut gate, curve)?;
+    run_custom_once(writer, pacer, gate, curve, &mut warnings)?;
+    let diffs = read_curve(writer, pacer, gate, curve)?;
     if diffs.is_empty() {
         return Ok(ApplyReport {
             attempts: 1,
@@ -172,8 +198,8 @@ fn upload_inner<W: AcpiWriter, P: Pacer>(
         });
     }
     warnings.push("readback mismatched; retrying the full upload once".to_string());
-    run_custom_once(writer, pacer, &mut gate, curve, &mut warnings)?;
-    let diffs = read_curve(writer, pacer, &mut gate, curve)?;
+    run_custom_once(writer, pacer, gate, curve, &mut warnings)?;
+    let diffs = read_curve(writer, pacer, gate, curve)?;
     if diffs.is_empty() {
         return Ok(ApplyReport {
             attempts: 2,
@@ -640,6 +666,34 @@ mod tests {
         assert_eq!(mock.gpu_duty, 80);
         apply_mode(&mut mock, &mut NoPacer, FanMode::Fixed, 10, true).unwrap();
         assert_eq!(mock.fixed_speed, 10);
+    }
+
+    #[test]
+    fn curve_edit_while_custom_writes_only_the_slots() {
+        let mut mock = MockAcpi::aero_17_yb_fixture();
+        upload_curve(&mut mock, &mut NoPacer, &sample()).unwrap();
+        mock.calls.clear();
+        let mut points = sample().points().to_vec();
+        points[1].duty_raw += 5;
+        let curve = FanCurve::try_new(points).unwrap();
+        let report = update_curve(&mut mock, &mut NoPacer, &curve).unwrap();
+        assert_eq!(report.attempts, 1);
+        assert!(methods(&mock)
+            .iter()
+            .filter(|method| method.starts_with("Set"))
+            .all(|method| method == "SetFanIndexValue"));
+        assert_eq!(mock.calls_named("SetFanIndexValue").count(), 15);
+    }
+
+    #[test]
+    fn curve_edit_outside_custom_falls_back_to_the_full_upload() {
+        let mut mock = MockAcpi::aero_17_yb_fixture();
+        let mut pacer = CountPacer::default();
+        let report = update_curve(&mut mock, &mut pacer, &sample()).unwrap();
+        assert!(report.warnings.iter().any(|w| w.contains("full upload")));
+        assert_eq!(mock.calls_named("SetStepFanStatus").count(), 1);
+        assert_eq!((mock.auto, mock.step), (0, 1));
+        assert_eq!(pacer.pauses, mock.calls.len() - 1);
     }
 
     #[test]

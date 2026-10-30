@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 
 use aero_core::{
     apply_fixed_duty, apply_mode, clamp_fixed_duty, restore_firmware_auto, set_charge_policy,
-    set_nv_power_config, upload_curve, ApplyError, ChargePolicy, CurvePoint, FanCurve, FanMode,
+    set_nv_power_config, update_curve, upload_curve, ApplyError, ChargePolicy, CurvePoint,
+    FanCurve, FanMode,
 };
 #[cfg(windows)]
 use aero_wmi::FixedPacer;
@@ -78,6 +79,7 @@ enum Command {
         expert: bool,
     },
     Upload(Vec<CurvePoint>),
+    UpdateCurve(Vec<CurvePoint>),
     MaxTest,
     Power(PowerWrite),
     Shutdown,
@@ -132,6 +134,10 @@ impl FanSession {
 
     pub fn upload(&self, points: Vec<CurvePoint>) {
         let _ = self.tx.send(Command::Upload(points));
+    }
+
+    pub fn update_curve(&self, points: Vec<CurvePoint>) {
+        let _ = self.tx.send(Command::UpdateCurve(points));
     }
 
     pub fn max_test(&self) {
@@ -228,7 +234,15 @@ fn worker(choice: BackendChoice, rx: Receiver<Command>, tx: Sender<SessionEvent>
             }
             Ok(Command::Upload(points)) => {
                 let _ = tx.send(busy());
-                let outcome = catch_unwind(AssertUnwindSafe(|| upload_any(&mut live, points)));
+                let outcome =
+                    catch_unwind(AssertUnwindSafe(|| upload_any(&mut live, points, false)));
+                restore_on_exit = false;
+                let _ = tx.send(finish_apply(&mut live, &mut restore_on_exit, outcome));
+            }
+            Ok(Command::UpdateCurve(points)) => {
+                let _ = tx.send(busy());
+                let outcome =
+                    catch_unwind(AssertUnwindSafe(|| upload_any(&mut live, points, true)));
                 restore_on_exit = false;
                 let _ = tx.send(finish_apply(&mut live, &mut restore_on_exit, outcome));
             }
@@ -502,14 +516,23 @@ fn fixed_duty_any(live: &mut Live, raw: u8, expert: bool) -> Result<String, Appl
     ))
 }
 
-fn upload_any(live: &mut Live, points: Vec<CurvePoint>) -> Result<String, ApplyError> {
+fn upload_any(
+    live: &mut Live,
+    points: Vec<CurvePoint>,
+    slots_only: bool,
+) -> Result<String, ApplyError> {
     let curve = FanCurve::try_new(points).map_err(ApplyError::InvalidCurve)?;
-    let report = match live {
-        Live::Mock(backend) => upload_curve(backend, &mut NoPacer, &curve)?,
+    let report = match (live, slots_only) {
+        (Live::Mock(backend), false) => upload_curve(backend, &mut NoPacer, &curve)?,
+        (Live::Mock(backend), true) => update_curve(backend, &mut NoPacer, &curve)?,
         #[cfg(windows)]
-        Live::Write(backend) => upload_curve(backend, &mut FixedPacer::standard(), &curve)?,
+        (Live::Write(backend), false) => {
+            upload_curve(backend, &mut FixedPacer::standard(), &curve)?
+        }
         #[cfg(windows)]
-        Live::Read(_) => {
+        (Live::Write(backend), true) => update_curve(backend, &mut FixedPacer::standard(), &curve)?,
+        #[cfg(windows)]
+        (Live::Read(_), _) => {
             return Err(ApplyError::Wmi(WmiError::NotAvailable(
                 "curve upload needs an elevated aero-gui",
             )))
