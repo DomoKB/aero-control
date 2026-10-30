@@ -116,6 +116,18 @@ pub fn fixed_script(duty_raw: u8) -> ModeScript {
     }
 }
 
+pub fn fixed_duty_script(duty_raw: u8) -> ModeScript {
+    ModeScript {
+        name: "fixed duty",
+        provisional: false,
+        notes: "Duty change while fixed is already on: Control Center sends only 107 and 71, so no mode flag is cleared.",
+        writes: vec![
+            data("SetFixedFanSpeed", duty_raw),
+            data("SetGPUFanDuty", duty_raw),
+        ],
+    }
+}
+
 pub fn custom_prefix() -> ModeScript {
     ModeScript {
         name: "custom",

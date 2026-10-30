@@ -10,7 +10,9 @@ use thiserror::Error;
 use tracing::debug;
 
 use crate::curve::{planned_slots, CurveIssue, FanCurve};
-use crate::mode::{fan_point_writes, script_for, FanMode, ModeScript, PlannedWrite};
+use crate::mode::{
+    fan_point_writes, fixed_duty_script, script_for, FanMode, ModeScript, PlannedWrite,
+};
 use crate::profile::Profile;
 use crate::scale::clamp_fixed_duty;
 
@@ -250,24 +252,62 @@ pub fn apply_mode<W: AcpiWriter, P: Pacer>(
         _ => fixed_raw,
     };
     guarded(writer, pacer, |writer, pacer| {
-        apply_mode_inner(writer, pacer, mode, duty)
+        apply_mode_inner(
+            writer,
+            pacer,
+            &mut Gate { started: false },
+            Vec::new(),
+            mode,
+            duty,
+        )
+    })
+}
+
+pub fn apply_fixed_duty<W: AcpiWriter, P: Pacer>(
+    writer: &mut W,
+    pacer: &mut P,
+    fixed_raw: u8,
+    expert: bool,
+) -> Result<ApplyReport, ApplyError> {
+    let duty = clamp_fixed_duty(fixed_raw, expert);
+    guarded(writer, pacer, |writer, pacer| {
+        let mut gate = Gate { started: false };
+        let mut warnings = Vec::new();
+        run_script(
+            writer,
+            pacer,
+            &mut gate,
+            &fixed_duty_script(duty),
+            &mut warnings,
+        )?;
+        let diffs = read_flags(writer, pacer, &mut gate, FanMode::Fixed, duty)?;
+        if diffs.is_empty() {
+            return Ok(ApplyReport {
+                attempts: 1,
+                warnings,
+                restored_auto: false,
+                diffs,
+            });
+        }
+        warnings.push("fixed duty readback mismatched; running the full fixed script".to_string());
+        apply_mode_inner(writer, pacer, &mut gate, warnings, FanMode::Fixed, duty)
     })
 }
 
 fn apply_mode_inner<W: AcpiWriter, P: Pacer>(
     writer: &mut W,
     pacer: &mut P,
+    gate: &mut Gate,
+    mut warnings: Vec<String>,
     mode: FanMode,
     duty: u8,
 ) -> Result<ApplyReport, ApplyError> {
     let script = script_for(mode, duty);
-    let mut warnings = Vec::new();
     if script.provisional {
         warnings.push(script.notes.to_string());
     }
-    let mut gate = Gate { started: false };
-    run_script(writer, pacer, &mut gate, &script, &mut warnings)?;
-    let mut diffs = read_flags(writer, pacer, &mut gate, mode, duty)?;
+    run_script(writer, pacer, gate, &script, &mut warnings)?;
+    let mut diffs = read_flags(writer, pacer, gate, mode, duty)?;
     if diffs.is_empty() {
         return Ok(ApplyReport {
             attempts: 1,
@@ -277,8 +317,8 @@ fn apply_mode_inner<W: AcpiWriter, P: Pacer>(
         });
     }
     warnings.push("mode readback mismatched; retrying the full script once".to_string());
-    run_script(writer, pacer, &mut gate, &script, &mut warnings)?;
-    diffs = read_flags(writer, pacer, &mut gate, mode, duty)?;
+    run_script(writer, pacer, gate, &script, &mut warnings)?;
+    diffs = read_flags(writer, pacer, gate, mode, duty)?;
     if diffs.is_empty() {
         return Ok(ApplyReport {
             attempts: 2,
@@ -600,6 +640,37 @@ mod tests {
         assert_eq!(mock.gpu_duty, 80);
         apply_mode(&mut mock, &mut NoPacer, FanMode::Fixed, 10, true).unwrap();
         assert_eq!(mock.fixed_speed, 10);
+    }
+
+    #[test]
+    fn duty_change_in_fixed_mode_writes_only_the_two_speeds() {
+        let mut mock = MockAcpi::aero_17_yb_fixture();
+        apply_mode(&mut mock, &mut NoPacer, FanMode::Fixed, 120, false).unwrap();
+        mock.calls.clear();
+        let report = apply_fixed_duty(&mut mock, &mut NoPacer, 150, false).unwrap();
+        assert_eq!(report.attempts, 1);
+        let sets: Vec<_> = methods(&mock)
+            .into_iter()
+            .filter(|method| method.starts_with("Set"))
+            .collect();
+        assert_eq!(sets, ["SetFixedFanSpeed", "SetGPUFanDuty"]);
+        assert_eq!(mock.fixed_speed, 150);
+        assert_eq!(mock.gpu_duty, 150);
+    }
+
+    #[test]
+    fn duty_change_outside_fixed_mode_falls_back_to_the_full_script() {
+        let mut mock = MockAcpi::aero_17_yb_fixture();
+        let mut pacer = CountPacer::default();
+        let report = apply_fixed_duty(&mut mock, &mut pacer, 10, false).unwrap();
+        assert_eq!(report.attempts, 1);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|w| w.contains("full fixed script")));
+        assert_eq!(mock.calls_named("SetFixedFanStatus").count(), 2);
+        assert_eq!((mock.auto, mock.fixed, mock.fixed_speed), (0, 1, 80));
+        assert_eq!(pacer.pauses, mock.calls.len() - 1);
     }
 
     #[test]

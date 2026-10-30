@@ -10,8 +10,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use aero_core::{
-    apply_mode, restore_firmware_auto, set_charge_policy, set_nv_power_config, upload_curve,
-    ApplyError, ChargePolicy, CurvePoint, FanCurve, FanMode,
+    apply_fixed_duty, apply_mode, clamp_fixed_duty, restore_firmware_auto, set_charge_policy,
+    set_nv_power_config, upload_curve, ApplyError, ChargePolicy, CurvePoint, FanCurve, FanMode,
 };
 #[cfg(windows)]
 use aero_wmi::FixedPacer;
@@ -73,6 +73,10 @@ enum Command {
         raw: u8,
         expert: bool,
     },
+    FixedDuty {
+        raw: u8,
+        expert: bool,
+    },
     Upload(Vec<CurvePoint>),
     MaxTest,
     Power(PowerWrite),
@@ -120,6 +124,10 @@ impl FanSession {
 
     pub fn apply(&self, mode: FanMode, raw: u8, expert: bool) {
         let _ = self.tx.send(Command::Apply { mode, raw, expert });
+    }
+
+    pub fn fixed_duty(&self, raw: u8, expert: bool) {
+        let _ = self.tx.send(Command::FixedDuty { raw, expert });
     }
 
     pub fn upload(&self, points: Vec<CurvePoint>) {
@@ -209,6 +217,13 @@ fn worker(choice: BackendChoice, rx: Receiver<Command>, tx: Sender<SessionEvent>
                 let outcome =
                     catch_unwind(AssertUnwindSafe(|| apply_any(&mut live, mode, raw, expert)));
                 restore_on_exit = matches!(mode, FanMode::Fixed | FanMode::Max);
+                let _ = tx.send(finish_apply(&mut live, &mut restore_on_exit, outcome));
+            }
+            Ok(Command::FixedDuty { raw, expert }) => {
+                let _ = tx.send(busy());
+                let outcome =
+                    catch_unwind(AssertUnwindSafe(|| fixed_duty_any(&mut live, raw, expert)));
+                restore_on_exit = true;
                 let _ = tx.send(finish_apply(&mut live, &mut restore_on_exit, outcome));
             }
             Ok(Command::Upload(points)) => {
@@ -460,6 +475,28 @@ fn apply_any(live: &mut Live, mode: FanMode, raw: u8, expert: bool) -> Result<St
     };
     Ok(format!(
         "{mode:?} applied in {} attempt(s). {}",
+        report.attempts,
+        report.warnings.join(" ")
+    ))
+}
+
+fn fixed_duty_any(live: &mut Live, raw: u8, expert: bool) -> Result<String, ApplyError> {
+    let report = match live {
+        Live::Mock(backend) => apply_fixed_duty(backend, &mut NoPacer, raw, expert)?,
+        #[cfg(windows)]
+        Live::Write(backend) => {
+            apply_fixed_duty(backend, &mut FixedPacer::standard(), raw, expert)?
+        }
+        #[cfg(windows)]
+        Live::Read(_) => {
+            return Err(ApplyError::Wmi(WmiError::NotAvailable(
+                "fan writes need an elevated aero-gui",
+            )))
+        }
+    };
+    Ok(format!(
+        "Fixed duty set to raw {} in {} attempt(s). {}",
+        clamp_fixed_duty(raw, expert),
         report.attempts,
         report.warnings.join(" ")
     ))

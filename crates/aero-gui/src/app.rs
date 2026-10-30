@@ -4,7 +4,7 @@
 //! builds keep the fake controller. Sensor reads are display only and never set a duty.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aero_core::{
     constrain_drag, insert_point, issues, parse_custom_fan_table_text, remove_point,
@@ -22,7 +22,7 @@ mod gauge;
 mod keyboard;
 mod live_duty;
 use keyboard::KeyboardTab;
-use live_duty::LiveDuty;
+use live_duty::{Input, LiveDuty};
 
 const CHARGE_POLICY_CUSTOM: u8 = 4;
 const PLOT_X_END: f64 = 100.0;
@@ -55,7 +55,6 @@ pub struct AeroApp {
     drag_index: Option<usize>,
     fixed_percent: u8,
     live_duty: LiveDuty,
-    knob_dragging: bool,
     expert: bool,
     arm_max: bool,
     import_text: String,
@@ -95,7 +94,7 @@ const MODES: [(&str, FanMode, &str); 6] = [
     (
         "Fixed",
         FanMode::Fixed,
-        "Fixed: one duty for both fans. Turn the dial; it applies live.",
+        "Fixed: one duty for both fans. Set the dial; it applies when you let go.",
     ),
     (
         "Max",
@@ -205,7 +204,6 @@ impl AeroApp {
             drag_index: None,
             fixed_percent: 50,
             live_duty: LiveDuty::new(50),
-            knob_dragging: false,
             expert: false,
             arm_max: false,
             import_text: "45,35;60,45;0,0;85,80;90,100".to_string(),
@@ -305,7 +303,7 @@ impl AeroApp {
         }
         let raw = aero_core::percent_to_raw(self.fixed_percent);
         if mode == FanMode::Fixed {
-            self.live_duty.mark_sent(self.fixed_percent, Instant::now());
+            self.live_duty.applied(self.fixed_percent);
         }
         self.busy = true;
         self.pending_mode = Some(mode);
@@ -319,18 +317,26 @@ impl AeroApp {
     }
 
     fn push_live_duty(&mut self, ctx: &egui::Context) {
-        if !self.fixed_shown() || !self.live_duty.pending(self.fixed_percent) {
+        if !self.fixed_shown() {
             return;
         }
-        if self.writes_allowed()
-            && self
-                .live_duty
-                .due(self.fixed_percent, self.knob_dragging, Instant::now())
-        {
-            self.apply_firmware(FanMode::Fixed);
-        } else {
-            ctx.request_repaint_after(live_duty::DRAG_INTERVAL / 5);
+        match self.live_duty.wait(self.fixed_percent, Instant::now()) {
+            Some(wait) if wait.is_zero() && self.writes_allowed() => self.send_fixed_duty(),
+            Some(wait) => ctx.request_repaint_after(wait.max(Duration::from_millis(50))),
+            None => {}
         }
+    }
+
+    fn send_fixed_duty(&mut self) {
+        if self.active_mode != Some(FanMode::Fixed) || self.pending_mode.is_some() {
+            self.apply_firmware(FanMode::Fixed);
+            return;
+        }
+        self.live_duty.applied(self.fixed_percent);
+        self.busy = true;
+        self.pending_mode = Some(FanMode::Fixed);
+        self.session
+            .fixed_duty(aero_core::percent_to_raw(self.fixed_percent), self.expert);
     }
 
     fn upload(&mut self) {
@@ -670,7 +676,14 @@ impl AeroApp {
         self.fixed_percent = self.fixed_percent.max(floor);
         ui.horizontal(|ui| {
             let knob = gauge::knob(ui, &mut self.fixed_percent, floor, 150.0);
-            self.knob_dragging = knob.dragged();
+            let now = Instant::now();
+            if knob.dragged() {
+                self.live_duty.input(Input::Dragging, now);
+            } else if knob.drag_stopped() || knob.clicked() {
+                self.live_duty.input(Input::Released, now);
+            } else if knob.changed() {
+                self.live_duty.input(Input::Scrolled, now);
+            }
             ui.add_space(16.0);
             ui.vertical(|ui| {
                 ui.add_space(22.0);
@@ -683,6 +696,8 @@ impl AeroApp {
                 ui.add_space(4.0);
                 let (status, color) = if self.report_error && !self.busy {
                     ("Not applied, see the log", DANGER)
+                } else if self.live_duty.held(self.fixed_percent) {
+                    ("Release to apply", AMBER)
                 } else if self.busy || self.live_duty.pending(self.fixed_percent) {
                     ("Applying…", AMBER)
                 } else {
@@ -696,7 +711,7 @@ impl AeroApp {
                 ui.add_space(8.0);
                 ui.label(
                     RichText::new(format!(
-                        "Drag or scroll the dial. Changes apply as you turn. Floor {FIXED_FLOOR_PERCENT}% unless expert is on."
+                        "Drag or scroll the dial. It applies when you let go. Floor {FIXED_FLOOR_PERCENT}% unless expert is on."
                     ))
                     .size(13.0)
                     .color(MUTED),
