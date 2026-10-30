@@ -20,7 +20,9 @@ use crate::system_power::{Battery, Plan, SystemPower};
 
 mod gauge;
 mod keyboard;
+mod live_duty;
 use keyboard::KeyboardTab;
+use live_duty::LiveDuty;
 
 const CHARGE_POLICY_CUSTOM: u8 = 4;
 const PLOT_X_END: f64 = 100.0;
@@ -52,6 +54,8 @@ pub struct AeroApp {
     issues: Vec<CurveIssue>,
     drag_index: Option<usize>,
     fixed_percent: u8,
+    live_duty: LiveDuty,
+    knob_dragging: bool,
     expert: bool,
     arm_max: bool,
     import_text: String,
@@ -91,7 +95,7 @@ const MODES: [(&str, FanMode, &str); 6] = [
     (
         "Fixed",
         FanMode::Fixed,
-        "Fixed: one duty for both fans, set with the dial below.",
+        "Fixed: one duty for both fans. Turn the dial; it applies live.",
     ),
     (
         "Max",
@@ -200,6 +204,8 @@ impl AeroApp {
             issues,
             drag_index: None,
             fixed_percent: 50,
+            live_duty: LiveDuty::new(50),
+            knob_dragging: false,
             expert: false,
             arm_max: false,
             import_text: "45,35;60,45;0,0;85,80;90,100".to_string(),
@@ -298,11 +304,33 @@ impl AeroApp {
             return;
         }
         let raw = aero_core::percent_to_raw(self.fixed_percent);
+        if mode == FanMode::Fixed {
+            self.live_duty.mark_sent(self.fixed_percent, Instant::now());
+        }
         self.busy = true;
         self.pending_mode = Some(mode);
         self.session.apply(mode, raw, self.expert);
         self.arm_max = false;
         self.arm_max_test = false;
+    }
+
+    fn fixed_shown(&self) -> bool {
+        self.pending_mode.or(self.active_mode) == Some(FanMode::Fixed)
+    }
+
+    fn push_live_duty(&mut self, ctx: &egui::Context) {
+        if !self.fixed_shown() || !self.live_duty.pending(self.fixed_percent) {
+            return;
+        }
+        if self.writes_allowed()
+            && self
+                .live_duty
+                .due(self.fixed_percent, self.knob_dragging, Instant::now())
+        {
+            self.apply_firmware(FanMode::Fixed);
+        } else {
+            ctx.request_repaint_after(live_duty::DRAG_INTERVAL / 5);
+        }
     }
 
     fn upload(&mut self) {
@@ -337,6 +365,7 @@ impl AeroApp {
 impl eframe::App for AeroApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_session();
+        self.push_live_duty(ctx);
         ctx.request_repaint_after(std::time::Duration::from_millis(400));
 
         egui::TopBottomPanel::top("bar")
@@ -465,11 +494,15 @@ impl AeroApp {
             banner(ui, error, DANGER);
             ui.add_space(12.0);
         }
-        self.gauge_row(ui);
-        ui.add_space(16.0);
-        self.mode_card(ui);
-        ui.add_space(16.0);
-        self.fixed_card(ui);
+        if ui.available_width() > 960.0 {
+            self.gauge_row(ui);
+            ui.add_space(16.0);
+            self.mode_card(ui);
+        } else {
+            self.mode_card(ui);
+            ui.add_space(16.0);
+            self.gauge_row(ui);
+        }
         ui.add_space(10.0);
         ui.label(RichText::new(&self.sensors.flags).size(13.0).color(MUTED));
     }
@@ -559,6 +592,10 @@ impl AeroApp {
             ui.add_space(10.0);
             self.mode_segments(ui, allow);
             ui.add_space(10.0);
+            if self.fixed_shown() {
+                self.fixed_controls(ui);
+                return;
+            }
             let hint = MODES
                 .iter()
                 .find(|(_, mode, _)| self.active_mode == Some(*mode))
@@ -628,48 +665,45 @@ impl AeroApp {
         }
     }
 
-    fn fixed_card(&mut self, ui: &mut egui::Ui) {
+    fn fixed_controls(&mut self, ui: &mut egui::Ui) {
         let floor = if self.expert { 0 } else { FIXED_FLOOR_PERCENT };
         self.fixed_percent = self.fixed_percent.max(floor);
-        card().show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                gauge::knob(ui, &mut self.fixed_percent, floor, 170.0);
-                ui.add_space(12.0);
-                ui.vertical(|ui| {
-                    ui.add_space(8.0);
-                    section_title(ui, "Fixed duty");
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(format!(
-                            "Both fans at {}% (raw {} of 229).",
-                            self.fixed_percent,
-                            aero_core::percent_to_raw(self.fixed_percent)
-                        ))
+        ui.horizontal(|ui| {
+            let knob = gauge::knob(ui, &mut self.fixed_percent, floor, 150.0);
+            self.knob_dragging = knob.dragged();
+            ui.add_space(16.0);
+            ui.vertical(|ui| {
+                ui.add_space(22.0);
+                ui.label(
+                    RichText::new(format!("Both fans at {}%", self.fixed_percent))
+                        .size(18.0)
+                        .strong()
                         .color(TEXT),
-                    );
-                    ui.label(
-                        RichText::new(format!(
-                            "Drag the dial or scroll. The floor is {FIXED_FLOOR_PERCENT}% unless expert is on."
-                        ))
-                        .size(13.0)
-                        .color(MUTED),
-                    );
-                    ui.add_space(12.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(self.writes_allowed(), primary_button("Apply fixed"))
-                            .on_hover_text(
-                                "Sends this duty to both fans. Stays at or above 35% (raw 80) unless expert is on.",
-                            )
-                            .clicked()
-                        {
-                            self.apply_firmware(FanMode::Fixed);
-                        }
-                        ui.checkbox(&mut self.expert, "Expert floor override")
-                            .on_hover_text("Allows a fixed duty below 35% (raw 80).");
-                    });
+                );
+                ui.add_space(4.0);
+                let (status, color) = if self.report_error && !self.busy {
+                    ("Not applied, see the log", DANGER)
+                } else if self.busy || self.live_duty.pending(self.fixed_percent) {
+                    ("Applying…", AMBER)
+                } else {
+                    ("Live on both fans", ACCENT)
+                };
+                ui.horizontal(|ui| {
+                    let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+                    ui.painter().circle_filled(dot.center(), 4.0, color);
+                    ui.label(RichText::new(status).size(13.0).color(color));
                 });
+                ui.add_space(8.0);
+                ui.label(
+                    RichText::new(format!(
+                        "Drag or scroll the dial. Changes apply as you turn. Floor {FIXED_FLOOR_PERCENT}% unless expert is on."
+                    ))
+                    .size(13.0)
+                    .color(MUTED),
+                );
+                ui.add_space(8.0);
+                ui.checkbox(&mut self.expert, "Expert floor override")
+                    .on_hover_text("Allows a fixed duty below 35% (raw 80).");
             });
         });
     }
