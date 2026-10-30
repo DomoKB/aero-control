@@ -7,8 +7,8 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use aero_core::{
-    constrain_drag, insert_point, issues, parse_custom_fan_table_text, remove_point,
-    stair_polyline, ChargePolicy, CurveIssue, CurvePoint, FanCurve, FanMode, FIXED_FLOOR_PERCENT,
+    issues, parse_custom_fan_table_text, ChargePolicy, CurveIssue, CurvePoint, FanCurve, FanMode,
+    FIXED_FLOOR_PERCENT,
 };
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Frame, Layout, Margin, Pos2, RichText, Rounding, Sense,
@@ -18,14 +18,15 @@ use eframe::egui::{
 use crate::session::{BackendChoice, FanSession, PowerSnapshot, PowerWrite, SensorSnapshot};
 use crate::system_power::{Battery, Plan, SystemPower};
 
+mod curve_chart;
 mod gauge;
+mod kbd_preview;
 mod keyboard;
 mod live_duty;
 use keyboard::KeyboardTab;
 use live_duty::{Input, LiveDuty};
 
 const CHARGE_POLICY_CUSTOM: u8 = 4;
-const PLOT_X_END: f64 = 100.0;
 const HISTORY_SECS: f64 = 60.0;
 
 const BG: Color32 = Color32::from_rgb(14, 17, 22);
@@ -53,6 +54,7 @@ pub struct AeroApp {
     points: Vec<CurvePoint>,
     issues: Vec<CurveIssue>,
     drag_index: Option<usize>,
+    applied_curve: Vec<CurvePoint>,
     fixed_percent: u8,
     live_duty: LiveDuty,
     expert: bool,
@@ -199,9 +201,10 @@ impl AeroApp {
             sensor_error: None,
             arm_max_test: false,
             page: Page::Fans,
-            points,
+            points: points.clone(),
             issues,
             drag_index: None,
+            applied_curve: points,
             fixed_percent: 50,
             live_duty: LiveDuty::new(50),
             expert: false,
@@ -349,7 +352,8 @@ impl AeroApp {
             Ok(curve) => {
                 self.busy = true;
                 self.pending_mode = Some(FanMode::Custom);
-                self.session.upload(curve.points().to_vec());
+                self.applied_curve = curve.points().to_vec();
+                self.session.upload(self.applied_curve.clone());
             }
             Err(issues) => {
                 self.issues = issues;
@@ -359,11 +363,26 @@ impl AeroApp {
         }
     }
 
+    fn push_curve(&mut self) {
+        if self.active_mode == Some(FanMode::Custom)
+            && self.pending_mode.is_none()
+            && self.drag_index.is_none()
+            && self.issues.is_empty()
+            && self.writes_allowed()
+            && self.points != self.applied_curve
+        {
+            self.applied_curve = self.points.clone();
+            self.busy = true;
+            self.pending_mode = Some(FanMode::Custom);
+            self.session.update_curve(self.applied_curve.clone());
+        }
+    }
+
     fn reset_factory(&mut self) {
         self.points = aero_core::factory_curve().points().to_vec();
         self.drag_index = None;
         self.recompute();
-        self.report = "Editor loaded the YB factory curve. Nothing is sent until Upload.".into();
+        self.report = "Editor loaded the YB factory curve.".into();
         self.report_error = false;
     }
 }
@@ -372,6 +391,7 @@ impl eframe::App for AeroApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_session();
         self.push_live_duty(ctx);
+        self.push_curve();
         ctx.request_repaint_after(std::time::Duration::from_millis(400));
 
         egui::TopBottomPanel::top("bar")
@@ -724,66 +744,69 @@ impl AeroApp {
     }
 
     fn curve_ui(&mut self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Curve").size(22.0).strong().color(TEXT));
-        ui.label(RichText::new("YB factory curve. Edit it here, then upload.").color(MUTED));
-        ui.add_space(12.0);
-        ui.horizontal(|ui| {
-            if ui
-                .add(
-                    egui::Button::new(RichText::new("Reset to Factory").color(TEXT))
-                        .fill(CARD_RAISED)
-                        .min_size(Vec2::new(160.0, 36.0))
-                        .rounding(Rounding::same(10.0))
-                        .stroke(Stroke::new(1.0_f32, STROKE)),
-                )
-                .on_hover_text(
-                    "Loads the YB factory curve into the editor. Nothing is sent until Upload.",
-                )
-                .clicked()
-            {
-                self.reset_factory();
-            }
-            let valid = self.issues.is_empty();
-            if ui
-                .add_enabled(
-                    valid && self.writes_allowed(),
-                    egui::Button::new(RichText::new("Upload").size(16.0).strong().color(ON_ACCENT))
-                        .fill(ACCENT)
-                        .min_size(Vec2::new(140.0, 36.0))
-                        .rounding(Rounding::same(10.0)),
-                )
-                .on_hover_text(
-                    "Writes all 15 slots and reads them back. A mismatch retries once, then restores firmware auto. Percents round half-up: 30% is raw 69, while this chip's table stores Control Center's truncated raw 68.",
-                )
-                .clicked()
-            {
-                self.upload();
-            }
-            if self.issues.is_empty() {
-                ui.colored_label(ACCENT, "Valid");
-            }
-        });
-        if !self.issues.is_empty() {
+        page_header(
+            ui,
+            "Curve",
+            "One firmware table drives both fans. Each duty holds until the next point.",
+        );
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                section_title(ui, "Custom curve");
+                ui.add_space(8.0);
+                self.curve_state(ui);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if self.active_mode != Some(FanMode::Custom)
+                        && ui
+                            .add_enabled(
+                                self.issues.is_empty() && self.writes_allowed(),
+                                primary_button("Use this curve"),
+                            )
+                            .on_hover_text(
+                                "Switches the fans to this curve: writes all 15 slots and reads them back. A mismatch retries once, then restores firmware auto.",
+                            )
+                            .clicked()
+                    {
+                        self.upload();
+                    }
+                    if ui
+                        .add(secondary_button("Factory"))
+                        .on_hover_text("Loads the YB factory curve from Control Center.")
+                        .clicked()
+                    {
+                        self.reset_factory();
+                    }
+                });
+            });
+            ui.add_space(8.0);
+            let markers: Vec<_> = [("CPU", &self.sensors.cpu), ("GPU", &self.sensors.gpu)]
+                .into_iter()
+                .filter_map(|(label, text)| {
+                    parse_temp(text).map(|temp_c| curve_chart::Marker {
+                        label,
+                        temp_c,
+                        color: gauge::temp_band(temp_c),
+                    })
+                })
+                .collect();
+            let height = (ui.available_height() - 64.0).clamp(240.0, 460.0);
+            curve_chart::show(ui, &mut self.points, &mut self.drag_index, &markers, height);
+            self.recompute();
             ui.add_space(6.0);
+            ui.label(
+                RichText::new("Drag a point to move it · double-click to add (max 15) · right-click to remove (min 2)")
+                    .size(13.0)
+                    .color(MUTED),
+            );
             for issue in &self.issues {
                 let where_ = issue
                     .index
-                    .map(|index| format!("point {index}: "))
+                    .map(|index| format!("Point {}: ", index + 1))
                     .unwrap_or_default();
                 ui.colored_label(DANGER, format!("{where_}{}", issue.message));
             }
-        }
-        ui.add_space(10.0);
-        self.plot(ui);
-        ui.add_space(6.0);
-        egui::CollapsingHeader::new("How to edit")
-            .default_open(false)
-            .show(ui, |ui| {
-                ui.label("Drag a point. Double-click the plot to add one (max 15). Right-click a point to remove it (min 2). The stair step holds each duty until the next temperature. The vertical line is the current CPU temperature.");
-            });
-        ui.add_space(8.0);
-        self.table(ui);
-        ui.add_space(8.0);
+        });
+        ui.add_space(12.0);
         egui::CollapsingHeader::new("Import CustomFanTable")
             .default_open(false)
             .show(ui, |ui| {
@@ -828,160 +851,24 @@ impl AeroApp {
             });
     }
 
-    fn plot(&mut self, ui: &mut egui::Ui) {
-        let percent_points: Vec<(f64, f64)> = self
-            .points
-            .iter()
-            .map(|point| {
-                (
-                    f64::from(point.temp_c),
-                    f64::from(aero_core::raw_to_percent(point.duty_raw)),
-                )
-            })
-            .collect();
-        let stair = stair_polyline(&percent_points, PLOT_X_END);
-        let stair_line: egui_plot::PlotPoints = stair.iter().map(|(x, y)| [*x, *y]).collect();
-        let markers: egui_plot::PlotPoints = percent_points.iter().map(|(x, y)| [*x, *y]).collect();
-        let selected: Option<[f64; 2]> = self
-            .drag_index
-            .and_then(|index| percent_points.get(index).map(|(x, y)| [*x, *y]));
-        let cpu_now = parse_temp(&self.sensors.cpu).map(f64::from);
-        let accent = ACCENT;
-        let hot = parse_temp(&self.sensors.cpu).map_or(MUTED, gauge::temp_band);
-
-        let response = egui_plot::Plot::new("fan_curve")
-            .height(380.0)
-            .allow_drag(false)
-            .allow_scroll(false)
-            .allow_zoom(false)
-            .allow_boxed_zoom(false)
-            .show_background(true)
-            .include_x(0.0)
-            .include_x(PLOT_X_END)
-            .include_y(0.0)
-            .include_y(100.0)
-            .x_axis_label("Temperature (°C)")
-            .y_axis_label("Duty (%)")
-            .legend(egui_plot::Legend::default())
-            .show(ui, |plot_ui| {
-                plot_ui.line(
-                    egui_plot::Line::new(stair_line)
-                        .name("Stair step")
-                        .color(accent)
-                        .width(2.5_f32),
-                );
-                plot_ui.points(
-                    egui_plot::Points::new(markers)
-                        .name("Points")
-                        .color(Color32::from_rgb(236, 240, 244))
-                        .radius(5.0_f32),
-                );
-                if let Some(point) = selected {
-                    plot_ui.points(
-                        egui_plot::Points::new(vec![point])
-                            .name("Selected")
-                            .color(accent)
-                            .radius(9.0_f32),
-                    );
-                }
-                if let Some(x) = cpu_now {
-                    plot_ui.vline(
-                        egui_plot::VLine::new(x)
-                            .name("CPU")
-                            .color(hot)
-                            .width(1.5_f32),
-                    );
-                }
-                plot_ui.pointer_coordinate()
-            });
-        self.handle_plot(&response);
-    }
-
-    fn handle_plot(&mut self, response: &egui_plot::PlotResponse<Option<egui_plot::PlotPoint>>) {
-        let Some(pointer) = response.inner else {
-            if response.response.drag_stopped() {
-                self.drag_index = None;
+    fn curve_state(&self, ui: &mut egui::Ui) {
+        let (text, fill) = if self.busy && self.pending_mode == Some(FanMode::Custom) {
+            ("Applying…", AMBER)
+        } else if self.active_mode == Some(FanMode::Custom) {
+            if self.issues.is_empty() {
+                ("Active · edits apply on release", ACCENT)
+            } else {
+                ("Active · fix the curve to apply", WARN)
             }
-            return;
+        } else {
+            ("Not active", CARD_RAISED)
         };
-        if response.response.drag_started()
-            || (response.response.dragged() && self.drag_index.is_none())
-        {
-            self.drag_index = nearest(&self.points, pointer.x, pointer.y);
-        }
-        if response.response.dragged() {
-            if let Some(index) = self.drag_index {
-                if let Some(point) = constrain_drag(
-                    &self.points,
-                    index,
-                    pointer.x.round() as i32,
-                    pointer.y.round() as i32,
-                ) {
-                    self.points[index] = point;
-                    self.recompute();
-                }
-            }
-        }
-        if response.response.drag_stopped() {
-            self.drag_index = None;
-        }
-        if response.response.double_clicked() {
-            let temp = pointer.x.round().clamp(30.0, 95.0) as u8;
-            let duty = pointer.y.round().clamp(0.0, 100.0) as u8;
-            if insert_point(&mut self.points, temp, duty).is_ok() {
-                self.recompute();
-            }
-        }
-        if response.response.secondary_clicked() {
-            if let Some(index) = nearest(&self.points, pointer.x, pointer.y) {
-                if remove_point(&mut self.points, index).is_ok() {
-                    self.recompute();
-                }
-            }
-        }
-    }
-
-    fn table(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical()
-            .max_height(220.0)
-            .show(ui, |ui| {
-                egui::Grid::new("points")
-                    .striped(true)
-                    .spacing([18.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.strong("Index");
-                        ui.strong("°C");
-                        ui.strong("Duty %");
-                        ui.strong("Raw");
-                        ui.end_row();
-                        for (index, point) in self.points.iter_mut().enumerate() {
-                            ui.label(index.to_string());
-                            let mut temp = point.temp_c;
-                            let mut percent = aero_core::raw_to_percent(point.duty_raw);
-                            let mut raw = point.duty_raw;
-                            if ui
-                                .add(egui::DragValue::new(&mut temp).range(0..=100))
-                                .changed()
-                            {
-                                point.temp_c = temp;
-                            }
-                            if ui
-                                .add(egui::DragValue::new(&mut percent).range(0..=100))
-                                .changed()
-                            {
-                                point.duty_raw = aero_core::percent_to_raw(percent);
-                            }
-                            if ui
-                                .add(egui::DragValue::new(&mut raw).range(0..=229))
-                                .changed()
-                            {
-                                point.duty_raw = raw;
-                            }
-                            ui.end_row();
-                        }
-                    });
-            });
-        self.recompute();
+        let fg = if fill == CARD_RAISED {
+            MUTED
+        } else {
+            ON_ACCENT
+        };
+        pill(ui, text, fill, fg);
     }
 
     fn power_ui(&mut self, ui: &mut egui::Ui) {
@@ -1599,22 +1486,4 @@ fn mode_from_flags(flags: &str) -> Option<FanMode> {
     } else {
         None
     }
-}
-
-fn nearest(points: &[CurvePoint], x: f64, y: f64) -> Option<usize> {
-    points
-        .iter()
-        .enumerate()
-        .min_by(|(_, left), (_, right)| {
-            let dl = dist(left, x, y);
-            let dr = dist(right, x, y);
-            dl.partial_cmp(&dr).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|(index, _)| index)
-}
-
-fn dist(point: &CurvePoint, x: f64, y: f64) -> f64 {
-    let dx = (f64::from(point.temp_c) - x) / 80.0;
-    let dy = (f64::from(aero_core::raw_to_percent(point.duty_raw)) - y) / 100.0;
-    dx * dx + dy * dy
 }

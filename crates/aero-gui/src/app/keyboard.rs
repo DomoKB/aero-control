@@ -1,5 +1,5 @@
 //! Keyboard lighting tab: Control Center's built-in keyboard options, applied
-//! only when the user presses Apply, with 0x88 readback as the success test.
+//! once per pick or slider release, with 0x88 readback as the success test.
 
 use std::path::PathBuf;
 
@@ -7,10 +7,13 @@ use aero_kbd::mock::MockKeyboard;
 use aero_kbd::profile::{Store, PROFILE_COUNT};
 use aero_kbd::proto::{self, DirectionKind};
 use aero_kbd::{Color, Direction, Effect, KbdError, KeyboardBackend, LightSettings, Rgb, Verified};
-use eframe::egui::{self, Color32, Frame, Margin, RichText, Rounding, Stroke, Vec2};
+use eframe::egui::{
+    self, Align2, Color32, FontId, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2,
+};
 
 use super::{
-    banner, info_card, ACCENT, CARD, CARD_RAISED, DANGER, MUTED, ON_ACCENT, STROKE, TEXT, WARN,
+    banner, card, kbd_preview, mix, page_header, section_title, segmented, ACCENT, BG, CARD_RAISED,
+    DANGER, MUTED, ON_ACCENT, STROKE, TEXT,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -230,7 +233,7 @@ impl KeyboardTab {
         let matrix = proto::solid_matrix(Rgb(r, g, b));
         match kb.write_custom(slot, &matrix) {
             Ok(()) => self.set_status(
-                format!("CUSTOM {} picture written and read back (all keys #{r:02X}{g:02X}{b:02X}). Press Apply to show it.", slot + 1),
+                format!("CUSTOM {} picture written and read back (all keys #{r:02X}{g:02X}{b:02X}). Pick it again to show it.", slot + 1),
                 false,
             ),
             Err(e) => self.set_status(format!("CUSTOM {} picture: {e}", slot + 1), true),
@@ -247,181 +250,355 @@ impl KeyboardTab {
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.ensure_open();
-        ui.label(RichText::new("Keyboard").size(22.0).strong().color(TEXT));
-        ui.label(
-            RichText::new(
-                "Built-in keyboard lighting, as in Control Center. Nothing is sent until Apply.",
-            )
-            .color(MUTED),
+        page_header(
+            ui,
+            "Keyboard",
+            "Built-in keyboard lighting, as in Control Center. Each change applies when you pick it.",
         );
-        ui.add_space(12.0);
-
-        match (&self.backend, &self.open_error) {
-            (Some(kb), _) => {
-                let i = kb.info();
-                let fw = i.firmware.clone().unwrap_or_else(|| "unknown".into());
-                info_card(
-                    ui,
-                    &format!(
-                        "{} · {:04X}:{:04X} · firmware {fw}",
-                        kb.label(),
-                        i.vendor_id,
-                        i.product_id
-                    ),
-                    &i.path,
-                );
-            }
-            (None, Some(e)) => banner(ui, &format!("Keyboard unavailable: {e}"), DANGER),
-            (None, None) => {}
+        if let Some(e) = &self.open_error {
+            banner(ui, &format!("Keyboard unavailable: {e}"), DANGER);
+            ui.add_space(12.0);
         }
+        let wide = ui.available_width() > 720.0;
+        if wide {
+            self.preview_card(ui);
+            ui.add_space(12.0);
+        }
+        self.effect_card(ui);
         ui.add_space(12.0);
+        self.controls_card(ui);
+        ui.add_space(12.0);
+        if !wide {
+            self.preview_card(ui);
+            ui.add_space(12.0);
+        }
+        self.profiles(ui);
+        ui.add_space(12.0);
+        egui::CollapsingHeader::new("About").default_open(false).show(ui, |ui| {
+            ui.label("Targets only the built-in keyboard (USB 1044:7A3F on this Aero 17 YB; other Gigabyte Ite IDs 7A38/7A39/7A3A/7A3B are accepted) and only its collection with 9-byte feature reports, the same rule Control Center uses. External keyboards are never opened.");
+            ui.add_space(4.0);
+            ui.label("Each change sends one 0x08 feature report, waits 65 ms, then asks the keyboard what it is running (0x88). Success is reported only if every field reads back the same. Sliders send once, when you let go.");
+            ui.add_space(4.0);
+            ui.label("Profiles and per-effect memory live in %APPDATA%\\aero-control\\keyboard-lighting.txt. Control Center's registry and ProfileData.xml are not touched; the keyboard itself keeps the last applied effect.");
+        });
+    }
 
-        section(ui, "LIGHTING EFFECT");
-        let mut picked = None;
-        ui.horizontal_wrapped(|ui| {
-            for effect in Effect::ALL {
-                if tile(ui, effect.gcc_name(), self.settings.effect == effect, 150.0).clicked() {
-                    picked = Some(effect);
-                }
+    fn preview_card(&mut self, ui: &mut egui::Ui) {
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let width = (ui.available_width() * 0.55).min(460.0);
+                let (rect, _) =
+                    ui.allocate_exact_size(Vec2::new(width, width * 0.3), Sense::hover());
+                kbd_preview::paint(ui.painter(), rect, &self.settings, self.custom_rgb);
+                ui.add_space(16.0);
+                ui.vertical(|ui| {
+                    ui.label(
+                        RichText::new(title_case(self.settings.effect.gcc_name()))
+                            .size(18.0)
+                            .strong()
+                            .color(TEXT),
+                    );
+                    ui.label(
+                        RichText::new(self.settings.normalized().describe())
+                            .size(13.0)
+                            .color(MUTED),
+                    );
+                    ui.add_space(6.0);
+                    self.live_state(ui);
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let ready = self.backend.is_some();
+                        if ui
+                            .add_enabled(ready, small_button("Read from keyboard"))
+                            .clicked()
+                        {
+                            self.read_back();
+                        }
+                        if ui
+                            .add_enabled(ready, small_button("Reset effect"))
+                            .on_hover_text("Control Center's default for this effect.")
+                            .clicked()
+                        {
+                            self.settings = LightSettings::effect_default(self.settings.effect);
+                            self.old_color = Color::Orange;
+                            self.apply();
+                        }
+                    });
+                    if let Some(kb) = &self.backend {
+                        let i = kb.info();
+                        ui.add_space(4.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "{} · {:04X}:{:04X} · firmware {}",
+                                kb.label(),
+                                i.vendor_id,
+                                i.product_id,
+                                i.firmware.as_deref().unwrap_or("unknown")
+                            ))
+                            .size(12.0)
+                            .color(MUTED),
+                        );
+                    }
+                });
+            });
+        });
+    }
+
+    fn live_state(&self, ui: &mut egui::Ui) {
+        let (text, color) = match (&self.status, self.keyboard_state) {
+            (Some((_, true)), _) => ("Not applied, see the status line", DANGER),
+            (_, Some(read)) if read == self.settings.normalized() => {
+                ("Live · confirmed by the keyboard", ACCENT)
+            }
+            _ => ("Not applied yet", MUTED),
+        };
+        ui.horizontal(|ui| {
+            let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::hover());
+            ui.painter().circle_filled(dot.center(), 4.0, color);
+            ui.label(RichText::new(text).size(13.0).color(color));
+        });
+    }
+
+    fn effect_card(&mut self, ui: &mut egui::Ui) {
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_title(ui, "Effect");
+            ui.add_space(10.0);
+            let gap = 8.0;
+            let compact = ui.available_width() < 720.0;
+            let cols = ((ui.available_width() + gap) / 150.0).floor().max(1.0) as usize;
+            let tile_w = (ui.available_width() - gap * (cols as f32 - 1.0)) / cols as f32;
+            let mut picked = None;
+            for row in Effect::ALL.chunks(cols) {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = gap;
+                    for effect in row {
+                        if self.effect_tile(ui, *effect, tile_w, compact).clicked() {
+                            picked = Some(*effect);
+                        }
+                    }
+                });
+                ui.add_space(gap - ui.spacing().item_spacing.y);
+            }
+            if let Some(effect) = picked {
+                self.select_effect(effect);
+                self.apply();
             }
         });
-        if let Some(e) = picked {
-            self.select_effect(e);
-        }
-        ui.add_space(12.0);
+    }
 
-        let effect = self.settings.effect;
-        card(ui, |ui| {
-            if effect.is_custom() {
+    fn effect_tile(
+        &self,
+        ui: &mut egui::Ui,
+        effect: Effect,
+        width: f32,
+        compact: bool,
+    ) -> egui::Response {
+        let height = if compact { 30.0 } else { 36.0 };
+        let (rect, response) = ui.allocate_exact_size(Vec2::new(width, height), Sense::click());
+        let on = self.settings.effect == effect;
+        let fill = if on {
+            mix(CARD_RAISED, ACCENT, 0.22)
+        } else if response.hovered() {
+            mix(CARD_RAISED, TEXT, 0.06)
+        } else {
+            CARD_RAISED
+        };
+        let stroke = if on {
+            Stroke::new(1.5_f32, ACCENT)
+        } else {
+            Stroke::new(1.0_f32, STROKE)
+        };
+        let painter = ui.painter_at(rect);
+        painter.rect(rect.shrink(0.5), Rounding::same(10.0), fill, stroke);
+        let chip = Rect::from_min_size(
+            Pos2::new(rect.left() + 10.0, rect.center().y - 7.0),
+            Vec2::new(20.0, 14.0),
+        );
+        let mut sample = self.store.recall(effect).0;
+        sample.brightness = proto::BRIGHTNESS_MAX;
+        if on {
+            sample = self.settings;
+            sample.brightness = sample.brightness.max(proto::BRIGHTNESS_MAX / 2);
+        }
+        for i in 0..4 {
+            let part = Rect::from_min_size(
+                chip.min + Vec2::new(i as f32 * 5.0, 0.0),
+                Vec2::new(5.0, chip.height()),
+            );
+            let x = (i as f32 + 0.5) / 4.0;
+            painter.rect_filled(
+                part,
+                Rounding::ZERO,
+                kbd_preview::key_color(&sample, self.custom_rgb, x, 0.3),
+            );
+        }
+        painter.rect_stroke(chip, Rounding::same(3.0), Stroke::new(1.0_f32, STROKE));
+        painter.text(
+            Pos2::new(chip.right() + 10.0, rect.center().y),
+            Align2::LEFT_CENTER,
+            title_case(effect.gcc_name()),
+            FontId::proportional(if compact { 12.5 } else { 13.5 }),
+            if on { TEXT } else { mix(MUTED, TEXT, 0.6) },
+        );
+        response
+    }
+
+    fn controls_card(&mut self, ui: &mut egui::Ui) {
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            if self.settings.effect.is_custom() {
                 self.custom_controls(ui);
             } else {
                 self.color_controls(ui);
             }
-            ui.add_space(8.0);
+            ui.add_space(12.0);
             let mut pct = proto::brightness_to_slider(self.settings.brightness);
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Brightness").color(TEXT));
-                if ui
-                    .add(
-                        egui::Slider::new(&mut pct, 0..=100)
-                            .step_by(2.0)
-                            .suffix("%"),
-                    )
-                    .changed()
-                {
-                    self.settings.brightness = proto::brightness_from_slider(pct);
-                }
-                ui.label(
-                    RichText::new(format!("raw {}/50", self.settings.brightness)).color(MUTED),
-                );
-            });
-            if effect.shows_speed(self.settings.color) {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Speed").color(TEXT));
-                    // Firmware speed 1 is fastest; show it the way Control Center's slider reads.
-                    let mut fast = 11 - self.settings.speed;
-                    if ui
-                        .add(egui::Slider::new(&mut fast, 1..=10).text("Min → Max"))
-                        .changed()
-                    {
-                        self.settings.speed = 11 - fast;
-                    }
-                    ui.label(
-                        RichText::new(format!("raw {} (1 = fastest)", self.settings.speed))
-                            .color(MUTED),
-                    );
-                });
+            let (changed, done) = slider(ui, "Brightness", &mut pct, 0, 100, "%");
+            if changed {
+                self.settings.brightness = proto::brightness_from_slider(pct);
             }
-            let kind = effect.direction_kind();
+            if done {
+                self.apply();
+            }
+            if self.settings.effect.shows_speed(self.settings.color) {
+                ui.add_space(6.0);
+                let mut fast = 11 - self.settings.speed;
+                let (changed, done) = slider(ui, "Speed", &mut fast, 1, 10, " / 10");
+                if changed {
+                    self.settings.speed = 11 - fast;
+                }
+                if done {
+                    self.apply();
+                }
+            }
+            let kind = self.settings.effect.direction_kind();
             if kind != DirectionKind::None {
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Direction").color(TEXT));
-                    let options: &[Direction] = if kind == DirectionKind::Rotate {
-                        &Direction::LINEAR[..2]
-                    } else {
-                        &Direction::LINEAR
-                    };
-                    for d in options {
-                        if tile(ui, d.label(kind), self.settings.direction == *d, 130.0).clicked() {
-                            self.settings.direction = *d;
-                        }
+                ui.add_space(10.0);
+                let options: &[Direction] = if kind == DirectionKind::Rotate {
+                    &Direction::LINEAR[..2]
+                } else {
+                    &Direction::LINEAR
+                };
+                let items: Vec<_> = options.iter().map(|d| (d.label(kind), "", true)).collect();
+                let on = options.iter().position(|d| *d == self.settings.direction);
+                ui.horizontal(|ui| {
+                    row_label(ui, "Direction", 46.0);
+                    if let Some(index) = segmented(ui, "kbd_direction", &items, on, None) {
+                        self.settings.direction = options[index];
+                        self.apply();
                     }
                 });
             }
         });
-        ui.add_space(12.0);
+    }
 
+    fn color_controls(&mut self, ui: &mut egui::Ui) {
+        let effect = self.settings.effect;
+        let mode = self.color_mode();
+        let mut choice = None;
+        ui.horizontal_wrapped(|ui| {
+            row_label(ui, "Colour", 34.0);
+            ui.spacing_mut().item_spacing.x = 10.0;
+            if swatch(ui, Swatch::Off, mode == ColorMode::Off).clicked() {
+                choice = Some(None);
+            }
+            let random_on =
+                mode == ColorMode::Random || (effect.forces_random() && mode == ColorMode::On);
+            if swatch(ui, Swatch::Random, random_on).clicked() {
+                choice = Some(Some(Color::Random));
+            }
+            if effect.shows_palette() {
+                ui.add_space(8.0);
+                for c in Color::PALETTE {
+                    let on = mode == ColorMode::On && self.settings.color == c;
+                    if swatch(ui, Swatch::Palette(c), on).clicked() {
+                        choice = Some(Some(c));
+                    }
+                }
+            } else {
+                ui.label(
+                    RichText::new(format!("{effect} always runs Random colours."))
+                        .size(13.0)
+                        .color(MUTED),
+                );
+            }
+        });
+        match choice {
+            Some(None) => self.select_mode(ColorMode::Off),
+            Some(Some(Color::Random)) => self.select_mode(ColorMode::Random),
+            Some(Some(c)) => {
+                self.select_mode(ColorMode::On);
+                self.select_color(c);
+            }
+            None => return,
+        }
+        self.apply();
+    }
+
+    fn custom_controls(&mut self, ui: &mut egui::Ui) {
+        let slot = self.settings.effect.custom_slot().unwrap_or(0);
         ui.horizontal(|ui| {
-            let ready = self.backend.is_some();
-            let apply = egui::Button::new(RichText::new("Apply").strong().color(ON_ACCENT))
-                .fill(ACCENT)
-                .rounding(Rounding::same(10.0))
-                .min_size(Vec2::new(120.0, 38.0));
-            if ui.add_enabled(ready, apply).clicked() {
-                self.apply();
-            }
-            let read = egui::Button::new("Read from keyboard")
-                .fill(CARD_RAISED)
-                .rounding(Rounding::same(10.0))
-                .min_size(Vec2::new(160.0, 38.0));
-            if ui.add_enabled(ready, read).clicked() {
-                self.read_back();
-            }
+            row_label(ui, "Fill colour", 34.0);
+            ui.color_edit_button_srgb(&mut self.custom_rgb);
+            ui.add_space(8.0);
             if ui
-                .add(
-                    egui::Button::new("Reset effect to Control Center default")
-                        .fill(CARD_RAISED)
-                        .rounding(Rounding::same(10.0)),
+                .add_enabled(
+                    self.backend.is_some(),
+                    small_button(&format!("Write to all keys of CUSTOM {}", slot + 1)),
+                )
+                .on_hover_text(
+                    "Writes one colour to every key slot of this picture and reads it back.",
                 )
                 .clicked()
             {
-                self.settings = LightSettings::effect_default(self.settings.effect);
-                self.old_color = Color::Orange;
+                self.fill_custom(slot);
             }
         });
-        ui.add_space(6.0);
         ui.label(
             RichText::new(format!(
-                "Will send: {}",
-                self.settings.normalized().describe()
+                "CUSTOM {} plays the per-key picture stored in the keyboard. Per-key painting is not included.",
+                slot + 1
             ))
+            .size(12.0)
             .color(MUTED),
         );
-        if let Some(s) = &self.keyboard_state {
-            ui.label(RichText::new(format!("Keyboard reports: {}", s.describe())).color(TEXT));
-        }
-        if let Some((text, err)) = &self.status {
-            ui.add_space(6.0);
-            banner(ui, text, if *err { DANGER } else { ACCENT });
-        }
-        ui.add_space(14.0);
+    }
 
-        section(ui, "PROFILES");
+    fn profiles(&mut self, ui: &mut egui::Ui) {
         let mut load = None;
-        let mut save = None;
-        ui.horizontal_wrapped(|ui| {
-            for i in 0..PROFILE_COUNT {
-                let p = &self.store.profiles[i];
-                card(ui, |ui| {
-                    ui.set_width(200.0);
+        let mut save = false;
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                section_title(ui, "Profiles");
+                ui.add_space(8.0);
+                for i in 0..PROFILE_COUNT {
+                    let p = &self.store.profiles[i];
                     let on = self.store.current_profile == i;
-                    ui.label(
-                        RichText::new(&p.name)
-                            .strong()
-                            .color(if on { ACCENT } else { TEXT }),
-                    );
-                    ui.label(RichText::new(p.settings.describe()).size(12.0).color(MUTED));
-                    ui.horizontal(|ui| {
-                        if ui.button("Load").clicked() {
-                            load = Some(i);
-                        }
-                        if ui.button("Save current").clicked() {
-                            save = Some(i);
-                        }
-                    });
-                });
-            }
+                    let text = RichText::new(&p.name).color(if on { ON_ACCENT } else { TEXT });
+                    if ui
+                        .add(
+                            egui::Button::new(text)
+                                .fill(if on { ACCENT } else { CARD_RAISED })
+                                .rounding(Rounding::same(10.0))
+                                .min_size(Vec2::new(0.0, 32.0)),
+                        )
+                        .on_hover_text(format!("Load and apply: {}", p.settings.describe()))
+                        .clicked()
+                    {
+                        load = Some(i);
+                    }
+                }
+                if ui
+                    .add(small_button("Save current here"))
+                    .on_hover_text("Saves the current lighting into the selected profile (aero-control's file only).")
+                    .clicked()
+                {
+                    save = true;
+                }
+            });
         });
         if let Some(i) = load {
             let s = self.store.profiles[i].settings;
@@ -430,22 +607,14 @@ impl KeyboardTab {
                 self.old_color = s.color;
             }
             self.store.current_profile = i;
-            let saved = self.save_store();
-            self.set_status(
-                format!(
-                    "{} loaded into the editor. Press Apply to send it.{}",
-                    self.store.profiles[i].name,
-                    saved
-                        .err()
-                        .map(|e| format!(" (file: {e})"))
-                        .unwrap_or_default()
-                ),
-                false,
-            );
+            if let Err(e) = self.save_store() {
+                self.set_status(format!("Profile choice not saved: {e}"), true);
+            }
+            self.apply();
         }
-        if let Some(i) = save {
+        if save {
+            let i = self.store.current_profile;
             self.store.profiles[i].settings = self.settings.normalized();
-            self.store.current_profile = i;
             match self.save_store() {
                 Ok(()) => self.set_status(
                     format!(
@@ -457,124 +626,143 @@ impl KeyboardTab {
                 Err(e) => self.set_status(format!("Profile not saved: {e}"), true),
             }
         }
-        ui.add_space(12.0);
-        egui::CollapsingHeader::new("About").default_open(false).show(ui, |ui| {
-            ui.label("Targets only the built-in keyboard (USB 1044:7A3F on this Aero 17 YB; other Gigabyte Ite IDs 7A38/7A39/7A3A/7A3B are accepted) and only its collection with 9-byte feature reports, the same rule Control Center uses. External keyboards are never opened.");
-            ui.add_space(4.0);
-            ui.label("Apply sends one 0x08 feature report, waits 65 ms, then asks the keyboard what it is running (0x88). Success is reported only if every field reads back the same.");
-            ui.add_space(4.0);
-            ui.label("Profiles and per-effect memory live in %APPDATA%\\aero-control\\keyboard-lighting.txt. Control Center's registry and ProfileData.xml are not touched; the keyboard itself keeps the last applied effect.");
-        });
     }
+}
 
-    fn color_controls(&mut self, ui: &mut egui::Ui) {
-        let effect = self.settings.effect;
-        let mode = self.color_mode();
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Colour").color(TEXT));
-            let modes: &[(ColorMode, &str)] = if effect.forces_random() {
-                &[(ColorMode::Random, "Random"), (ColorMode::Off, "Off")]
-            } else {
-                &[
-                    (ColorMode::On, "On"),
-                    (ColorMode::Random, "Random"),
-                    (ColorMode::Off, "Off"),
-                ]
-            };
-            for (m, label) in modes {
-                let on = mode == *m
-                    || (effect.forces_random() && *m == ColorMode::Random && mode == ColorMode::On);
-                if tile(ui, label, on, 90.0).clicked() {
-                    self.select_mode(*m);
-                }
-            }
-        });
-        if effect.shows_palette() && mode == ColorMode::On {
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                for c in Color::PALETTE {
-                    if swatch(ui, c, self.settings.color == c).clicked() {
-                        self.select_color(c);
-                    }
-                }
-            });
-        } else if effect.forces_random() {
-            ui.label(
-                RichText::new(format!(
-                    "{effect} always runs Random colours in Control Center."
-                ))
-                .color(MUTED),
-            );
+const LABEL_W: f32 = 92.0;
+
+fn row_label(ui: &mut egui::Ui, text: &str, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(LABEL_W, height), Sense::hover());
+    ui.painter().text(
+        rect.left_center(),
+        Align2::LEFT_CENTER,
+        text,
+        FontId::proportional(14.5),
+        TEXT,
+    );
+}
+
+fn title_case(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut start = true;
+    for ch in name.chars() {
+        if start {
+            out.extend(ch.to_uppercase());
+        } else {
+            out.extend(ch.to_lowercase());
         }
+        start = ch == ' ';
     }
-
-    fn custom_controls(&mut self, ui: &mut egui::Ui) {
-        let slot = self.settings.effect.custom_slot().unwrap_or(0);
-        ui.label(
-            RichText::new(format!(
-                "CUSTOM {} plays the per-key picture stored in the keyboard. Apply selects it; brightness applies.",
-                slot + 1
-            ))
-            .color(MUTED),
-        );
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Fill colour").color(TEXT));
-            ui.color_edit_button_srgb(&mut self.custom_rgb);
-            let fill = egui::Button::new(format!("Write all keys of CUSTOM {}", slot + 1))
-                .fill(CARD_RAISED)
-                .rounding(Rounding::same(10.0));
-            if ui.add_enabled(self.backend.is_some(), fill).clicked() {
-                self.fill_custom(slot);
-            }
-        });
-        ui.label(
-            RichText::new("Per-key painting and Control Center's game pictures are not included; this writes one colour to every key slot and verifies it by reading the picture back.")
-                .size(12.0)
-                .color(WARN),
-        );
-    }
+    out
 }
 
-fn section(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).size(11.0).color(MUTED));
-    ui.add_space(6.0);
-}
-
-fn card(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
-    Frame::none()
-        .fill(CARD)
-        .rounding(Rounding::same(12.0))
+fn small_button(text: &str) -> egui::Button<'_> {
+    egui::Button::new(RichText::new(text).size(13.0).color(TEXT))
+        .fill(CARD_RAISED)
+        .rounding(Rounding::same(8.0))
         .stroke(Stroke::new(1.0_f32, STROKE))
-        .inner_margin(Margin::same(14.0))
-        .show(ui, add);
+        .min_size(Vec2::new(0.0, 28.0))
 }
 
-fn tile(ui: &mut egui::Ui, label: &str, on: bool, width: f32) -> egui::Response {
-    let text = RichText::new(label).color(if on { ON_ACCENT } else { TEXT });
-    ui.add(
-        egui::Button::new(if on { text.strong() } else { text })
-            .fill(if on { ACCENT } else { CARD_RAISED })
-            .rounding(Rounding::same(10.0))
-            .min_size(Vec2::new(width, 36.0)),
-    )
+/// Painted slider. Returns (value changed, gesture finished with a change).
+fn slider(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut u8,
+    min: u8,
+    max: u8,
+    unit: &str,
+) -> (bool, bool) {
+    let mut changed = false;
+    let mut done = false;
+    ui.horizontal(|ui| {
+        row_label(ui, label, 30.0);
+        let width = (ui.available_width() - 70.0).max(120.0);
+        let (rect, response) =
+            ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::click_and_drag());
+        let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width() - 16.0, 6.0));
+        if let Some(pos) = response.interact_pointer_pos() {
+            if response.dragged() || response.clicked() {
+                let t = ((pos.x - track.left()) / track.width()).clamp(0.0, 1.0);
+                let next = (f32::from(min) + t * f32::from(max - min)).round() as u8;
+                if next != *value {
+                    *value = next;
+                    changed = true;
+                }
+            }
+        }
+        if response.drag_stopped() || response.clicked() {
+            done = true;
+        }
+        let t = f32::from(*value - min) / f32::from(max - min);
+        let painter = ui.painter();
+        painter.rect_filled(track, Rounding::same(3.0), BG);
+        let filled = Rect::from_min_max(
+            track.min,
+            Pos2::new(track.left() + track.width() * t, track.bottom()),
+        );
+        painter.rect_filled(filled, Rounding::same(3.0), ACCENT);
+        let knob = Pos2::new(filled.right(), track.center().y);
+        let ring = if response.hovered() || response.dragged() {
+            ACCENT
+        } else {
+            STROKE
+        };
+        painter.circle(knob, 9.0, TEXT, Stroke::new(2.0_f32, ring));
+        ui.add_space(8.0);
+        ui.label(RichText::new(format!("{value}{unit}")).color(TEXT));
+    });
+    (changed, done)
 }
 
-fn swatch(ui: &mut egui::Ui, color: Color, on: bool) -> egui::Response {
-    let Rgb(r, g, b) = color.preview();
-    let fill = Color32::from_rgb(r, g, b);
-    let text_color = if (r as u32 + g as u32 + b as u32) > 380 {
-        Color32::BLACK
-    } else {
-        Color32::WHITE
+enum Swatch {
+    Off,
+    Random,
+    Palette(Color),
+}
+
+fn swatch(ui: &mut egui::Ui, kind: Swatch, on: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::click());
+    let painter = ui.painter();
+    let center = rect.center();
+    let radius = 12.0;
+    let tip = match kind {
+        Swatch::Off => {
+            painter.circle(center, radius, BG, Stroke::new(1.5_f32, MUTED));
+            painter.line_segment(
+                [center + Vec2::new(-7.0, 7.0), center + Vec2::new(7.0, -7.0)],
+                Stroke::new(1.5_f32, MUTED),
+            );
+            "Off"
+        }
+        Swatch::Random => {
+            for i in 0..6 {
+                let from = i as f32 / 6.0 * std::f32::consts::TAU;
+                let to = from + std::f32::consts::TAU / 6.0;
+                let hue: Color32 = egui::ecolor::Hsva::new(i as f32 / 6.0, 0.8, 1.0, 1.0).into();
+                let points = (0..=6)
+                    .map(|s| center + Vec2::angled(from + (to - from) * s as f32 / 6.0) * radius)
+                    .chain(std::iter::once(center))
+                    .collect();
+                painter.add(egui::Shape::convex_polygon(points, hue, Stroke::NONE));
+            }
+            "Random"
+        }
+        Swatch::Palette(color) => {
+            let Rgb(r, g, b) = color.preview();
+            painter.circle(
+                center,
+                radius,
+                Color32::from_rgb(r, g, b),
+                Stroke::new(1.0_f32, STROKE),
+            );
+            color.name()
+        }
     };
-    ui.add(
-        egui::Button::new(RichText::new(color.name()).color(text_color))
-            .fill(fill)
-            .stroke(Stroke::new(
-                if on { 3.0_f32 } else { 1.0_f32 },
-                if on { TEXT } else { STROKE },
-            ))
-            .rounding(Rounding::same(10.0))
-            .min_size(Vec2::new(86.0, 36.0)),
-    )
+    if on {
+        painter.circle_stroke(center, radius + 3.5, Stroke::new(2.0_f32, ACCENT));
+    } else if response.hovered() {
+        painter.circle_stroke(center, radius + 3.0, Stroke::new(1.0_f32, MUTED));
+    }
+    response.on_hover_text(tip)
 }
