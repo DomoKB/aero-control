@@ -2,6 +2,7 @@ mod app;
 mod elevate;
 mod log_file;
 mod session;
+mod system_power;
 
 use std::env;
 use std::process::ExitCode;

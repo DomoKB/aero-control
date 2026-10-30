@@ -10,13 +10,14 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use aero_core::{
-    apply_mode, restore_firmware_auto, upload_curve, ApplyError, CurvePoint, FanCurve, FanMode,
+    apply_mode, restore_firmware_auto, set_charge_policy, set_nv_power_config, upload_curve,
+    ApplyError, ChargePolicy, CurvePoint, FanCurve, FanMode,
 };
 #[cfg(windows)]
 use aero_wmi::FixedPacer;
 use aero_wmi::{
-    decode_rpm, AcpiReader, AcpiWriter, ClassStatus, MockAcpi, NoPacer, RpmOrder, SetOutcome,
-    WmiError, WmiOutput, WriteParams,
+    decode_rpm, AcpiReader, AcpiWriter, ClassStatus, MockAcpi, NoPacer, Pacer, RpmOrder,
+    SetOutcome, WmiError, WmiOutput, WriteParams,
 };
 
 use crate::log_file::{format_call, CallLog};
@@ -39,6 +40,23 @@ pub struct SensorSnapshot {
     pub rpm2: String,
     pub flags: String,
     pub error: Option<String>,
+    /// Read at startup and after a battery or power write, not on every poll.
+    pub power: Option<PowerSnapshot>,
+}
+
+/// Raw getter values, or the error text.
+#[derive(Clone, Debug)]
+pub struct PowerSnapshot {
+    pub charge_policy: Result<u32, String>,
+    pub charge_stop: Result<u32, String>,
+    pub battery_health: Result<u32, String>,
+    pub nv_power_config: Result<u32, String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PowerWrite {
+    Charge(ChargePolicy),
+    NvPowerConfig(bool),
 }
 
 #[derive(Clone, Debug)]
@@ -57,6 +75,7 @@ enum Command {
     },
     Upload(Vec<CurvePoint>),
     MaxTest,
+    Power(PowerWrite),
     Shutdown,
 }
 
@@ -110,6 +129,10 @@ impl FanSession {
     pub fn max_test(&self) {
         let _ = self.tx.send(Command::MaxTest);
     }
+
+    pub fn power(&self, write: PowerWrite) {
+        let _ = self.tx.send(Command::Power(write));
+    }
 }
 
 impl Drop for FanSession {
@@ -159,7 +182,7 @@ fn worker(choice: BackendChoice, rx: Receiver<Command>, tx: Sender<SessionEvent>
         }
     };
     let _ = tx.send(SessionEvent {
-        sensors: read_sensors(&mut live),
+        sensors: read_sensors_and_power(&mut live),
         message: Some(hello_line(&live, &log_path)),
         error: false,
         busy: false,
@@ -193,6 +216,21 @@ fn worker(choice: BackendChoice, rx: Receiver<Command>, tx: Sender<SessionEvent>
                 let outcome = catch_unwind(AssertUnwindSafe(|| upload_any(&mut live, points)));
                 restore_on_exit = false;
                 let _ = tx.send(finish_apply(&mut live, &mut restore_on_exit, outcome));
+            }
+            Ok(Command::Power(write)) => {
+                let _ = tx.send(busy());
+                let outcome = catch_unwind(AssertUnwindSafe(|| power_any(&mut live, write)));
+                let (message, error) = match outcome {
+                    Ok(Ok(text)) => (text, false),
+                    Ok(Err(err)) => (err.to_string(), true),
+                    Err(_) => ("The power command panicked.".to_string(), true),
+                };
+                let _ = tx.send(SessionEvent {
+                    sensors: read_sensors_and_power(&mut live),
+                    message: Some(message),
+                    error,
+                    busy: false,
+                });
             }
             Ok(Command::MaxTest) => {
                 let _ = tx.send(SessionEvent {
@@ -447,6 +485,38 @@ fn upload_any(live: &mut Live, points: Vec<CurvePoint>) -> Result<String, ApplyE
     ))
 }
 
+fn power_any(live: &mut Live, write: PowerWrite) -> Result<String, ApplyError> {
+    match live {
+        Live::Mock(backend) => run_power(backend, &mut NoPacer, write),
+        #[cfg(windows)]
+        Live::Write(backend) => run_power(backend, &mut FixedPacer::standard(), write),
+        #[cfg(windows)]
+        Live::Read(_) => Err(ApplyError::Wmi(WmiError::NotAvailable(
+            "battery and power writes need an elevated aero-gui",
+        ))),
+    }
+}
+
+fn run_power<W: AcpiWriter, P: Pacer>(
+    writer: &mut W,
+    pacer: &mut P,
+    write: PowerWrite,
+) -> Result<String, ApplyError> {
+    match write {
+        PowerWrite::Charge(policy) => {
+            set_charge_policy(writer, pacer, policy)?;
+            Ok(match policy {
+                ChargePolicy::Standard => "Charging policy set to Standard.".to_string(),
+                ChargePolicy::Custom(stop) => format!("Charging stops at {stop}%."),
+            })
+        }
+        PowerWrite::NvPowerConfig(on) => {
+            set_nv_power_config(writer, pacer, on)?;
+            Ok(format!("NvPowerConfig set to {}.", u8::from(on)))
+        }
+    }
+}
+
 fn restore_any(live: &mut Live) {
     match live {
         Live::Mock(backend) => {
@@ -468,6 +538,37 @@ fn read_sensors(live: &mut Live) -> Option<SensorSnapshot> {
         Live::Read(backend) => Some(snapshot(backend)),
         #[cfg(windows)]
         Live::Write(backend) => Some(snapshot(backend)),
+    }
+}
+
+fn read_sensors_and_power(live: &mut Live) -> Option<SensorSnapshot> {
+    let power = match live {
+        Live::Mock(backend) => power_snapshot(backend),
+        #[cfg(windows)]
+        Live::Read(backend) => power_snapshot(backend),
+        #[cfg(windows)]
+        Live::Write(backend) => power_snapshot(backend),
+    };
+    read_sensors(live).map(|sensors| SensorSnapshot {
+        power: Some(power),
+        ..sensors
+    })
+}
+
+fn power_snapshot<R: AcpiReader>(reader: &mut R) -> PowerSnapshot {
+    let mut read = |method: &str| {
+        reader
+            .get(method, &[])
+            .map_err(|err| err.to_string())?
+            .get("Data")
+            .and_then(|value| value.as_u32())
+            .ok_or_else(|| format!("{method} returned no Data"))
+    };
+    PowerSnapshot {
+        charge_policy: read("GetChargePolicy"),
+        charge_stop: read("GetChargeStop"),
+        battery_health: read("GetBatteryHealth"),
+        nv_power_config: read("GetNvPowerConfig"),
     }
 }
 
@@ -497,6 +598,7 @@ fn snapshot<R: AcpiReader>(reader: &mut R) -> SensorSnapshot {
         } else {
             Some(errors.join(" | "))
         },
+        power: None,
     }
 }
 

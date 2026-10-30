@@ -75,6 +75,10 @@ const fn set(name: &'static str, id: u32, outputs: &'static [(&'static str, Widt
 pub static GETTERS: &[MethodSpec] = &[
     get("GetCPUFanDuty", 70, DATA_U8),
     get("GetGPUFanDuty", 71, DATA_U8),
+    get("GetNvPowerConfig", 81, DATA_U8),
+    get("GetBatteryHealth", 97, DATA_U8),
+    get("GetChargePolicy", 100, DATA_U16),
+    get("GetChargeStop", 101, DATA_U16),
     get("GetStepFanStatus", 103, DATA_U16),
     MethodSpec {
         name: "GetFanIndexValue",
@@ -100,6 +104,8 @@ pub static SETTERS: &[MethodSpec] = &[
     set("SetGPUFanDuty", 71, DATA_OUT),
     set("SetNvPowerConfig", 81, &[]),
     set("SetSuperQuiet", 88, &[]),
+    set("SetChargePolicy", 100, DATA_OUT),
+    set("SetChargeStop", 101, DATA_OUT),
     set("SetCurrentFanStep", 102, DATA_OUT),
     set("SetStepFanStatus", 103, DATA_OUT),
     MethodSpec {

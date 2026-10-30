@@ -64,6 +64,12 @@ pub enum ApplyError {
     InvalidCharge(u8),
     #[error(transparent)]
     Wmi(#[from] WmiError),
+    #[error("{getter} read back {actual:?}, expected {expected}")]
+    ReadBack {
+        getter: &'static str,
+        expected: u8,
+        actual: Option<u32>,
+    },
     #[error("the firmware did not match after one retry")]
     VerifyFailed { report: ApplyReport },
     #[error("{reason} (firmware auto was restored)")]

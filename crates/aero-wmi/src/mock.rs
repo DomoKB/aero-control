@@ -42,6 +42,10 @@ pub struct MockAcpi {
     pub current_step: u8,
     pub fixed_speed: u8,
     pub gpu_duty: u8,
+    pub nv_power_config: u8,
+    pub battery_health: u8,
+    pub charge_policy: u8,
+    pub charge_stop: u8,
     pub curve: [(u8, u8); FAN_CURVE_SLOTS],
     pub calls: Vec<RecordedCall>,
     pub mof_present: bool,
@@ -85,6 +89,10 @@ impl MockAcpi {
             current_step: 0,
             fixed_speed: 0,
             gpu_duty: 0,
+            nv_power_config: 0,
+            battery_health: 0,
+            charge_policy: 0,
+            charge_stop: 100,
             curve,
             calls: Vec::new(),
             mof_present: true,
@@ -195,6 +203,10 @@ impl AcpiReader for MockAcpi {
             "GetGPUFanDuty" => self.output_u8("Data", self.gpu_duty),
             "GetFanSpeed" => self.output_u8("Data", self.fixed_speed),
             "GetWhisperMode" => self.output_u8("Data", 0),
+            "GetNvPowerConfig" => self.output_u8("Data", self.nv_power_config),
+            "GetBatteryHealth" => self.output_u8("Data", self.battery_health),
+            "GetChargePolicy" => self.output_u16("Data", u16::from(self.charge_policy)),
+            "GetChargeStop" => self.output_u16("Data", u16::from(self.charge_stop)),
             "GetFanIndexValue" => self.fan_index(params)?,
             other => self.zeros_for(other)?,
         };
@@ -229,6 +241,9 @@ impl AcpiWriter for MockAcpi {
             ("SetCurrentFanStep", WriteParams::Data(value)) => self.current_step = *value,
             ("SetSuperQuiet", WriteParams::Data(value)) => self.super_quiet = *value,
             ("SetFanAdjustStatus", WriteParams::Data(value)) => self.fan_adjust = *value,
+            ("SetNvPowerConfig", WriteParams::Data(value)) => self.nv_power_config = *value,
+            ("SetChargePolicy", WriteParams::Data(value)) => self.charge_policy = *value,
+            ("SetChargeStop", WriteParams::Data(value)) => self.charge_stop = *value,
             ("SetFanIndexValue", WriteParams::FanPoint { index, temp, duty }) => {
                 if *index as usize >= FAN_CURVE_SLOTS {
                     return Err(WmiError::IndexOutOfRange { index: *index });

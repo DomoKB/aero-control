@@ -14,6 +14,7 @@ mod apply;
 mod curve;
 mod import_gcc;
 mod mode;
+mod power;
 mod preset;
 mod profile;
 mod scale;
@@ -36,6 +37,7 @@ pub use mode::{
     custom_prefix, fan_point_writes, gaming_script, normal_script, quiet_script, script_for,
     FanMode, ModeScript, PlannedWrite,
 };
+pub use power::{set_charge_policy, set_nv_power_config, ChargePolicy};
 pub use preset::{
     builtin_config, curve_from_percent, factory_curve, gcc_floor_raw, presets, Preset, PresetKind,
     FACTORY_YB_CHIP_RAW, FACTORY_YB_PERCENT,

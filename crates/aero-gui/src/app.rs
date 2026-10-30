@@ -8,19 +8,21 @@ use std::time::Instant;
 
 use aero_core::{
     constrain_drag, insert_point, issues, parse_custom_fan_table_text, remove_point,
-    stair_polyline, CurveIssue, CurvePoint, FanCurve, FanMode, FIXED_FLOOR_PERCENT,
+    stair_polyline, ChargePolicy, CurveIssue, CurvePoint, FanCurve, FanMode, FIXED_FLOOR_PERCENT,
 };
 use eframe::egui::{
     self, Align, Align2, Color32, FontId, Frame, Layout, Margin, Pos2, RichText, Rounding, Sense,
     Stroke, TextStyle, Vec2,
 };
 
-use crate::session::{BackendChoice, FanSession, SensorSnapshot};
+use crate::session::{BackendChoice, FanSession, PowerSnapshot, PowerWrite, SensorSnapshot};
+use crate::system_power::{Battery, Plan, SystemPower};
 
 mod gauge;
 mod keyboard;
 use keyboard::KeyboardTab;
 
+const CHARGE_POLICY_CUSTOM: u8 = 4;
 const PLOT_X_END: f64 = 100.0;
 const HISTORY_SECS: f64 = 60.0;
 
@@ -61,6 +63,13 @@ pub struct AeroApp {
     active_mode: Option<FanMode>,
     pending_mode: Option<FanMode>,
     keyboard: KeyboardTab,
+    firmware_power: Option<PowerSnapshot>,
+    charge_custom: bool,
+    charge_stop: u8,
+    system: SystemPower,
+    plans: Vec<Plan>,
+    active_plan: Result<Plan, String>,
+    battery: Option<Battery>,
 }
 
 const MODES: [(&str, FanMode, &str); 6] = [
@@ -168,8 +177,7 @@ impl History {
 impl AeroApp {
     pub fn new(cc: &eframe::CreationContext<'_>, choice: BackendChoice) -> Self {
         install_theme(&cc.egui_ctx);
-        let keyboard = KeyboardTab::new(matches!(choice, BackendChoice::Mock));
-
+        let mock = matches!(choice, BackendChoice::Mock);
         let points = aero_core::factory_curve().points().to_vec();
         let issues = issues(&points);
         let session = FanSession::start(choice);
@@ -179,35 +187,13 @@ impl AeroApp {
                 session.backend_label, session.log_path
             )
         });
-        let mut sensors = Sensors {
-            cpu: "—".into(),
-            gpu: "—".into(),
-            gpu2: "—".into(),
-            rpm1: "—".into(),
-            rpm2: "—".into(),
-            flags: "—".into(),
-        };
-        let mut sensor_error = None;
-        let mut history = History::new();
-        if let Some(snapshot) = session.initial_sensors.clone() {
-            sensor_error = snapshot.error.clone();
-            sensors.cpu = snapshot.cpu;
-            sensors.gpu = snapshot.gpu;
-            sensors.gpu2 = snapshot.gpu2;
-            sensors.rpm1 = snapshot.rpm1;
-            sensors.rpm2 = snapshot.rpm2;
-            sensors.flags = snapshot.flags;
-            history.cpu.push(0.0, parse_temp(&sensors.cpu));
-            history.gpu.push(0.0, parse_temp(&sensors.gpu));
-            history.rpm1.push(0.0, parse_rpm(&sensors.rpm1));
-            history.rpm2.push(0.0, parse_rpm(&sensors.rpm2));
-        }
-        let active_mode = mode_from_flags(&sensors.flags);
-        Self {
+        let initial = session.initial_sensors.clone();
+        let system = SystemPower::new(mock);
+        let mut app = Self {
             session,
             busy: false,
             report_error: false,
-            sensor_error,
+            sensor_error: None,
             arm_max_test: false,
             page: Page::Fans,
             points,
@@ -219,13 +205,31 @@ impl AeroApp {
             import_text: "45,35;60,45;0,0;85,80;90,100".to_string(),
             import_note: String::new(),
             report,
-            sensors,
-            history,
+            sensors: Sensors {
+                cpu: "—".into(),
+                gpu: "—".into(),
+                gpu2: "—".into(),
+                rpm1: "—".into(),
+                rpm2: "—".into(),
+                flags: "—".into(),
+            },
+            history: History::new(),
             started: Instant::now(),
-            active_mode,
+            active_mode: None,
             pending_mode: None,
-            keyboard,
+            keyboard: KeyboardTab::new(mock),
+            firmware_power: None,
+            charge_custom: false,
+            charge_stop: 80,
+            plans: system.plans(),
+            active_plan: system.active(),
+            battery: system.battery(),
+            system,
+        };
+        if let Some(snapshot) = initial {
+            app.apply_snapshot(snapshot);
         }
+        app
     }
 
     fn poll_session(&mut self) {
@@ -255,6 +259,17 @@ impl AeroApp {
         self.sensors.rpm2 = snapshot.rpm2;
         self.sensors.flags = snapshot.flags;
         self.sensor_error = snapshot.error;
+        if let Some(power) = snapshot.power {
+            if let Ok(policy) = power.charge_policy {
+                self.charge_custom = policy == u32::from(CHARGE_POLICY_CUSTOM);
+            }
+            if let Ok(stop) = power.charge_stop {
+                self.charge_stop = stop.clamp(60, 100) as u8;
+            }
+            self.firmware_power = Some(power);
+        }
+        self.battery = self.system.battery();
+        self.active_plan = self.system.active();
         self.history.cpu.push(t, parse_temp(&self.sensors.cpu));
         self.history.gpu.push(t, parse_temp(&self.sensors.gpu));
         self.history.rpm1.push(t, parse_rpm(&self.sensors.rpm1));
@@ -556,63 +571,32 @@ impl AeroApp {
     }
 
     fn mode_segments(&mut self, ui: &mut egui::Ui, allow: bool) {
-        let height = 46.0;
-        let (rect, _) =
-            ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
-        ui.painter()
-            .rect(rect, Rounding::same(12.0), BG, Stroke::new(1.0_f32, STROKE));
-        let seg_w = rect.width() / MODES.len() as f32;
-        for (index, (label, mode, tip)) in MODES.iter().enumerate() {
-            let seg = egui::Rect::from_min_size(
-                rect.min + Vec2::new(index as f32 * seg_w, 0.0),
-                Vec2::new(seg_w, height),
-            )
-            .shrink(4.0);
-            let navigates = *mode == FanMode::Custom;
-            let enabled = allow || navigates;
-            let id = ui.id().with(("mode", index));
-            let response = ui
-                .interact(
-                    seg,
-                    id,
-                    if enabled {
-                        Sense::click()
-                    } else {
-                        Sense::hover()
-                    },
-                )
-                .on_hover_text(*tip);
-            let armed = *mode == FanMode::Max && self.arm_max;
-            let on = self.active_mode == Some(*mode);
-            let (fill, fg) = if armed {
-                (WARN, ON_ACCENT)
-            } else if on {
-                (ACCENT, ON_ACCENT)
-            } else if response.hovered() && enabled {
-                (CARD_RAISED, TEXT)
+        let items = MODES.map(|(label, mode, tip)| {
+            let label = if mode == FanMode::Max && self.arm_max {
+                "Confirm"
             } else {
-                (Color32::TRANSPARENT, if enabled { TEXT } else { MUTED })
+                label
             };
-            ui.painter().rect_filled(seg, Rounding::same(9.0), fill);
-            let label = if armed { "Confirm" } else { *label };
-            ui.painter().text(
-                seg.center(),
-                Align2::CENTER_CENTER,
-                label,
-                FontId::proportional(15.0),
-                fg,
-            );
-            if response.clicked() {
-                match mode {
-                    FanMode::Custom => self.page = Page::Curve,
-                    FanMode::Max if !self.arm_max => {
-                        self.arm_max = true;
-                        self.report = "Max sets both fans to raw 229 (100%). Click Confirm.".into();
-                        self.report_error = false;
-                    }
-                    mode => self.apply_firmware(*mode),
-                }
+            (label, tip, allow || mode == FanMode::Custom)
+        });
+        let on = MODES
+            .iter()
+            .position(|(_, mode, _)| self.active_mode == Some(*mode));
+        let armed = MODES
+            .iter()
+            .position(|(_, mode, _)| *mode == FanMode::Max)
+            .filter(|_| self.arm_max);
+        let Some(index) = segmented(ui, "fan_mode", &items, on, armed) else {
+            return;
+        };
+        match MODES[index].1 {
+            FanMode::Custom => self.page = Page::Curve,
+            FanMode::Max if !self.arm_max => {
+                self.arm_max = true;
+                self.report = "Max sets both fans to raw 229 (100%). Click Confirm.".into();
+                self.report_error = false;
             }
+            mode => self.apply_firmware(mode),
         }
     }
 
@@ -951,26 +935,197 @@ impl AeroApp {
         self.recompute();
     }
 
-    fn power_ui(&self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Power").size(22.0).strong().color(TEXT));
-        ui.add_space(8.0);
+    fn power_ui(&mut self, ui: &mut egui::Ui) {
+        page_header(
+            ui,
+            "Power",
+            "Windows power plan and the NVIDIA power config switch.",
+        );
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_title(ui, "Windows power plan");
+            ui.add_space(10.0);
+            if self.plans.is_empty() {
+                ui.label(
+                    RichText::new("None of the standard plans exist on this system.").color(MUTED),
+                );
+            } else {
+                let items: Vec<(&str, &str, bool)> = self
+                    .plans
+                    .iter()
+                    .map(|plan| (plan.name, "", true))
+                    .collect();
+                let on = self
+                    .plans
+                    .iter()
+                    .position(|plan| self.active_plan.as_ref() == Ok(plan));
+                if let Some(index) = segmented(ui, "plan", &items, on, None) {
+                    let plan = self.plans[index];
+                    match self.system.set_active(plan) {
+                        Ok(()) => {
+                            self.report = format!("Windows power plan set to {}.", plan.name);
+                            self.report_error = false;
+                        }
+                        Err(err) => {
+                            self.report = err;
+                            self.report_error = true;
+                        }
+                    }
+                    self.active_plan = self.system.active();
+                }
+            }
+            ui.add_space(8.0);
+            let note = match &self.active_plan {
+                Ok(plan) => format!(
+                    "Active: {}. Switching does not need Administrator.",
+                    plan.name
+                ),
+                Err(other) => format!("Active: {other}."),
+            };
+            ui.label(RichText::new(note).size(13.0).color(MUTED));
+        });
+        ui.add_space(16.0);
+        let allow = self.writes_allowed();
+        let current = self
+            .firmware_power
+            .as_ref()
+            .map(|power| power.nv_power_config.clone());
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_title(ui, "NVIDIA power config");
+            ui.add_space(10.0);
+            let on = match current {
+                Some(Ok(0)) => Some(0),
+                Some(Ok(1)) => Some(1),
+                _ => None,
+            };
+            let items = [("Off (0)", "", allow), ("On (1)", "", allow)];
+            if let Some(index) = segmented(ui, "nv_power", &items, on, None) {
+                self.send_power(PowerWrite::NvPowerConfig(index == 1));
+            }
+            ui.add_space(8.0);
+            let reading = match current {
+                Some(Ok(value)) => format!("GetNvPowerConfig reads {value}."),
+                Some(Err(err)) => format!("GetNvPowerConfig failed: {err}"),
+                None => "GetNvPowerConfig has not been read.".to_string(),
+            };
+            ui.label(RichText::new(reading).size(13.0).color(MUTED));
+            ui.label(
+                RichText::new(
+                    "Sends SetNvPowerConfig with Data 0 or 1, the values Control Center writes. Its effect on GPU power is not measured here.",
+                )
+                .size(13.0)
+                .color(MUTED),
+            );
+        });
+        ui.add_space(16.0);
         info_card(
             ui,
-            "Not sent to the EC",
-            "Dynamic Boost, NvPowerConfig, the NVIDIA thermal target, AI Boost, and CPU PL1/PL2 can sit on a TOML profile. Applying a profile does not write them.",
+            "Not controlled here",
+            "CPU PL1/PL2, Dynamic Boost, the NVIDIA thermal target and the GPU MUX. A profile can store some of these, but nothing in this build writes them.",
         );
-        ui.add_space(12.0);
-        info_card(ui, "Firmware flags", &self.sensors.flags);
     }
 
-    fn battery_ui(&self, ui: &mut egui::Ui) {
-        ui.label(RichText::new("Battery").size(22.0).strong().color(TEXT));
-        ui.add_space(8.0);
-        info_card(
+    fn battery_ui(&mut self, ui: &mut egui::Ui) {
+        page_header(
             ui,
-            "Charge limit",
-            "A profile may store charge_limit. Nothing in this build writes a battery or charge policy to the embedded controller.",
+            "Battery",
+            "Charging policy is kept by the embedded controller.",
         );
+        let power = self.firmware_power.clone();
+        let battery = self.battery;
+        ui.columns(2, |cols| {
+            card().show(&mut cols[0], |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_min_height(118.0);
+                section_title(ui, "Windows battery");
+                ui.add_space(8.0);
+                battery_status(ui, battery);
+            });
+            card().show(&mut cols[1], |ui| {
+                ui.set_width(ui.available_width());
+                ui.set_min_height(118.0);
+                section_title(ui, "Battery health code");
+                ui.add_space(8.0);
+                let code = match power.as_ref().map(|power| &power.battery_health) {
+                    Some(Ok(code)) => code.to_string(),
+                    Some(Err(_)) => "error".to_string(),
+                    None => "—".to_string(),
+                };
+                ui.label(RichText::new(code).size(34.0).color(TEXT));
+                ui.label(
+                    RichText::new(
+                        "Raw GetBatteryHealth value. Gigabyte does not document what the code means.",
+                    )
+                    .size(13.0)
+                    .color(MUTED),
+                );
+            });
+        });
+        ui.add_space(16.0);
+        let allow = self.writes_allowed();
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_title(ui, "Charging policy");
+            ui.add_space(10.0);
+            let items = [
+                ("Standard", "Charge to 100%.", true),
+                ("Custom", "Stop charging at the percent below.", true),
+            ];
+            if let Some(index) = segmented(
+                ui,
+                "charge",
+                &items,
+                Some(usize::from(self.charge_custom)),
+                None,
+            ) {
+                self.charge_custom = index == 1;
+            }
+            ui.add_space(12.0);
+            ui.add_enabled_ui(self.charge_custom, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Stop at").color(TEXT));
+                    ui.spacing_mut().slider_width = (ui.available_width() - 120.0).max(160.0);
+                    ui.add(
+                        egui::Slider::new(&mut self.charge_stop, 60..=100)
+                            .suffix("%")
+                            .trailing_fill(true),
+                    );
+                });
+            });
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                let policy = if self.charge_custom {
+                    ChargePolicy::Custom(self.charge_stop)
+                } else {
+                    ChargePolicy::Standard
+                };
+                if ui
+                    .add_enabled(allow, primary_button("Apply"))
+                    .on_hover_text(
+                        "Custom sends SetChargePolicy 4, then SetChargeStop. Both are read back.",
+                    )
+                    .clicked()
+                {
+                    self.send_power(PowerWrite::Charge(policy));
+                }
+                ui.label(
+                    RichText::new(firmware_charge_text(power.as_ref()))
+                        .size(13.0)
+                        .color(MUTED),
+                );
+            });
+        });
+    }
+
+    fn send_power(&mut self, write: PowerWrite) {
+        if !self.writes_allowed() {
+            self.report = "Battery and power writes need an elevated aero-gui.".to_string();
+            self.report_error = true;
+            return;
+        }
+        self.busy = true;
+        self.session.power(write);
     }
 
     fn log_ui(&self, ui: &mut egui::Ui) {
@@ -1114,6 +1269,59 @@ fn card() -> Frame {
         .inner_margin(Margin::same(18.0))
 }
 
+/// Equal-width segmented buttons. Returns the clicked index.
+fn segmented(
+    ui: &mut egui::Ui,
+    id: &str,
+    items: &[(&str, &str, bool)],
+    on: Option<usize>,
+    armed: Option<usize>,
+) -> Option<usize> {
+    let height = 46.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+    ui.painter()
+        .rect(rect, Rounding::same(12.0), BG, Stroke::new(1.0_f32, STROKE));
+    let seg_w = rect.width() / items.len() as f32;
+    let mut clicked = None;
+    for (index, (label, tip, enabled)) in items.iter().enumerate() {
+        let seg = egui::Rect::from_min_size(
+            rect.min + Vec2::new(index as f32 * seg_w, 0.0),
+            Vec2::new(seg_w, height),
+        )
+        .shrink(4.0);
+        let sense = if *enabled {
+            Sense::click()
+        } else {
+            Sense::hover()
+        };
+        let mut response = ui.interact(seg, ui.id().with((id, index)), sense);
+        if !tip.is_empty() {
+            response = response.on_hover_text(*tip);
+        }
+        let (fill, fg) = if armed == Some(index) {
+            (WARN, ON_ACCENT)
+        } else if on == Some(index) {
+            (ACCENT, ON_ACCENT)
+        } else if response.hovered() && *enabled {
+            (CARD_RAISED, TEXT)
+        } else {
+            (Color32::TRANSPARENT, if *enabled { TEXT } else { MUTED })
+        };
+        ui.painter().rect_filled(seg, Rounding::same(9.0), fill);
+        ui.painter().text(
+            seg.center(),
+            Align2::CENTER_CENTER,
+            *label,
+            FontId::proportional(15.0),
+            fg,
+        );
+        if response.clicked() {
+            clicked = Some(index);
+        }
+    }
+    clicked
+}
+
 fn primary_button(text: &str) -> egui::Button<'_> {
     egui::Button::new(RichText::new(text).strong().color(ON_ACCENT))
         .fill(ACCENT)
@@ -1227,6 +1435,56 @@ fn sparkline(
             Stroke::new(1.8_f32, color),
         ));
     }
+}
+
+fn battery_status(ui: &mut egui::Ui, battery: Option<Battery>) {
+    let Some(battery) = battery else {
+        ui.label(RichText::new("GetSystemPowerStatus failed.").color(MUTED));
+        return;
+    };
+    let percent = battery.percent;
+    ui.label(
+        RichText::new(percent.map_or("—".to_string(), |p| format!("{p}%")))
+            .size(34.0)
+            .color(TEXT),
+    );
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 10.0), Sense::hover());
+    ui.painter()
+        .rect_filled(rect, Rounding::same(5.0), CARD_RAISED);
+    if let Some(p) = percent {
+        let mut fill = rect;
+        fill.set_width(rect.width() * f32::from(p) / 100.0);
+        ui.painter().rect_filled(fill, Rounding::same(5.0), ACCENT);
+    }
+    ui.add_space(6.0);
+    let source = match battery.on_ac {
+        Some(true) => "On AC power",
+        Some(false) => "On battery",
+        None => "Power source unknown",
+    };
+    let state = if battery.charging { " · charging" } else { "" };
+    ui.label(
+        RichText::new(format!("{source}{state}"))
+            .size(13.0)
+            .color(MUTED),
+    );
+}
+
+fn firmware_charge_text(power: Option<&PowerSnapshot>) -> String {
+    let Some(power) = power else {
+        return "Firmware values not read yet.".to_string();
+    };
+    let policy = match power.charge_policy {
+        Ok(0) => "Standard".to_string(),
+        Ok(4) => "Custom".to_string(),
+        Ok(other) => format!("policy {other}"),
+        Err(_) => "policy unreadable".to_string(),
+    };
+    let stop = match power.charge_stop {
+        Ok(stop) => format!("stop {stop}%"),
+        Err(_) => "stop unreadable".to_string(),
+    };
+    format!("Firmware now: {policy}, {stop}.")
 }
 
 fn info_card(ui: &mut egui::Ui, title: &str, body: &str) {
