@@ -82,8 +82,6 @@ impl Profile {
 
     pub fn has_deferred_fields(&self) -> bool {
         self.dynamic_boost.is_some()
-            || self.nv_power_config.is_some()
-            || self.nv_thermal_target.is_some()
             || self.ai_boost.is_some()
             || self.charge_limit.is_some()
             || self.cpu_pl1_w.is_some()

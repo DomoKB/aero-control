@@ -1,7 +1,7 @@
 //! Firmware fan-mode scripts.
 //!
 //! Each script is a list of `GB_WMIACPI_Set` calls. It does not read
-//! temperatures. Sources and the provisional lines are described on the
+//! temperatures. Sources are described on the
 //! scripts themselves and in `docs/SOURCES.md`.
 
 use aero_wmi::WriteParams;
@@ -38,7 +38,6 @@ pub struct PlannedWrite {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModeScript {
     pub name: &'static str,
-    pub provisional: bool,
     pub notes: &'static str,
     pub writes: Vec<PlannedWrite>,
 }
@@ -51,56 +50,57 @@ fn data(method: &'static str, value: u8) -> PlannedWrite {
 }
 
 /// Clears that stop a leftover step, fixed duty, or quiet flag from overriding
-/// the mode we're about to enter. Clearing `SetFanAdjustStatus` is a defensive
-/// extra and is marked provisional in the notes.
-fn clears(super_quiet: u8) -> Vec<PlannedWrite> {
+/// the mode we're about to enter.
+fn clears() -> Vec<PlannedWrite> {
     vec![
         data("SetFanAdjustStatus", 0),
-        data("SetSuperQuiet", super_quiet),
+        data("SetSuperQuiet", 0),
         data("SetCurrentFanStep", 0),
-        data("SetFixedFanStatus", 0),
-        data("SetStepFanStatus", 0),
     ]
 }
 
+/// Control Center's DeepFan mode sequence for the AERO 17 YB, which has
+/// bSuperQuiet, bSuperMode and bNvwhisper off and bNvPowerCfg on
+/// (MainWindow.cs 1436-1445).
+fn firmware_mode(auto: u8, thermal_target: u8, nv_power_config: u8) -> Vec<PlannedWrite> {
+    let mut writes = clears();
+    writes.extend([
+        data("SetFixedFanStatus", 0),
+        data("SetStepFanStatus", 0),
+        data("SetAutoFanStatus", auto),
+        data("SetNvThermalTarget", thermal_target),
+        data("SetNvPowerConfig", nv_power_config),
+    ]);
+    writes
+}
+
 pub fn normal_script() -> ModeScript {
-    let mut writes = clears(0);
-    writes.push(data("SetAutoFanStatus", 1));
     ModeScript {
         name: "normal",
-        provisional: false,
-        notes: "Firmware automatic mode. The tail (fixed off, step off, auto on) is the scope's restore sequence. SetCurrentFanStep(0) is the §5.1 bugfix. SetFanAdjustStatus(0) and SetSuperQuiet(0) drop leftover overrides.",
-        writes,
+        notes: "Control Center normal_Click (DeepFan.cs 6801-6870): auto 0, SetQuietMode(0) which is SetNvThermalTarget (Helpers.cs 1399-1420), and SetNvPowerConfig(0) from FanAndOcTheme. The first three writes are extra clears.",
+        writes: firmware_mode(0, 0, 0),
     }
 }
 
 pub fn quiet_script() -> ModeScript {
-    let mut writes = clears(0);
-    // Auto stays on so a missing SuperQuiet method cannot leave the fans with
-    // no governor. The Aero 16 "Silence" trace turns auto off as part of a
-    // larger power-mode sequence (whisper + thermal target) that we do not send.
-    writes.push(data("SetAutoFanStatus", 1));
-    writes.push(data("SetSuperQuiet", 1));
     ModeScript {
         name: "quiet",
-        provisional: true,
-        notes: "PROVISIONAL. Quiet and Super Quiet are the same SetSuperQuiet switch (the scope groups them). Auto is left on, which differs from the Aero 16 Silence trace, because that trace also changes whisper mode and the thermal target.",
-        writes,
+        notes: "Control Center quiet_Click (DeepFan.cs 6730-6799): as Normal with SetNvThermalTarget(1). SetSuperQuiet is skipped on YB because bSuperQuiet is off.",
+        writes: firmware_mode(0, 1, 0),
     }
 }
 
 pub fn gaming_script() -> ModeScript {
-    let mut script = normal_script();
-    script.name = "gaming";
-    script.provisional = true;
-    script.notes = "PROVISIONAL. The Aero 16 Gaming trace uses the same fan flags as Normal. On that machine the gaming change is Dynamic Boost and NvPowerConfig, which are not applied yet. AERO 17 YB DeepFan may use a different fan script; the probe is how to check. The Gaming curve preset is a separate custom table.";
-    script
+    ModeScript {
+        name: "gaming",
+        notes: "Control Center gaming_Click (DeepFan.cs 6872-6941): auto 1 (FANB, the EC boost curve) and SetNvPowerConfig(1) from FanAndOcTheme when smartfan is 2 (DeepFan.cs 7087+).",
+        writes: firmware_mode(1, 0, 1),
+    }
 }
 
 pub fn fixed_script(duty_raw: u8) -> ModeScript {
     ModeScript {
         name: "fixed",
-        provisional: false,
         notes: "Scope Max sequence, with SetCurrentFanStep(0) from §5.1 and the Aero 16 Turbo trace. Duty 229 is 100% (scope and that trace).",
         writes: vec![
                 data("SetSuperQuiet", 0),
@@ -119,7 +119,6 @@ pub fn fixed_script(duty_raw: u8) -> ModeScript {
 pub fn fixed_duty_script(duty_raw: u8) -> ModeScript {
     ModeScript {
         name: "fixed duty",
-        provisional: false,
         notes: "Duty change while fixed is already on: Control Center sends only 107 and 71, so no mode flag is cleared.",
         writes: vec![
             data("SetFixedFanSpeed", duty_raw),
@@ -131,7 +130,6 @@ pub fn fixed_duty_script(duty_raw: u8) -> ModeScript {
 pub fn custom_prefix() -> ModeScript {
     ModeScript {
         name: "custom",
-        provisional: false,
         notes: "Full re-apply from §5.1: clear auto and fixed, SetCurrentFanStep(0), SetStepFanStatus(1), then all 15 slots. SetSuperQuiet(0) and SetFanAdjustStatus(0) are extra clears so a latched flag cannot hide the table.",
         writes: vec![
                 data("SetAutoFanStatus", 0),
@@ -175,38 +173,35 @@ pub fn fan_point_writes(curve: &FanCurve) -> Vec<PlannedWrite> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn normal_tail_matches_the_scope_restore_sequence() {
-        let script = normal_script();
-        let tail: Vec<_> = script
+    fn tail(script: &ModeScript) -> Vec<(&'static str, WriteParams)> {
+        script
             .writes
             .iter()
-            .rev()
-            .take(3)
+            .skip(3)
             .map(|write| (write.method, write.params.clone()))
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        assert_eq!(
-            tail,
-            vec![
-                ("SetFixedFanStatus", WriteParams::Data(0)),
-                ("SetStepFanStatus", WriteParams::Data(0)),
-                ("SetAutoFanStatus", WriteParams::Data(1)),
-            ]
-        );
-        assert!(script
-            .writes
-            .iter()
-            .any(|write| write.method == "SetCurrentFanStep"));
+            .collect()
+    }
+
+    fn cc_sequence(auto: u8, thermal: u8, nv: u8) -> Vec<(&'static str, WriteParams)> {
+        vec![
+            ("SetFixedFanStatus", WriteParams::Data(0)),
+            ("SetStepFanStatus", WriteParams::Data(0)),
+            ("SetAutoFanStatus", WriteParams::Data(auto)),
+            ("SetNvThermalTarget", WriteParams::Data(thermal)),
+            ("SetNvPowerConfig", WriteParams::Data(nv)),
+        ]
     }
 
     #[test]
-    fn gaming_fan_writes_match_normal_until_the_sku_is_probed() {
-        assert_eq!(gaming_script().writes, normal_script().writes);
-        assert!(gaming_script().provisional);
-        assert!(!normal_script().provisional);
+    fn firmware_modes_match_control_center_on_yb() {
+        assert_eq!(tail(&normal_script()), cc_sequence(0, 0, 0));
+        assert_eq!(tail(&gaming_script()), cc_sequence(1, 0, 1));
+        assert_eq!(tail(&quiet_script()), cc_sequence(0, 1, 0));
+        for script in [normal_script(), gaming_script(), quiet_script()] {
+            assert!(!script.writes.iter().any(|write| {
+                write.method == "SetSuperQuiet" && write.params != WriteParams::Data(0)
+            }));
+        }
     }
 
     #[test]
@@ -222,24 +217,5 @@ mod tests {
             .writes
             .iter()
             .any(|write| write.method == "SetCurrentFanStep"));
-    }
-
-    #[test]
-    fn quiet_requests_super_quiet_and_leaves_auto_on() {
-        let script = quiet_script();
-        assert!(script.provisional);
-        assert!(script.writes.iter().any(|write| {
-            write.method == "SetSuperQuiet" && write.params == WriteParams::Data(1)
-        }));
-        assert_eq!(
-            script
-                .writes
-                .last()
-                .map(|write| (write.method, write.params.clone())),
-            Some(("SetSuperQuiet", WriteParams::Data(1)))
-        );
-        assert!(script.writes.iter().any(|write| {
-            write.method == "SetAutoFanStatus" && write.params == WriteParams::Data(1)
-        }));
     }
 }

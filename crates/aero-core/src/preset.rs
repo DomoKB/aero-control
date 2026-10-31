@@ -37,15 +37,15 @@ pub fn presets() -> Vec<Preset> {
         Preset {
             id: "quiet",
             name: "Quiet",
-            provisional: true,
-            notes: "Same firmware switch. The exact flag combination is provisional; see the quiet script.",
+            provisional: false,
+            notes: "Control Center's quiet profile: firmware fan control with the GPU thermal target set to quiet.",
             kind: PresetKind::Firmware(FanMode::Quiet),
         },
         Preset {
             id: "gaming",
             name: "Gaming",
-            provisional: true,
-            notes: "Firmware gaming profile. Fan writes currently match Normal; see the gaming script.",
+            provisional: false,
+            notes: "Control Center's gaming profile: the firmware boost fan curve and NvPowerConfig on.",
             kind: PresetKind::Firmware(FanMode::Gaming),
         },
         Preset {
@@ -223,12 +223,7 @@ mod tests {
         assert_eq!(curves.len(), 2);
         assert!(curves.iter().all(|preset| !preset.provisional));
         assert_eq!(quiet_curve().points().len(), QUIET_YB_PERCENT.len());
-        assert!(presets
-            .iter()
-            .any(|preset| preset.id == "quiet" && preset.provisional));
-        assert!(presets
-            .iter()
-            .any(|preset| preset.id == "normal" && !preset.provisional));
+        assert!(presets.iter().all(|preset| !preset.provisional));
         let curve = factory_curve();
         assert_eq!(curve.points().len(), 15);
         assert!(curve

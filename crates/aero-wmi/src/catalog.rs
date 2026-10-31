@@ -103,6 +103,7 @@ pub static GETTERS: &[MethodSpec] = &[
 pub static SETTERS: &[MethodSpec] = &[
     set("SetGPUFanDuty", 71, DATA_OUT),
     set("SetNvPowerConfig", 81, &[]),
+    set("SetNvThermalTarget", 87, &[]),
     set("SetSuperQuiet", 88, &[]),
     set("SetChargePolicy", 100, DATA_OUT),
     set("SetChargeStop", 101, DATA_OUT),

@@ -5,7 +5,9 @@
 
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
-use aero_wmi::{decode_fan_index, AcpiReader, AcpiWriter, Pacer, WmiError, FAN_CURVE_SLOTS};
+use aero_wmi::{
+    decode_fan_index, AcpiReader, AcpiWriter, Pacer, WmiError, WriteParams, FAN_CURVE_SLOTS,
+};
 use thiserror::Error;
 use tracing::debug;
 
@@ -335,9 +337,6 @@ fn apply_mode_inner<W: AcpiWriter, P: Pacer>(
     duty: u8,
 ) -> Result<ApplyReport, ApplyError> {
     let script = script_for(mode, duty);
-    if script.provisional {
-        warnings.push(script.notes.to_string());
-    }
     run_script(writer, pacer, gate, &script, &mut warnings)?;
     let mut diffs = read_flags(writer, pacer, gate, mode, duty)?;
     if diffs.is_empty() {
@@ -377,7 +376,8 @@ fn read_flags<W: AcpiWriter, P: Pacer>(
     duty: u8,
 ) -> Result<Vec<SlotDiff>, ApplyError> {
     let (auto, fixed, step, speed) = match mode {
-        FanMode::Normal | FanMode::Gaming | FanMode::Quiet => (1, 0, 0, None),
+        FanMode::Gaming => (1, 0, 0, None),
+        FanMode::Normal | FanMode::Quiet => (0, 0, 0, None),
         FanMode::Max | FanMode::Fixed => (0, 1, 1, Some(duty)),
         FanMode::Custom => (0, 0, 1, None),
     };
@@ -493,14 +493,28 @@ pub fn apply_profile<W: AcpiWriter, P: Pacer>(
             .warnings
             .push("CPU PL1/PL2 is stored only; the XTU bridge is not implemented".to_string());
     }
+    let overrides: Vec<PlannedWrite> = [
+        ("SetNvThermalTarget", profile.nv_thermal_target),
+        ("SetNvPowerConfig", profile.nv_power_config),
+    ]
+    .into_iter()
+    .filter_map(|(method, value)| {
+        value.map(|value| PlannedWrite {
+            method,
+            params: WriteParams::Data(value),
+        })
+    })
+    .collect();
+    let mut gate = Gate { started: true };
+    for write in &overrides {
+        exec_write(writer, pacer, &mut gate, write, &mut report.warnings)?;
+    }
     if profile.dynamic_boost.is_some()
-        || profile.nv_power_config.is_some()
-        || profile.nv_thermal_target.is_some()
         || profile.ai_boost.is_some()
         || profile.charge_limit.is_some()
     {
         report.warnings.push(
-            "GPU power and battery charge fields are stored only; they are not sent to WMI yet"
+            "Dynamic Boost, AI Boost and battery charge fields are stored only; they are not sent to WMI yet"
                 .to_string(),
         );
     }
@@ -541,7 +555,7 @@ mod tests {
     use crate::curve::CurvePoint;
     use crate::percent_to_raw;
     use crate::preset::factory_curve;
-    use aero_wmi::{CountPacer, MockAcpi, NoPacer, WriteParams};
+    use aero_wmi::{CountPacer, MockAcpi, NoPacer};
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
     fn sample() -> FanCurve {
@@ -605,7 +619,7 @@ mod tests {
         let err = upload_curve(&mut mock, &mut NoPacer, &sample()).unwrap_err();
         assert!(matches!(err, ApplyError::Restored { .. }));
         assert_eq!(mock.calls_named("SetFanIndexValue").count(), 30);
-        assert_eq!(mock.auto, 1);
+        assert_eq!(mock.auto, 0);
         assert_eq!(mock.fixed, 0);
         assert_eq!(mock.step, 0);
     }
@@ -659,7 +673,7 @@ mod tests {
             let _ = upload_curve(&mut mock, &mut NoPacer, &curve);
         }));
         assert!(panicked.is_err());
-        assert_eq!(mock.auto, 1);
+        assert_eq!(mock.auto, 0);
         assert_eq!(mock.step, 0);
         assert_eq!(mock.fixed, 0);
     }
@@ -744,12 +758,41 @@ mod tests {
     }
 
     #[test]
-    fn quiet_sets_super_quiet_without_a_curve_upload() {
+    fn modes_leave_the_firmware_in_the_control_center_state() {
+        let cases = [
+            (FanMode::Normal, 0, 0, 0),
+            (FanMode::Gaming, 1, 0, 1),
+            (FanMode::Quiet, 0, 1, 0),
+        ];
+        for (mode, auto, thermal, nv) in cases {
+            let mut mock = MockAcpi::aero_17_yb_fixture();
+            let report = apply_mode(&mut mock, &mut NoPacer, mode, 0, false).unwrap();
+            assert_eq!(
+                (mock.auto, mock.nv_thermal_target, mock.nv_power_config),
+                (auto, thermal, nv),
+                "{mode:?}"
+            );
+            assert_eq!((mock.fixed, mock.step, mock.super_quiet), (0, 0, 0));
+            assert!(
+                report.warnings.is_empty(),
+                "{mode:?}: {:?}",
+                report.warnings
+            );
+            assert_eq!(mock.calls_named("SetFanIndexValue").count(), 0);
+        }
+    }
+
+    #[test]
+    fn profile_gpu_power_fields_override_the_mode_defaults() {
+        let mut profile = crate::builtin_config().profile("Normal").unwrap().clone();
+        profile.fan_mode = FanMode::Gaming;
+        profile.nv_power_config = Some(0);
+        profile.nv_thermal_target = Some(1);
         let mut mock = MockAcpi::aero_17_yb_fixture();
-        apply_mode(&mut mock, &mut NoPacer, FanMode::Quiet, 0, false).unwrap();
-        assert_eq!(mock.super_quiet, 1);
+        apply_profile(&mut mock, &mut NoPacer, &profile, ApplyReason::User).unwrap();
         assert_eq!(mock.auto, 1);
-        assert_eq!(mock.calls_named("SetFanIndexValue").count(), 0);
+        assert_eq!(mock.nv_power_config, 0);
+        assert_eq!(mock.nv_thermal_target, 1);
     }
 
     #[test]
@@ -800,7 +843,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(on_battery.fan_mode, FanMode::Quiet);
-        assert_eq!(mock.super_quiet, 1);
+        assert_eq!(mock.nv_thermal_target, 1);
+        assert_eq!(mock.nv_power_config, 0);
         let quiet_sets = mock
             .calls
             .iter()
@@ -830,12 +874,7 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("not sent")));
-        assert!(mock.calls.iter().all(|call| {
-            call.method.starts_with("Set")
-                && call.method != "SetNvPowerConfig"
-                && call.method != "SetDynamicBoostStatus"
-                || call.method.starts_with("Get")
-        }));
+        assert_eq!(mock.calls_named("SetDynamicBoostStatus").count(), 0);
     }
 
     #[test]
@@ -861,9 +900,8 @@ mod tests {
     #[test]
     fn writer_records_data_under_the_mof_name() {
         let mut mock = MockAcpi::aero_17_yb_fixture();
-        apply_mode(&mut mock, &mut NoPacer, FanMode::Normal, 0, false).unwrap();
+        apply_mode(&mut mock, &mut NoPacer, FanMode::Gaming, 0, false).unwrap();
         let call = mock.calls_named("SetAutoFanStatus").last().unwrap();
         assert_eq!(call.params, vec![("Data".to_string(), 1)]);
-        let _ = WriteParams::Data(1);
     }
 }

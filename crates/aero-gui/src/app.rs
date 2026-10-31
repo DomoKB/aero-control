@@ -86,12 +86,12 @@ const MODES: [(&str, FanMode, &str); 6] = [
     (
         "Quiet",
         FanMode::Quiet,
-        "Quiet: Super Quiet. The flag sequence is still provisional.",
+        "Quiet: firmware control with the quiet GPU thermal target, as Control Center.",
     ),
     (
         "Gaming",
         FanMode::Gaming,
-        "Gaming: fan writes currently match Normal. Still provisional.",
+        "Gaming: firmware boost fan curve and NvPowerConfig on, as Control Center.",
     ),
     (
         "Fixed",
@@ -1093,7 +1093,7 @@ impl AeroApp {
                 ui.add_space(6.0);
                 ui.label("Curve upload writes all 15 slots, reads them back, and restores firmware auto on a mismatch or a panic. Closing the window does the same if the last command was Fixed or Max.");
                 ui.add_space(6.0);
-                ui.label("The editor starts from the quiet curve measured on this laptop. Factory loads Control Center's YB curve (DeepFan setDefault_Click, confirmed by GetFanIndexValue on this P77YB). Quiet and Gaming flag sequences are still provisional. Upload rounds percent half-up, so 30% is raw 69 here and raw 68 on the chip, which truncates.");
+                ui.label("The editor starts from the quiet curve measured on this laptop. Factory loads Control Center's YB curve (DeepFan setDefault_Click, confirmed by GetFanIndexValue on this P77YB). Upload rounds percent half-up, so 30% is raw 69 here and raw 68 on the chip, which truncates.");
             });
     }
 }

@@ -43,6 +43,7 @@ pub struct MockAcpi {
     pub fixed_speed: u8,
     pub gpu_duty: u8,
     pub nv_power_config: u8,
+    pub nv_thermal_target: u8,
     pub battery_health: u8,
     pub charge_policy: u8,
     pub charge_stop: u8,
@@ -90,6 +91,7 @@ impl MockAcpi {
             fixed_speed: 0,
             gpu_duty: 0,
             nv_power_config: 0,
+            nv_thermal_target: 0,
             battery_health: 0,
             charge_policy: 0,
             charge_stop: 100,
@@ -242,6 +244,7 @@ impl AcpiWriter for MockAcpi {
             ("SetSuperQuiet", WriteParams::Data(value)) => self.super_quiet = *value,
             ("SetFanAdjustStatus", WriteParams::Data(value)) => self.fan_adjust = *value,
             ("SetNvPowerConfig", WriteParams::Data(value)) => self.nv_power_config = *value,
+            ("SetNvThermalTarget", WriteParams::Data(value)) => self.nv_thermal_target = *value,
             ("SetChargePolicy", WriteParams::Data(value)) => self.charge_policy = *value,
             ("SetChargeStop", WriteParams::Data(value)) => self.charge_stop = *value,
             ("SetFanIndexValue", WriteParams::FanPoint { index, temp, duty }) => {
