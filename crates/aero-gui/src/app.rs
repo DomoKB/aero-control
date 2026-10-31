@@ -183,7 +183,7 @@ impl AeroApp {
     pub fn new(cc: &eframe::CreationContext<'_>, choice: BackendChoice) -> Self {
         install_theme(&cc.egui_ctx);
         let mock = matches!(choice, BackendChoice::Mock);
-        let points = aero_core::factory_curve().points().to_vec();
+        let points = aero_core::quiet_curve().points().to_vec();
         let issues = issues(&points);
         let session = FanSession::start(choice);
         let report = session.banner.clone().unwrap_or_else(|| {
@@ -378,11 +378,11 @@ impl AeroApp {
         }
     }
 
-    fn reset_factory(&mut self) {
-        self.points = aero_core::factory_curve().points().to_vec();
+    fn load_curve(&mut self, curve: aero_core::FanCurve, report: &str) {
+        self.points = curve.points().to_vec();
         self.drag_index = None;
         self.recompute();
-        self.report = "Editor loaded the YB factory curve.".into();
+        self.report = report.into();
         self.report_error = false;
     }
 }
@@ -774,7 +774,14 @@ impl AeroApp {
                         .on_hover_text("Loads the YB factory curve from Control Center.")
                         .clicked()
                     {
-                        self.reset_factory();
+                        self.load_curve(aero_core::factory_curve(), "Editor loaded the YB factory curve.");
+                    }
+                    if ui
+                        .add(secondary_button("Quiet"))
+                        .on_hover_text("Loads the quiet curve measured on this laptop: 25% at idle, about 50% under full load.")
+                        .clicked()
+                    {
+                        self.load_curve(aero_core::quiet_curve(), "Editor loaded the quiet curve.");
                     }
                 });
             });
@@ -1086,7 +1093,7 @@ impl AeroApp {
                 ui.add_space(6.0);
                 ui.label("Curve upload writes all 15 slots, reads them back, and restores firmware auto on a mismatch or a panic. Closing the window does the same if the last command was Fixed or Max.");
                 ui.add_space(6.0);
-                ui.label("The editor starts from Control Center's YB factory curve (DeepFan setDefault_Click, confirmed by GetFanIndexValue on this P77YB). Quiet and Gaming flag sequences are still provisional. Upload rounds percent half-up, so 30% is raw 69 here and raw 68 on the chip, which truncates.");
+                ui.label("The editor starts from the quiet curve measured on this laptop. Factory loads Control Center's YB curve (DeepFan setDefault_Click, confirmed by GetFanIndexValue on this P77YB). Quiet and Gaming flag sequences are still provisional. Upload rounds percent half-up, so 30% is raw 69 here and raw 68 on the chip, which truncates.");
             });
     }
 }

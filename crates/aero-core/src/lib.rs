@@ -39,8 +39,8 @@ pub use mode::{
 };
 pub use power::{set_charge_policy, set_nv_power_config, ChargePolicy};
 pub use preset::{
-    builtin_config, curve_from_percent, factory_curve, gcc_floor_raw, presets, Preset, PresetKind,
-    FACTORY_YB_CHIP_RAW, FACTORY_YB_PERCENT,
+    builtin_config, curve_from_percent, factory_curve, gcc_floor_raw, presets, quiet_curve, Preset,
+    PresetKind, FACTORY_YB_CHIP_RAW, FACTORY_YB_PERCENT, QUIET_YB_PERCENT,
 };
 pub use profile::{Config, CurvePointToml, Profile};
 pub use scale::{clamp_fixed_duty, percent_to_raw, raw_to_percent, DUTY_MAX, FIXED_FLOOR_PERCENT};

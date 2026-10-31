@@ -62,6 +62,7 @@ pub fn presets() -> Vec<Preset> {
             notes: "One duty for the CPU fan and the GPU fan. Default 50%. The floor is 35% unless expert mode is on.",
             kind: PresetKind::Fixed { duty_percent: 50 },
         },
+        curve_preset("quiet-curve", "Quiet curve", false, QUIET_NOTES, QUIET_YB_PERCENT),
         curve_preset(
             "factory",
             "Factory",
@@ -92,6 +93,23 @@ pub const FACTORY_YB_PERCENT: &[(u8, u8)] = &[
     (89, 100),
 ];
 
+/// Quiet-first curve from the 2026-10-31 curvelab run on this AERO 17 YB.
+/// Under full load the CPU holds about 90°C at any fan speed from 25% to 55%,
+/// so extra fan buys work, not temperature: 55% does all of it, 45% about 97%.
+/// Idle sits near 57°C at 25%. 50% from 85°C and 80% at 90°C are the curve rules.
+pub const QUIET_YB_PERCENT: &[(u8, u8)] = &[
+    (0, 25),
+    (65, 30),
+    (72, 35),
+    (78, 40),
+    (82, 45),
+    (85, 50),
+    (88, 55),
+    (90, 80),
+];
+
+const QUIET_NOTES: &str = "Quiet-first curve measured on this AERO 17 YB: 25% at idle, 50 to 55% under sustained full load, where the CPU holds about 90°C regardless of fan speed.";
+
 /// Raw duty bytes read from that laptop. They are `floor(percent * 229 / 100)`.
 pub const FACTORY_YB_CHIP_RAW: &[u8] = &[
     57, 68, 80, 91, 103, 114, 125, 137, 148, 160, 171, 183, 194, 206, 229,
@@ -113,6 +131,10 @@ fn curve_preset(
         notes,
         kind: PresetKind::Curve(curve_from_percent(points)),
     }
+}
+
+pub fn quiet_curve() -> FanCurve {
+    curve_from_percent(QUIET_YB_PERCENT)
 }
 
 pub fn factory_curve() -> FanCurve {
@@ -192,17 +214,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn factory_curve_is_the_only_custom_preset_and_is_confirmed() {
+    fn built_in_curves_are_valid_and_confirmed() {
         let presets = presets();
         let curves: Vec<_> = presets
             .iter()
             .filter(|preset| matches!(preset.kind, PresetKind::Curve(_)))
             .collect();
-        assert_eq!(curves.len(), 1);
-        assert_eq!(curves[0].id, "factory");
-        assert!(!curves[0].provisional);
-        assert!(presets.iter().any(|preset| preset.id == "quiet" && preset.provisional));
-        assert!(presets.iter().any(|preset| preset.id == "normal" && !preset.provisional));
+        assert_eq!(curves.len(), 2);
+        assert!(curves.iter().all(|preset| !preset.provisional));
+        assert_eq!(quiet_curve().points().len(), QUIET_YB_PERCENT.len());
+        assert!(presets
+            .iter()
+            .any(|preset| preset.id == "quiet" && preset.provisional));
+        assert!(presets
+            .iter()
+            .any(|preset| preset.id == "normal" && !preset.provisional));
         let curve = factory_curve();
         assert_eq!(curve.points().len(), 15);
         assert!(curve

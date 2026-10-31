@@ -211,7 +211,11 @@ mod tests {
                 let name = entry.file_name().to_string_lossy().to_string();
                 !matches!(
                     name.as_str(),
-                    "silent.toml" | "balanced.toml" | "performance.toml" | "max-ish.toml" | "pairs.toml"
+                    "silent.toml"
+                        | "balanced.toml"
+                        | "performance.toml"
+                        | "max-ish.toml"
+                        | "pairs.toml"
                 )
             }));
     }

@@ -150,7 +150,13 @@ pub fn upload_curve<W: AcpiWriter, P: Pacer>(
     curve: &FanCurve,
 ) -> Result<ApplyReport, ApplyError> {
     guarded(writer, pacer, |writer, pacer| {
-        upload_inner(writer, pacer, &mut Gate { started: false }, Vec::new(), curve)
+        upload_inner(
+            writer,
+            pacer,
+            &mut Gate { started: false },
+            Vec::new(),
+            curve,
+        )
     })
 }
 
