@@ -49,35 +49,21 @@ fn data(method: &'static str, value: u8) -> PlannedWrite {
     }
 }
 
-/// Clears that stop a leftover step, fixed duty, or quiet flag from overriding
-/// the mode we're about to enter.
-fn clears() -> Vec<PlannedWrite> {
-    vec![
-        data("SetFanAdjustStatus", 0),
-        data("SetSuperQuiet", 0),
-        data("SetCurrentFanStep", 0),
-    ]
-}
-
-/// Control Center's DeepFan mode sequence for the AERO 17 YB, which has
-/// bSuperQuiet, bSuperMode and bNvwhisper off and bNvPowerCfg on
-/// (MainWindow.cs 1436-1445).
+/// Manual Control Center mode buttons on the AERO 17 YB, with AI disabled.
 fn firmware_mode(auto: u8, thermal_target: u8, nv_power_config: u8) -> Vec<PlannedWrite> {
-    let mut writes = clears();
-    writes.extend([
+    vec![
         data("SetFixedFanStatus", 0),
         data("SetStepFanStatus", 0),
         data("SetAutoFanStatus", auto),
         data("SetNvThermalTarget", thermal_target),
         data("SetNvPowerConfig", nv_power_config),
-    ]);
-    writes
+    ]
 }
 
 pub fn normal_script() -> ModeScript {
     ModeScript {
         name: "normal",
-        notes: "Control Center normal_Click (DeepFan.cs 6801-6870): auto 0, SetQuietMode(0) which is SetNvThermalTarget (Helpers.cs 1399-1420), and SetNvPowerConfig(0) from FanAndOcTheme. The first three writes are extra clears.",
+        notes: "Control Center normal_Click (DeepFan.cs 6801-6870): auto 0, SetQuietMode(0) which is SetNvThermalTarget (Helpers.cs 1399-1420), and SetNvPowerConfig(0) from FanAndOcTheme.",
         writes: firmware_mode(0, 0, 0),
     }
 }
@@ -101,17 +87,34 @@ pub fn gaming_script() -> ModeScript {
 pub fn fixed_script(duty_raw: u8) -> ModeScript {
     ModeScript {
         name: "fixed",
-        notes: "Scope Max sequence, with SetCurrentFanStep(0) from §5.1 and the Aero 16 Turbo trace. Duty 229 is 100% (scope and that trace).",
+        notes: "YB Control Center Customize fixed sequence; NVIDIA power config is off with AI disabled.",
         writes: vec![
-                data("SetSuperQuiet", 0),
-            data("SetFanAdjustStatus", 0),
-            data("SetCurrentFanStep", 0),
             data("SetAutoFanStatus", 0),
             data("SetFixedFanStatus", 0),
             data("SetStepFanStatus", 1),
+            data("SetNvThermalTarget", 0),
             data("SetFixedFanStatus", 1),
             data("SetFixedFanSpeed", duty_raw),
             data("SetGPUFanDuty", duty_raw),
+            data("SetNvPowerConfig", 0),
+        ],
+    }
+}
+
+fn max_script() -> ModeScript {
+    ModeScript {
+        name: "max",
+        notes: "YB Control Center fan hotkey sequence, with NVIDIA power config off.",
+        writes: vec![
+            data("SetAutoFanStatus", 0),
+            data("SetFixedFanStatus", 0),
+            data("SetStepFanStatus", 1),
+            data("SetAutoFanStatus", 0),
+            data("SetFixedFanStatus", 1),
+            data("SetFixedFanSpeed", 229),
+            data("SetGPUFanDuty", 229),
+            data("SetNvThermalTarget", 0),
+            data("SetNvPowerConfig", 0),
         ],
     }
 }
@@ -130,14 +133,14 @@ pub fn fixed_duty_script(duty_raw: u8) -> ModeScript {
 pub fn custom_prefix() -> ModeScript {
     ModeScript {
         name: "custom",
-        notes: "Full re-apply from §5.1: clear auto and fixed, SetCurrentFanStep(0), SetStepFanStatus(1), then all 15 slots. SetSuperQuiet(0) and SetFanAdjustStatus(0) are extra clears so a latched flag cannot hide the table.",
+        notes: "YB Deep Control mode sequence before the full curve upload, with AI disabled.",
         writes: vec![
-                data("SetAutoFanStatus", 0),
+            data("SetAutoFanStatus", 0),
             data("SetFixedFanStatus", 0),
-            data("SetSuperQuiet", 0),
-            data("SetFanAdjustStatus", 0),
             data("SetCurrentFanStep", 0),
             data("SetStepFanStatus", 1),
+            data("SetNvThermalTarget", 0),
+            data("SetNvPowerConfig", 0),
         ],
     }
 }
@@ -147,7 +150,7 @@ pub fn script_for(mode: FanMode, fixed_raw: u8) -> ModeScript {
         FanMode::Normal => normal_script(),
         FanMode::Quiet => quiet_script(),
         FanMode::Gaming => gaming_script(),
-        FanMode::Max => fixed_script(229),
+        FanMode::Max => max_script(),
         FanMode::Fixed => fixed_script(fixed_raw),
         FanMode::Custom => custom_prefix(),
     }
@@ -173,11 +176,10 @@ pub fn fan_point_writes(curve: &FanCurve) -> Vec<PlannedWrite> {
 mod tests {
     use super::*;
 
-    fn tail(script: &ModeScript) -> Vec<(&'static str, WriteParams)> {
+    fn sequence(script: &ModeScript) -> Vec<(&'static str, WriteParams)> {
         script
             .writes
             .iter()
-            .skip(3)
             .map(|write| (write.method, write.params.clone()))
             .collect()
     }
@@ -194,9 +196,9 @@ mod tests {
 
     #[test]
     fn firmware_modes_match_control_center_on_yb() {
-        assert_eq!(tail(&normal_script()), cc_sequence(0, 0, 0));
-        assert_eq!(tail(&gaming_script()), cc_sequence(1, 0, 1));
-        assert_eq!(tail(&quiet_script()), cc_sequence(0, 1, 0));
+        assert_eq!(sequence(&normal_script()), cc_sequence(0, 0, 0));
+        assert_eq!(sequence(&gaming_script()), cc_sequence(1, 0, 1));
+        assert_eq!(sequence(&quiet_script()), cc_sequence(0, 1, 0));
         for script in [normal_script(), gaming_script(), quiet_script()] {
             assert!(!script.writes.iter().any(|write| {
                 write.method == "SetSuperQuiet" && write.params != WriteParams::Data(0)
@@ -205,17 +207,50 @@ mod tests {
     }
 
     #[test]
-    fn max_ends_at_raw_229_on_both_fans() {
-        let script = fixed_script(229);
-        assert!(script.writes.iter().any(|write| {
-            write.method == "SetFixedFanSpeed" && write.params == WriteParams::Data(229)
-        }));
-        assert!(script.writes.iter().any(|write| {
-            write.method == "SetGPUFanDuty" && write.params == WriteParams::Data(229)
-        }));
-        assert!(script
-            .writes
-            .iter()
-            .any(|write| write.method == "SetCurrentFanStep"));
+    fn fan_scripts_avoid_adjust_status() {
+        for mode in [
+            FanMode::Normal,
+            FanMode::Quiet,
+            FanMode::Gaming,
+            FanMode::Max,
+            FanMode::Fixed,
+            FanMode::Custom,
+        ] {
+            assert!(!script_for(mode, 100)
+                .writes
+                .iter()
+                .any(|w| w.method == "SetFanAdjustStatus"));
+        }
+    }
+
+    #[test]
+    fn fixed_and_max_follow_control_center_yb_sequences() {
+        assert_eq!(
+            sequence(&fixed_script(120)),
+            vec![
+                ("SetAutoFanStatus", WriteParams::Data(0)),
+                ("SetFixedFanStatus", WriteParams::Data(0)),
+                ("SetStepFanStatus", WriteParams::Data(1)),
+                ("SetNvThermalTarget", WriteParams::Data(0)),
+                ("SetFixedFanStatus", WriteParams::Data(1)),
+                ("SetFixedFanSpeed", WriteParams::Data(120)),
+                ("SetGPUFanDuty", WriteParams::Data(120)),
+                ("SetNvPowerConfig", WriteParams::Data(0)),
+            ]
+        );
+        assert_eq!(
+            sequence(&max_script()),
+            vec![
+                ("SetAutoFanStatus", WriteParams::Data(0)),
+                ("SetFixedFanStatus", WriteParams::Data(0)),
+                ("SetStepFanStatus", WriteParams::Data(1)),
+                ("SetAutoFanStatus", WriteParams::Data(0)),
+                ("SetFixedFanStatus", WriteParams::Data(1)),
+                ("SetFixedFanSpeed", WriteParams::Data(229)),
+                ("SetGPUFanDuty", WriteParams::Data(229)),
+                ("SetNvThermalTarget", WriteParams::Data(0)),
+                ("SetNvPowerConfig", WriteParams::Data(0)),
+            ]
+        );
     }
 }

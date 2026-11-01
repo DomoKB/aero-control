@@ -1,8 +1,10 @@
 # Where the command facts came from
 
-aero-control does not copy AeroCtl. That project is GPLv3 and was not needed: the questions the scope left open were settled from the sources below. No AeroCtl source is vendored here.
+aero-control does not copy AeroCtl. That GPLv3 project is now a functional replacement target: its README, UI labels and public configuration declarations were consulted for feature coverage. Command behaviour is established from the primary sources below. No AeroCtl source is copied or vendored here; see AEROCTL_PARITY.md.
 
 ## Windows method names and parameter names
+
+The Windows backend opens the firmware WMI data blocks by GUID using Windows' data-block API. It does not load Gigabyte's `acpimof.dll` or require Gigabyte MOF/CIM class registration. The MOF listing below supplies method IDs and parameter layouts as reference material; it is not a runtime dependency. Availability of the corresponding firmware WMI blocks is still required.
 
 Gigabyte Aero 16 SKU P86YE5 MOF listing posted in [lm-sensors issue 400](https://github.com/lm-sensors/lm-sensors/issues/400). That dump is the source for:
 
@@ -29,7 +31,7 @@ That packing is the Linux WMBC selector (`0x68`), which is a different entry poi
 ## Duty scale 0–229
 
 - The scope, from Control Center's decompiled DeepFan path: max duty is 229, and Control Center truncates with `duty * 229 / 100`
-- [Aero 15 EC notes](https://github.com/tangalbert919/p37-ec-aero-15/blob/master/Aero%2015%20Fan%20Control%20Registers.md): `0xE5` (229) is 100%, `0x50` (80) is 35%, and the rest of that table matches truncating percent. aero-control rounds half up instead, on purpose
+- [Aero 15 EC notes](https://github.com/tangalbert919/p37-ec-aero-15/blob/master/Aero%2015%20Fan%20Control%20Registers.md): `0xE5` (229) is 100%, `0x50` (80) is 35%, and the rest of that table matches truncating percent. aero-control preserves those exact raw bytes for Factory; other percent-based custom points round half up
 
 [ejempty/aero-keyboard-fan](https://github.com/ejempty/aero-keyboard-fan) (MIT) documents `SetCurrentFanStep`, the class GUID, and a max-fan sequence that sends duty **100**. This project follows the scope and the Aero 16 Turbo trace (`229`), not that 100.
 
@@ -39,43 +41,58 @@ The Control Center quick-start manual names Normal, Gaming, Quiet, Customize (fi
 
 The factory custom curve for model names containing `yb` (the same branch as `xa` / `va` / `ya` and the rest of that family) is the `setDefault_Click` table in DeepFan.dll. On this AERO 17 YB (P77YB, BIOS FB10), `GetFanIndexValue` 0..14 returned the same temperatures with duty bytes equal to `floor(percent * 229 / 100)`:
 
-| °C | % | Chip raw | aero-control raw |
+| °C | % | Chip raw | Factory raw |
 |---|---|---|---|
 | 0 | 25 | 57 | 57 |
-| 50 | 30 | 68 | 69 |
+| 50 | 30 | 68 | 68 |
 | 53 | 35 | 80 | 80 |
-| 56 | 40 | 91 | 92 |
+| 56 | 40 | 91 | 91 |
 | 59 | 45 | 103 | 103 |
-| 62 | 50 | 114 | 115 |
-| 65 | 55 | 125 | 126 |
+| 62 | 50 | 114 | 114 |
+| 65 | 55 | 125 | 125 |
 | 68 | 60 | 137 | 137 |
-| 71 | 65 | 148 | 149 |
+| 71 | 65 | 148 | 148 |
 | 74 | 70 | 160 | 160 |
-| 77 | 75 | 171 | 172 |
+| 77 | 75 | 171 | 171 |
 | 80 | 80 | 183 | 183 |
-| 83 | 85 | 194 | 195 |
+| 83 | 85 | 194 | 194 |
 | 86 | 90 | 206 | 206 |
 | 89 | 100 | 229 | 229 |
 
-Quiet, Normal, Gaming, and Max are firmware switches, not other curves. Control Center ships this one default custom table per model family. aero-control keeps half-up rounding, so an upload of the percent table will not bit-match the chip's truncated bytes (30% is raw 69 here and raw 68 on the chip). Readback compares the raw byte, so that one-count difference restores firmware auto.
+Quiet, Normal, Gaming, and Max are firmware switches, not other curves. Control Center ships this one default custom table per model family. The Factory preset and shipped profile use the chip's exact raw bytes, and readback compares the bytes actually sent.
 
-## What is provisional
+## Firmware verification (AERO 17 YB, BIOS FB10)
 
-| Item | Why |
-|---|---|
-| Quiet's decision to leave auto **on** while setting `SetSuperQuiet(1)` | The Aero 16 Silence trace turns auto off, but only together with whisper mode and a thermal target we do not send. Leaving auto on fails safe. |
-| Gaming's fan script matching Normal | The Aero 16 Gaming trace uses the same fan flags as Creator/Normal. The gaming change there is Dynamic Boost / `NvPowerConfig`, which is not applied yet. AERO 17 YB DeepFan may differ. |
-| `SetFanAdjustStatus(0)` and `SetSuperQuiet(0)` as extra clears | Defensive. Not part of the scope's three-call restore tail. |
-| `SetFanCustomStatus` | Named in the scope, absent from the Aero 16 MOF. |
-| `CustomFanTable` byte layouts | The registry path is from the scope. The binary layouts are inferred and labelled in the parser warnings. |
-| Stair-step drawing | The editor draws the duty holding until the next temperature. Whether the EC interpolates is not separately confirmed. |
+The reference tree contains the decompiled DSDT and Control Center DeepFan code. Normal and Quiet use auto flag 0; Gaming uses 1. Recovery uses the Normal sequence. The manual Normal, Quiet and Gaming button handlers do not call SetCurrentFanStep or SetSuperQuiet on this YB; aero-control follows those paths. Deep Control resets the step, while Customize fixed and the fan hotkey use their respective flag and duty sequences. With AI disabled FanAndOcTheme sets NvPowerConfig only for Gaming. Calls in aero-control remain paced and verified, and registry and AI integration are not reproduced. These field values alone do not establish physical fan behaviour.
 
-## Confirmed enough to send
+The DSDT shows SetFanAdjustStatus(0) writes zero to both fan registers and sets GFAN. It is not a clear and is no longer included in the fan scripts. The suggestion that GFAN enables OS fan control is unverified. The fixed sequence follows Control Center and clears GFAN through SetAutoFanStatus; register readback does not prove the fans respond.
 
-- Normal / restore tail: `SetFixedFanStatus 0`, `SetStepFanStatus 0`, `SetAutoFanStatus 1` (scope), plus `SetCurrentFanStep 0` (scope §5.1 and the Aero 16 traces).
-- Max / fixed shape: auto off, fixed off then on, step on, `SetFixedFanSpeed` and `SetGPUFanDuty`. Max uses 229.
-- Custom upload: clear auto and fixed, `SetCurrentFanStep 0`, `SetStepFanStatus 1`, then all 15 `SetFanIndexValue` calls, then `GetFanIndexValue` for every slot.
-- Percent conversion rounds half up. 50% is raw 115, not the truncated 114. 30% is raw 69, not the chip's 68.
-- Curve index base `0..14` on this P77YB: `GetFanIndexValue` returned the 15 factory points above.
-- The YB factory percent table is the DeepFan `setDefault_Click` default, not a guessed curve.
-- A `(0, 0)` point is rejected anywhere in a user curve because it terminates the table.
+WMI transport errors have uncertain side effects. The operation stops and attempts Normal recovery, and reports a failure if recovery fails. Unknown firmware method IDs may return success without acting. Hardware validation, including RPM and thermal observation, remains outstanding.
+
+## Additional replacement features (2026-11-01)
+
+- `gigabyte.mof` getter 87 is `GetNvThermalTarget`; DSDT WMBC case `0x57` returns CRAF and WMBD sets it. The earlier statement that this target has no thermal getter was incorrect; the new path verifies readback.
+- Camera197, sleep USB charging122 and hibernation USB charging123 have both MOF declarations and actual YB DSDT handlers (CDON, S3UC, S4UC). Their presence alone does not prove physical port/camera behaviour.
+- `MainWindow.cs` vendor-HID reports map `04 00 00 84` to fan, `04 00 00 7C` to Wi-Fi, and `04 00 00 80` to Fn+F6. Fn+F6's action is panel dependent in the official app; aero-control requires explicit display-off selection. DSDT display-off ID196 delegates to SMM `0x95`, so acceptance is not panel-state measurement.
+- Display brightness keys notify Windows through DSDT BRTN. Lighting events synchronize an already-applied firmware change. Neither is blindly toggled a second time. The YB model gate does not enable the older PS/2 touchpad path.
+- `GetFanAdjustStatus`112 is not a GFAN-ownership getter on this YB: WMBC case `0x70` returns FAN1 raw duty, whereas the setter changes GFAN and both fan registers. No GFAN getter is claimed.
+- Startup mode recognition compares durable fan flags and the thermal profile. The NVIDIA power-request flag is transient and is not part of the mode match. It does not guess a custom mode from the step flag or guess which app owns a matching configuration.
+- AeroCtl's separate Smart Charge flag and cycle-byte interpretation have not been established for this target. `GetBatteryCount`72 is declared in the MOF but has no target getter handler; the adjacent cycle-byte getters are not combined into an invented total.
+
+Percent-based custom conversion rounds half up; Factory uses the truncated values above. The physical firmware still needs to be checked for exact readback.
+
+## CPU/GPU power controls (2026-11-01)
+
+`SmartDashboard.dll/SmartDashboard/Dashboard.cs` maps CPU buttons 1–5 through `cpuprocess` to CPUOC stages `one`–`five`. `CPUOC.dll/CPUOC/CPU.cs` selects `CPUOC.Resource.P77VB.xml` for AERO 17 YB. Its i7 entries use XTU control 48 for PL1 and 47 for PL2: 38/107, 45/107, 52/107, 58/107 and 62/107 W; `zero` is 52/107 W and `dc` is 45/56.25 W. The i9-only sixth level is not enabled for the verified i7 target. The independent Rust preset table preserves the battery fraction in milliwatts. Arbitrary power sliders and undervolting are outside this implementation.
+
+The same Dashboard's `gpustage0`/`gpustage1` use `SetNvPowerConfig(false/true)` behind the YB `bNvPowerCfg` gate. Since `bGpuBoost` is also true for YB, both then clear `SetAIBoostStatus(0)` (the helper's misleading name is `SetAIBoost208`, but this MOF's actual method ID is 129 / 0x81). WMBD/WMBC map it to the EC FESC bit. The direct GPU controls reproduce this sequence and check the FESC clear. The fan buttons' `FanAndOcTheme` path sends the NVIDIA request without this extra Dashboard step; those sequences remain distinct.
+
+The NVIDIA flag is a transient request, not a verified active power mode. On this laptop with NVIDIA driver 621.01, a bounded native one-byte `SetNvPowerConfig(1)` request read 1 immediately and 0 after 50 ms and 500 ms. A padded four-byte request likewise did not remain at 1; changing the input width was not adopted as a fix. The DSDT sets the external `PEGP.TEMQ` object, sets NLIM, then notifies the NVIDIA device. A driver/firmware consumer is consistent with the observed clearing, but this does not prove the requested power budget was applied. The original GPU request and fan flags were restored and verified after the probe.
+
+Requiring `GetNvPowerConfig == 1` after a 500 ms pause produced false GPU failures and caused Gaming mode to retry and restore Normal despite its fan flags matching. That equality check was removed from fan-mode verification and standalone GPU request handling. Transport errors, malformed request readback, fan/thermal mismatches, and failed FESC clears still fail. The GUI highlights only the last GPU request sent in its current session; it never captures a cleared request as a confirmed Level 1. Resulting GPU wattage and load performance remain unverified.
+
+A second bounded hardware check exercised the corrected core paths on AC power from Normal: manual Level 2 returned success while the transient flag read 0, and Gaming applied in one attempt with fan/thermal flags `(auto=1, fixed=0, step=0, thermal=0)` and the request flag 0. Normal restoration succeeded and all original flags, the request flag and FESC were confirmed as 0 afterward. This verifies command completion and mode flags, not load power or full thermal behaviour.
+
+CPU writes require the installed Intel SDK/service, independently of the direct Gigabyte WMI path. The SDK is loaded from its standard Intel installation directory only after signature verification. The bridge uses the SDK's exposed control metadata and active hardware refresh, rejects locked, incompatible or reboot-required settings, and attempts verified rollback if either limit fails. Process timeout means the final CPU limits are uncertain. Profiles with a CPU preset fail before WMI writes when CPU tuning is unavailable; later WMI failure leaves an already-applied CPU preset in place and says so explicitly.
+
+Read-only inspection found Intel XTU 7.14.2.14 and a running XTU3SERVICE, but its SDK reported `SYSTEM_UNCHECKED` and exposed no usable tuning connection. Its service log also records VBS/hypervisor and BIOS undervolt-protection incompatibilities. Actual CPU power writes and thermal/load behaviour were not tested. CPU controls remain unavailable in this state; the app does not disable security features or replace drivers. Mock SDK tests cover exact limits, locked controls, rejected/no-op writes, rollback and failed recovery.

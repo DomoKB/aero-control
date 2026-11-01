@@ -1,0 +1,72 @@
+{
+  "accesskit_consumer-0.24.3": {
+    "directory": "licenses/accesskit-02cf1aa",
+    "source": "https://github.com/AccessKit/accesskit/tree/02cf1aa5dda9cb4d97ef7bbab486c039c35960a8",
+    "revision": "02cf1aa5dda9cb4d97ef7bbab486c039c35960a8"
+  },
+  "accesskit_windows-0.23.2": {
+    "directory": "licenses/accesskit-02cf1aa",
+    "source": "https://github.com/AccessKit/accesskit/tree/02cf1aa5dda9cb4d97ef7bbab486c039c35960a8",
+    "revision": "02cf1aa5dda9cb4d97ef7bbab486c039c35960a8"
+  },
+  "accesskit-0.16.3": {
+    "directory": "licenses/accesskit-02cf1aa",
+    "source": "https://github.com/AccessKit/accesskit/tree/02cf1aa5dda9cb4d97ef7bbab486c039c35960a8",
+    "revision": "02cf1aa5dda9cb4d97ef7bbab486c039c35960a8"
+  },
+  "accesskit_winit-0.22.4": {
+    "directory": "licenses/accesskit-c1bd2d6",
+    "source": "https://github.com/AccessKit/accesskit/tree/c1bd2d610615a244fd9e8bba0a6c3aecbfe46821",
+    "revision": "c1bd2d610615a244fd9e8bba0a6c3aecbfe46821"
+  },
+  "ecolor-0.29.1": {
+    "directory": "licenses/egui-fe368ba",
+    "source": "https://github.com/emilk/egui/tree/fe368bacc4a15697e347607e73a56c0299b3d42d",
+    "revision": "fe368bacc4a15697e347607e73a56c0299b3d42d"
+  },
+  "eframe-0.29.1": {
+    "directory": "licenses/egui-fe368ba",
+    "source": "https://github.com/emilk/egui/tree/fe368bacc4a15697e347607e73a56c0299b3d42d",
+    "revision": "fe368bacc4a15697e347607e73a56c0299b3d42d"
+  },
+  "egui_glow-0.29.1": {
+    "directory": "licenses/egui-fe368ba",
+    "source": "https://github.com/emilk/egui/tree/fe368bacc4a15697e347607e73a56c0299b3d42d",
+    "revision": "fe368bacc4a15697e347607e73a56c0299b3d42d"
+  },
+  "egui-winit-0.29.1": {
+    "directory": "licenses/egui-fe368ba",
+    "source": "https://github.com/emilk/egui/tree/fe368bacc4a15697e347607e73a56c0299b3d42d",
+    "revision": "fe368bacc4a15697e347607e73a56c0299b3d42d"
+  },
+  "egui-0.29.1": {
+    "directory": "licenses/egui-fe368ba",
+    "source": "https://github.com/emilk/egui/tree/fe368bacc4a15697e347607e73a56c0299b3d42d",
+    "revision": "fe368bacc4a15697e347607e73a56c0299b3d42d"
+  },
+  "emath-0.29.1": {
+    "directory": "licenses/egui-fe368ba",
+    "source": "https://github.com/emilk/egui/tree/fe368bacc4a15697e347607e73a56c0299b3d42d",
+    "revision": "fe368bacc4a15697e347607e73a56c0299b3d42d"
+  },
+  "epaint-0.29.1": {
+    "directory": "licenses/egui-fe368ba",
+    "source": "https://github.com/emilk/egui/tree/fe368bacc4a15697e347607e73a56c0299b3d42d",
+    "revision": "fe368bacc4a15697e347607e73a56c0299b3d42d"
+  },
+  "clipboard-win-5.4.3": {
+    "directory": "licenses/clipboard-win-ed27008",
+    "source": "https://github.com/DoumanAsh/clipboard-win/tree/ed27008ae5d1f10cfbb266de039f0fb35fd05a56",
+    "revision": "ed27008ae5d1f10cfbb266de039f0fb35fd05a56"
+  },
+  "gl_generator-0.14.0": {
+    "directory": "licenses/gl-rs-ea503e8",
+    "source": "https://github.com/rust-windowing/gl-rs/tree/ea503e8d5fb6d73c6030e6191ce738cd3bf3433e",
+    "revision": "ea503e8d5fb6d73c6030e6191ce738cd3bf3433e"
+  },
+  "khronos_api-3.1.0": {
+    "directory": "licenses/gl-rs-f150967",
+    "source": "https://github.com/rust-windowing/gl-rs/tree/f150967b1c44ae888e6676f93f639ebc82771bdc",
+    "revision": "f150967b1c44ae888e6676f93f639ebc82771bdc"
+  }
+}

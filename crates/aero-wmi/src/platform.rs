@@ -151,7 +151,9 @@ impl WmiBlock {
                     out.truncate(out_size as usize);
                     return Ok(out);
                 }
-                ERROR_INSUFFICIENT_BUFFER if out_size as usize > out.len() => {
+                ERROR_INSUFFICIENT_BUFFER
+                    if spec.block == Block::Get && out_size as usize > out.len() =>
+                {
                     out.resize(out_size as usize, 0);
                 }
                 rc => return Err(rc),
@@ -333,18 +335,23 @@ fn bios_string(value: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// Read SMBIOS identity strings without opening the Gigabyte WMI provider.
+pub fn read_system_sku() -> SkuInfo {
+    SkuInfo {
+        manufacturer: bios_string("SystemManufacturer"),
+        model: bios_string("SystemProductName"),
+        system_family: bios_string("SystemFamily"),
+        system_sku: bios_string("SystemSKU"),
+        bios_version: bios_string("BIOSVersion"),
+        bios_manufacturer: bios_string("BIOSVendor"),
+        baseboard_product: bios_string("BaseBoardProduct"),
+        source: r"HKLM\HARDWARE\DESCRIPTION\System\BIOS".to_string(),
+    }
+}
+
 impl SkuSource for WindowsReader {
     fn read_sku(&mut self) -> Result<SkuInfo, WmiError> {
-        Ok(SkuInfo {
-            manufacturer: bios_string("SystemManufacturer"),
-            model: bios_string("SystemProductName"),
-            system_family: bios_string("SystemFamily"),
-            system_sku: bios_string("SystemSKU"),
-            bios_version: bios_string("BIOSVersion"),
-            bios_manufacturer: bios_string("BIOSVendor"),
-            baseboard_product: bios_string("BaseBoardProduct"),
-            source: r"HKLM\HARDWARE\DESCRIPTION\System\BIOS".to_string(),
-        })
+        Ok(read_system_sku())
     }
 }
 
@@ -384,18 +391,11 @@ impl AcpiWriter for WindowsWriter {
             reason: "not in the allow-list",
         })?;
         let pairs = params.pairs();
-        match self.inner.call(Some(&self.set), spec, &pairs) {
-            Ok(returned) => Ok(SetOutcome {
-                threw: None,
-                returned,
-            }),
-            // A delivered call the firmware rejected. The EC often still applies it.
-            Err(WmiError::CallFailed { detail, .. }) => Ok(SetOutcome {
-                threw: Some(detail),
-                returned: Vec::new(),
-            }),
-            Err(other) => Err(other),
-        }
+        let returned = self.inner.call(Some(&self.set), spec, &pairs)?;
+        Ok(SetOutcome {
+            threw: None,
+            returned,
+        })
     }
 }
 

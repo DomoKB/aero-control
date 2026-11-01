@@ -275,7 +275,7 @@ impl KeyboardTab {
         self.profiles(ui);
         ui.add_space(12.0);
         egui::CollapsingHeader::new("About").default_open(false).show(ui, |ui| {
-            ui.label("Targets only the built-in keyboard (USB 1044:7A3F on this Aero 17 YB; other Gigabyte Ite IDs 7A38/7A39/7A3A/7A3B are accepted) and only its collection with 9-byte feature reports, the same rule Control Center uses. External keyboards are never opened.");
+            ui.label("Targets the compatible built-in Gigabyte ITE keyboard detected on this laptop (USB vendor 1044; product IDs 7A3F/7A38/7A39/7A3A/7A3B) and only its collection with 9-byte feature reports, the same rule Control Center uses. External keyboards are never opened.");
             ui.add_space(4.0);
             ui.label("Each change sends one 0x08 feature report, waits 65 ms, then asks the keyboard what it is running (0x88). Success is reported only if every field reads back the same. Sliders send once, when you let go.");
             ui.add_space(4.0);

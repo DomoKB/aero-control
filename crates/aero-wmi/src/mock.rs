@@ -43,10 +43,16 @@ pub struct MockAcpi {
     pub fixed_speed: u8,
     pub gpu_duty: u8,
     pub nv_power_config: u8,
+    pub ai_boost_status: u8,
+    /// The driver consumes/clears the NVIDIA request; it is not a mode latch.
+    pub consume_nv_power_requests: bool,
     pub nv_thermal_target: u8,
     pub battery_health: u8,
     pub charge_policy: u8,
     pub charge_stop: u8,
+    pub camera: u8,
+    pub sleep_usb_charge: u8,
+    pub hibernation_usb_charge: u8,
     pub curve: [(u8, u8); FAN_CURVE_SLOTS],
     pub calls: Vec<RecordedCall>,
     pub mof_present: bool,
@@ -56,6 +62,9 @@ pub struct MockAcpi {
     pub throw_setters: HashSet<String>,
     #[cfg(feature = "writer")]
     pub missing_setters: HashSet<String>,
+    /// Simulates a firmware method that reports success without changing state.
+    #[cfg(feature = "writer")]
+    pub ignored_setters: HashSet<String>,
     #[cfg(feature = "writer")]
     pub panic_on_set: Option<String>,
 }
@@ -91,10 +100,15 @@ impl MockAcpi {
             fixed_speed: 0,
             gpu_duty: 0,
             nv_power_config: 0,
+            ai_boost_status: 0,
+            consume_nv_power_requests: false,
             nv_thermal_target: 0,
             battery_health: 0,
             charge_policy: 0,
             charge_stop: 100,
+            camera: 1,
+            sleep_usb_charge: 0,
+            hibernation_usb_charge: 0,
             curve,
             calls: Vec::new(),
             mof_present: true,
@@ -103,6 +117,8 @@ impl MockAcpi {
             throw_setters: HashSet::new(),
             #[cfg(feature = "writer")]
             missing_setters: HashSet::new(),
+            #[cfg(feature = "writer")]
+            ignored_setters: HashSet::new(),
             #[cfg(feature = "writer")]
             panic_on_set: None,
         }
@@ -205,10 +221,20 @@ impl AcpiReader for MockAcpi {
             "GetGPUFanDuty" => self.output_u8("Data", self.gpu_duty),
             "GetFanSpeed" => self.output_u8("Data", self.fixed_speed),
             "GetWhisperMode" => self.output_u8("Data", 0),
-            "GetNvPowerConfig" => self.output_u8("Data", self.nv_power_config),
+            "GetNvPowerConfig" => {
+                if self.consume_nv_power_requests {
+                    self.nv_power_config = 0;
+                }
+                self.output_u8("Data", self.nv_power_config)
+            }
+            "GetAIBoostStatus" => self.output_u8("Data", self.ai_boost_status),
+            "GetNvThermalTarget" => self.output_u8("Data", self.nv_thermal_target),
             "GetBatteryHealth" => self.output_u8("Data", self.battery_health),
             "GetChargePolicy" => self.output_u16("Data", u16::from(self.charge_policy)),
             "GetChargeStop" => self.output_u16("Data", u16::from(self.charge_stop)),
+            "GetCamera" => self.output_u8("Data", self.camera),
+            "GetSleepUSBCharge" => self.output_u8("Data", self.sleep_usb_charge),
+            "GetHibernationUSBCharge" => self.output_u8("Data", self.hibernation_usb_charge),
             "GetFanIndexValue" => self.fan_index(params)?,
             other => self.zeros_for(other)?,
         };
@@ -234,6 +260,20 @@ impl AcpiWriter for MockAcpi {
             });
         }
 
+        if self.throw_setters.contains(method) {
+            return Err(WmiError::CallFailed {
+                method: method.to_string(),
+                detail: "Win32 error (mock)".to_string(),
+            });
+        }
+
+        if self.ignored_setters.contains(method) {
+            return Ok(SetOutcome {
+                threw: None,
+                returned: Vec::new(),
+            });
+        }
+
         match (method, params) {
             ("SetAutoFanStatus", WriteParams::Data(value)) => self.auto = *value,
             ("SetFixedFanStatus", WriteParams::Data(value)) => self.fixed = *value,
@@ -244,9 +284,17 @@ impl AcpiWriter for MockAcpi {
             ("SetSuperQuiet", WriteParams::Data(value)) => self.super_quiet = *value,
             ("SetFanAdjustStatus", WriteParams::Data(value)) => self.fan_adjust = *value,
             ("SetNvPowerConfig", WriteParams::Data(value)) => self.nv_power_config = *value,
+            ("SetAIBoostStatus", WriteParams::Data(value)) => self.ai_boost_status = *value,
             ("SetNvThermalTarget", WriteParams::Data(value)) => self.nv_thermal_target = *value,
             ("SetChargePolicy", WriteParams::Data(value)) => self.charge_policy = *value,
             ("SetChargeStop", WriteParams::Data(value)) => self.charge_stop = *value,
+            ("SetCamera", WriteParams::Data(value)) => self.camera = *value & 1,
+            ("SetSleepUSBCharge", WriteParams::Data(value)) => self.sleep_usb_charge = *value & 1,
+            ("SetHibernationUSBCharge", WriteParams::Data(value)) => {
+                self.hibernation_usb_charge = *value & 1
+            }
+            // The mock records the request without changing the host display.
+            ("SetBrightnessOff", WriteParams::Data(_)) => {}
             ("SetFanIndexValue", WriteParams::FanPoint { index, temp, duty }) => {
                 if *index as usize >= FAN_CURVE_SLOTS {
                     return Err(WmiError::IndexOutOfRange { index: *index });
@@ -260,12 +308,8 @@ impl AcpiWriter for MockAcpi {
             }
         }
 
-        let threw = self
-            .throw_setters
-            .contains(method)
-            .then(|| "WBEM error (mock: write was still applied)".to_string());
         Ok(SetOutcome {
-            threw,
+            threw: None,
             returned: Vec::new(),
         })
     }

@@ -1,7 +1,20 @@
+#![cfg_attr(
+    all(windows, not(debug_assertions), not(test)),
+    windows_subsystem = "windows"
+)]
+
 mod app;
+mod cpu_power;
+mod desktop_events;
+mod device_identity;
+mod display_controls;
 mod elevate;
+mod fan_state;
 mod log_file;
+mod profile_store;
 mod session;
+mod startup_task;
+mod system_controls;
 mod system_power;
 
 use std::env;

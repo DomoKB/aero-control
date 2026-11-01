@@ -1,8 +1,7 @@
 //! Owns the embedded-controller connection on one thread.
 //!
 //! `WindowsWriter` is tied to the COM apartment that created it, so the UI
-//! thread only sends commands. Sensor polls are getters. They never choose a
-//! fan duty.
+//! thread only sends commands. Sensor polls are getters and do not set fan duty.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -10,15 +9,15 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use aero_core::{
-    apply_fixed_duty, apply_mode, clamp_fixed_duty, restore_firmware_auto, set_charge_policy,
-    set_nv_power_config, update_curve, upload_curve, ApplyError, ChargePolicy, CurvePoint,
-    FanCurve, FanMode,
+    apply_fixed_duty, apply_mode, apply_profile, clamp_fixed_duty, restore_firmware_auto,
+    set_charge_policy, set_nv_power_config, set_nv_thermal_target, update_curve, upload_curve,
+    ApplyError, ApplyReason, ChargePolicy, CurvePoint, FanCurve, FanMode, Profile,
 };
 #[cfg(windows)]
 use aero_wmi::FixedPacer;
 use aero_wmi::{
     decode_rpm, AcpiReader, AcpiWriter, ClassStatus, MockAcpi, NoPacer, Pacer, RpmOrder,
-    SetOutcome, WmiError, WmiOutput, WriteParams,
+    SetOutcome, SkuInfo, SkuSource, WmiError, WmiOutput, WriteParams,
 };
 
 use crate::log_file::{format_call, CallLog};
@@ -30,6 +29,15 @@ pub enum BackendChoice {
     Real {
         elevated: bool,
     },
+}
+
+impl BackendChoice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Mock => "MOCK",
+            Self::Real { .. } => "REAL",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -52,12 +60,23 @@ pub struct PowerSnapshot {
     pub charge_stop: Result<u32, String>,
     pub battery_health: Result<u32, String>,
     pub nv_power_config: Result<u32, String>,
+    pub nv_thermal_target: Result<u32, String>,
+    pub camera: Result<u32, String>,
+    pub sleep_usb_charge: Result<u32, String>,
+    pub hibernation_usb_charge: Result<u32, String>,
+    pub identity: Result<SkuInfo, String>,
+    pub fan_state: Result<crate::fan_state::RecognizedFanState, crate::fan_state::FanStateError>,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub enum PowerWrite {
     Charge(ChargePolicy),
     NvPowerConfig(bool),
+    ThermalTarget(bool),
+    Camera(bool),
+    SleepUsbCharge(bool),
+    HibernationUsbCharge(bool),
+    DisplayOff,
 }
 
 #[derive(Clone, Debug)]
@@ -66,9 +85,15 @@ pub struct SessionEvent {
     pub message: Option<String>,
     pub error: bool,
     pub busy: bool,
+    /// Present only when a requested fan apply has finished verification or failed.
+    pub fan_result: Option<bool>,
+    /// Last GPU request sent by this operation, never a measured power budget.
+    pub gpu_request: Option<Result<bool, String>>,
+    pub cpu_power: Option<Result<crate::cpu_power::CpuPowerSnapshot, String>>,
 }
 
 enum Command {
+    Profile(Profile, ApplyReason),
     Apply {
         mode: FanMode,
         raw: u8,
@@ -82,6 +107,8 @@ enum Command {
     UpdateCurve(Vec<CurvePoint>),
     MaxTest,
     Power(PowerWrite),
+    RefreshPower,
+    CpuPower(Option<aero_core::CpuPowerPreset>),
     Shutdown,
 }
 
@@ -97,15 +124,24 @@ pub struct FanSession {
 }
 
 impl FanSession {
+    pub fn profile(&self, profile: Profile, reason: ApplyReason) {
+        let _ = self.tx.send(Command::Profile(profile, reason));
+    }
     pub fn start(choice: BackendChoice) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel();
         let (ev_tx, ev_rx) = mpsc::channel();
         let join = thread::spawn(move || worker(choice, cmd_rx, ev_tx));
         let hello = ev_rx.recv().unwrap_or_else(|_| SessionEvent {
             sensors: None,
-            message: Some("the fan thread stopped before it connected".to_string()),
+            message: Some(format!(
+                "{}|0||The fan thread stopped before it connected.",
+                choice.label()
+            )),
             error: true,
             busy: false,
+            fan_result: None,
+            gpu_request: None,
+            cpu_power: None,
         });
         let (backend_label, writes_enabled, log_path, banner) = parse_hello(&hello);
         Self {
@@ -147,6 +183,14 @@ impl FanSession {
     pub fn power(&self, write: PowerWrite) {
         let _ = self.tx.send(Command::Power(write));
     }
+
+    pub fn cpu_power(&self, preset: Option<aero_core::CpuPowerPreset>) {
+        let _ = self.tx.send(Command::CpuPower(preset));
+    }
+
+    pub fn refresh_power(&self) {
+        let _ = self.tx.send(Command::RefreshPower);
+    }
 }
 
 impl Drop for FanSession {
@@ -163,7 +207,8 @@ fn parse_hello(event: &SessionEvent) -> (String, bool, String, Option<String>) {
     // "REAL|MOCK|<writes 0/1>|<log path>|<banner>"
     let mut parts = text.splitn(5, '|');
     let label = parts.next().unwrap_or("MOCK").to_string();
-    let writes = parts.next().unwrap_or("1") == "1";
+    let explicit_writes = parts.next().is_some_and(|value| value == "1");
+    let writes = matches!(label.as_str(), "REAL" | "MOCK") && explicit_writes;
     let log_path = parts.next().unwrap_or("").to_string();
     let banner = parts
         .next()
@@ -188,25 +233,143 @@ fn worker(choice: BackendChoice, rx: Receiver<Command>, tx: Sender<SessionEvent>
         Err(err) => {
             let _ = tx.send(SessionEvent {
                 sensors: None,
-                message: Some(format!("MOCK|0|{log_path}|{err}")),
+                message: Some(format!("{}|0|{log_path}|{err}", choice.label())),
                 error: true,
                 busy: false,
+                fan_result: None,
+                gpu_request: None,
+                cpu_power: None,
             });
             return;
         }
+    };
+    let log_path = match &live {
+        Live::Mock(backend) => backend.log.path().display().to_string(),
+        #[cfg(windows)]
+        Live::Read(backend) => backend.log.path().display().to_string(),
+        #[cfg(windows)]
+        Live::Write(backend) => backend.log.path().display().to_string(),
     };
     let _ = tx.send(SessionEvent {
         sensors: read_sensors_and_power(&mut live),
         message: Some(hello_line(&live, &log_path)),
         error: false,
         busy: false,
+        fan_result: None,
+        gpu_request: None,
+        cpu_power: None,
     });
+    let identity = crate::device_identity::read(matches!(choice, BackendChoice::Mock));
+    let mut cpu = crate::cpu_power::CpuPower::new(
+        matches!(choice, BackendChoice::Mock),
+        crate::device_identity::has_yb_command_set(&identity),
+        matches!(choice, BackendChoice::Real { elevated: true }),
+    );
     let mut restore_on_exit = false;
     loop {
         match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(Command::Profile(mut profile, reason)) => {
+                let _ = tx.send(busy());
+                if let Err(error) = crate::profile_store::validate_profile(&profile) {
+                    let _ = tx.send(SessionEvent {
+                        message: Some(error),
+                        error: true,
+                        fan_result: Some(false),
+                        gpu_request: None,
+                        ..idle()
+                    });
+                    continue;
+                }
+                // CPU is preflighted and verified before any profile WMI writes.
+                // If it fails, keep the existing fan/GPU state unchanged.
+                let requested_gpu = profile
+                    .nv_power_config
+                    .map(|value| value == 1)
+                    .unwrap_or(profile.fan_mode == FanMode::Gaming);
+                let preset = profile.cpu_power_preset.take();
+                let mut cpu_snapshot = None;
+                if let Some(preset) = preset {
+                    let outcome = cpu.apply(preset);
+                    if let Err(error) = &outcome {
+                        let _ = tx.send(SessionEvent {
+                            message: Some(format!("Profile was not applied: {error}")),
+                            error: true,
+                            fan_result: Some(false),
+                            gpu_request: None,
+                            cpu_power: Some(outcome),
+                            ..idle()
+                        });
+                        continue;
+                    }
+                    cpu_snapshot = Some(outcome);
+                }
+                let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    let report = match &mut live {
+                        Live::Mock(backend) => {
+                            apply_profile(backend, &mut NoPacer, &profile, reason)?
+                        }
+                        #[cfg(windows)]
+                        Live::Write(backend) => {
+                            apply_profile(backend, &mut FixedPacer::standard(), &profile, reason)?
+                        }
+                        #[cfg(windows)]
+                        Live::Read(_) => {
+                            return Err(ApplyError::Wmi(WmiError::NotAvailable(
+                                "profile writes need elevation",
+                            )))
+                        }
+                    };
+                    Ok(format!(
+                        "Applied {}. {}",
+                        profile.name,
+                        report.warnings.join(" ")
+                    ))
+                }));
+                restore_on_exit = matches!(profile.fan_mode, FanMode::Fixed | FanMode::Max);
+                let mut event = finish_fan_apply(
+                    &mut live,
+                    &mut restore_on_exit,
+                    outcome,
+                    Some(requested_gpu),
+                );
+                if event.fan_result == Some(false) && preset.is_some() {
+                    // CPU writes are a separate subsystem. Do not claim a full
+                    // rollback when the fan/GPU portion of the profile failed.
+                    event.message.get_or_insert_with(String::new).push_str(
+                        " CPU power was applied separately and remains at the requested preset.",
+                    );
+                }
+                event.cpu_power = cpu_snapshot;
+                let _ = tx.send(event);
+            }
+            Ok(Command::CpuPower(preset)) => {
+                let _ = tx.send(busy());
+                let outcome = if let Some(preset) = preset {
+                    cpu.apply(preset)
+                } else {
+                    cpu.read()
+                };
+                let (message, error) = match &outcome {
+                    Ok(snapshot) => (
+                        format!(
+                            "CPU power confirmed: sustained {:.2} W, short burst {:.2} W.",
+                            snapshot.pl1_mw as f64 / 1000.0,
+                            snapshot.pl2_mw as f64 / 1000.0
+                        ),
+                        false,
+                    ),
+                    Err(error) => (error.clone(), true),
+                };
+                let _ = tx.send(SessionEvent {
+                    cpu_power: Some(outcome),
+                    message: Some(message),
+                    error,
+                    ..idle()
+                });
+            }
             Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => {
                 if restore_on_exit {
-                    restore_any(&mut live);
+                    let _ = safe_restore(&mut live);
                 }
                 break;
             }
@@ -216,6 +379,9 @@ fn worker(choice: BackendChoice, rx: Receiver<Command>, tx: Sender<SessionEvent>
                     message: None,
                     error: false,
                     busy: false,
+                    fan_result: None,
+                    gpu_request: None,
+                    cpu_power: None,
                 });
             }
             Ok(Command::Apply { mode, raw, expert }) => {
@@ -223,28 +389,48 @@ fn worker(choice: BackendChoice, rx: Receiver<Command>, tx: Sender<SessionEvent>
                 let outcome =
                     catch_unwind(AssertUnwindSafe(|| apply_any(&mut live, mode, raw, expert)));
                 restore_on_exit = matches!(mode, FanMode::Fixed | FanMode::Max);
-                let _ = tx.send(finish_apply(&mut live, &mut restore_on_exit, outcome));
+                let _ = tx.send(finish_fan_apply(
+                    &mut live,
+                    &mut restore_on_exit,
+                    outcome,
+                    Some(mode == FanMode::Gaming),
+                ));
             }
             Ok(Command::FixedDuty { raw, expert }) => {
                 let _ = tx.send(busy());
                 let outcome =
                     catch_unwind(AssertUnwindSafe(|| fixed_duty_any(&mut live, raw, expert)));
                 restore_on_exit = true;
-                let _ = tx.send(finish_apply(&mut live, &mut restore_on_exit, outcome));
+                let _ = tx.send(finish_fan_apply(
+                    &mut live,
+                    &mut restore_on_exit,
+                    outcome,
+                    None,
+                ));
             }
             Ok(Command::Upload(points)) => {
                 let _ = tx.send(busy());
                 let outcome =
                     catch_unwind(AssertUnwindSafe(|| upload_any(&mut live, points, false)));
                 restore_on_exit = false;
-                let _ = tx.send(finish_apply(&mut live, &mut restore_on_exit, outcome));
+                let _ = tx.send(finish_fan_apply(
+                    &mut live,
+                    &mut restore_on_exit,
+                    outcome,
+                    Some(false),
+                ));
             }
             Ok(Command::UpdateCurve(points)) => {
                 let _ = tx.send(busy());
                 let outcome =
                     catch_unwind(AssertUnwindSafe(|| upload_any(&mut live, points, true)));
                 restore_on_exit = false;
-                let _ = tx.send(finish_apply(&mut live, &mut restore_on_exit, outcome));
+                let _ = tx.send(finish_fan_apply(
+                    &mut live,
+                    &mut restore_on_exit,
+                    outcome,
+                    None,
+                ));
             }
             Ok(Command::Power(write)) => {
                 let _ = tx.send(busy());
@@ -254,12 +440,51 @@ fn worker(choice: BackendChoice, rx: Receiver<Command>, tx: Sender<SessionEvent>
                     Ok(Err(err)) => (err.to_string(), true),
                     Err(_) => ("The power command panicked.".to_string(), true),
                 };
+                let gpu_request = match write {
+                    PowerWrite::NvPowerConfig(on) => {
+                        Some(if error { Err(message.clone()) } else { Ok(on) })
+                    }
+                    _ => None,
+                };
                 let _ = tx.send(SessionEvent {
                     sensors: read_sensors_and_power(&mut live),
                     message: Some(message),
                     error,
                     busy: false,
+                    fan_result: None,
+                    gpu_request,
+                    cpu_power: None,
                 });
+            }
+            Ok(Command::RefreshPower) => {
+                let _ = tx.send(SessionEvent {
+                    message: Some("Reading firmware settings…".into()),
+                    ..busy()
+                });
+                let event =
+                    match catch_unwind(AssertUnwindSafe(|| read_sensors_and_power(&mut live))) {
+                        Ok(sensors) => SessionEvent {
+                            sensors,
+                            message: Some("Firmware reads finished.".into()),
+                            error: false,
+                            busy: false,
+                            fan_result: None,
+                            gpu_request: None,
+                            cpu_power: None,
+                        },
+                        Err(_) => SessionEvent {
+                            sensors: None,
+                            message: Some(
+                                "Firmware refresh panicked; readings are unavailable.".into(),
+                            ),
+                            error: true,
+                            busy: false,
+                            fan_result: None,
+                            gpu_request: None,
+                            cpu_power: None,
+                        },
+                    };
+                let _ = tx.send(event);
             }
             Ok(Command::MaxTest) => {
                 let _ = tx.send(SessionEvent {
@@ -267,41 +492,53 @@ fn worker(choice: BackendChoice, rx: Receiver<Command>, tx: Sender<SessionEvent>
                     message: Some("Max for 10 seconds, then firmware auto.".to_string()),
                     error: false,
                     busy: true,
+                    fan_result: None,
+                    gpu_request: None,
+                    cpu_power: None,
                 });
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
                     apply_any(&mut live, FanMode::Max, 229, false)
                 }));
-                if outcome.is_err() {
-                    restore_any(&mut live);
-                    restore_on_exit = false;
-                    let _ = tx.send(SessionEvent {
-                        sensors: read_sensors(&mut live),
-                        message: Some("Max panicked; firmware auto was restored.".to_string()),
-                        error: true,
-                        busy: false,
-                    });
-                    continue;
+                match outcome {
+                    Ok(Ok(text)) => {
+                        let _ = tx.send(report_from("Max", Ok(text)));
+                    }
+                    other => {
+                        let _ = tx.send(finish_fan_apply(
+                            &mut live,
+                            &mut restore_on_exit,
+                            other,
+                            None,
+                        ));
+                        continue;
+                    }
                 }
-                let applied = outcome.unwrap_or_else(|_| {
-                    Err(ApplyError::Wmi(WmiError::NotAvailable("Max panicked")))
-                });
-                let _ = tx.send(report_from("Max", applied));
                 if wait_or_shutdown(&rx, &tx, &mut live, Duration::from_secs(10)) {
-                    restore_any(&mut live);
+                    let _ = restore_any(&mut live);
                     break;
                 }
                 let restored = catch_unwind(AssertUnwindSafe(|| restore_any(&mut live)));
-                restore_on_exit = false;
-                let failed = restored.is_err();
+                let result = match restored {
+                    Ok(result) => result.map_err(|error| error.to_string()),
+                    Err(_) => Err("Restore after the Max test panicked.".to_string()),
+                };
+                let failed = result.is_err();
+                restore_on_exit = failed;
                 let _ = tx.send(SessionEvent {
-                    sensors: read_sensors(&mut live),
-                    message: Some(if failed {
-                        "Restore after the Max test panicked.".to_string()
-                    } else {
-                        "Max test finished. Firmware auto restored.".to_string()
-                    }),
+                    sensors: read_sensors_and_power(&mut live),
+                    message: Some(result.map_or_else(
+                        |error| format!("Max test recovery failed: {error}"),
+                        |_| "Max test finished. Normal mode restored.".into(),
+                    )),
                     error: failed,
                     busy: false,
+                    fan_result: Some(!failed),
+                    gpu_request: Some(if failed {
+                        Err("Max recovery failed.".into())
+                    } else {
+                        Ok(false)
+                    }),
+                    cpu_power: None,
                 });
             }
         }
@@ -325,6 +562,9 @@ fn wait_or_shutdown(
                     message: None,
                     error: false,
                     busy: true,
+                    fan_result: None,
+                    gpu_request: None,
+                    cpu_power: None,
                 });
             }
             Ok(_) => {
@@ -335,11 +575,117 @@ fn wait_or_shutdown(
                     ),
                     error: true,
                     busy: true,
+                    fan_result: None,
+                    gpu_request: None,
+                    cpu_power: None,
                 });
             }
         }
     }
     false
+}
+
+fn idle() -> SessionEvent {
+    SessionEvent {
+        sensors: None,
+        message: None,
+        error: false,
+        busy: false,
+        fan_result: None,
+        gpu_request: None,
+        cpu_power: None,
+    }
+}
+
+#[cfg(test)]
+mod cpu_profile_tests {
+    use super::*;
+
+    fn completed(session: &FanSession) -> SessionEvent {
+        loop {
+            let event = session
+                .rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("mock command completes");
+            if !event.busy {
+                return event;
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_request_and_gaming_survive_a_cleared_request_flag_and_refresh() {
+        let session = FanSession::start(BackendChoice::Mock);
+        session.power(PowerWrite::NvPowerConfig(true));
+        let event = completed(&session);
+        assert_eq!(event.gpu_request, Some(Ok(true)));
+        assert_eq!(event.fan_result, None);
+        assert!(!event.error);
+        assert_eq!(event.sensors.unwrap().power.unwrap().nv_power_config, Ok(0));
+        session.apply(FanMode::Gaming, 0, false);
+        let event = completed(&session);
+        assert_eq!(event.gpu_request, Some(Ok(true)));
+        assert_eq!(event.fan_result, Some(true));
+        assert_eq!(
+            event
+                .sensors
+                .unwrap()
+                .power
+                .unwrap()
+                .fan_state
+                .unwrap()
+                .mode,
+            FanMode::Gaming
+        );
+        session.refresh_power();
+        let event = completed(&session);
+        assert_eq!(event.gpu_request, None);
+        let power = event.sensors.unwrap().power.unwrap();
+        assert_eq!(power.nv_power_config, Ok(0));
+        assert_eq!(power.fan_state.unwrap().mode, FanMode::Gaming);
+    }
+
+    #[test]
+    fn cpu_commands_do_not_report_a_fan_change_and_profiles_keep_cpu_readback() {
+        let session = FanSession::start(BackendChoice::Mock);
+        session.cpu_power(None);
+        let initial = completed(&session);
+        assert_eq!(initial.fan_result, None);
+        assert_eq!(initial.cpu_power.unwrap().unwrap().pl1_mw, 52_000);
+        session.cpu_power(Some(aero_core::CpuPowerPreset::Battery));
+        let applied = completed(&session);
+        assert_eq!(applied.fan_result, None);
+        assert_eq!(applied.cpu_power.unwrap().unwrap().pl2_mw, 56_250);
+        let mut profile = aero_core::builtin_config()
+            .profile("Gaming")
+            .unwrap()
+            .clone();
+        profile.cpu_power_preset = Some(aero_core::CpuPowerPreset::Level5);
+        session.profile(profile, ApplyReason::User);
+        let event = completed(&session);
+        assert_eq!(event.fan_result, Some(true));
+        assert_eq!(event.cpu_power.unwrap().unwrap().pl1_mw, 62_000);
+        assert_eq!(event.gpu_request, Some(Ok(true)));
+        assert_eq!(event.sensors.unwrap().power.unwrap().nv_power_config, Ok(0));
+    }
+
+    #[test]
+    fn invalid_profile_does_not_apply_cpu_power() {
+        let session = FanSession::start(BackendChoice::Mock);
+        let mut profile = aero_core::builtin_config()
+            .profile("Gaming")
+            .unwrap()
+            .clone();
+        profile.cpu_power_preset = Some(aero_core::CpuPowerPreset::Level5);
+        profile.charge_limit = Some(101);
+        session.profile(profile, ApplyReason::User);
+        assert_eq!(completed(&session).fan_result, Some(false));
+        session.cpu_power(None);
+        assert_eq!(
+            completed(&session).cpu_power.unwrap().unwrap().pl1_mw,
+            52_000
+        );
+    }
 }
 
 fn busy() -> SessionEvent {
@@ -348,7 +694,88 @@ fn busy() -> SessionEvent {
         message: Some("Sending the firmware sequence…".to_string()),
         error: false,
         busy: true,
+        fan_result: None,
+        gpu_request: None,
+        cpu_power: None,
     }
+}
+
+#[cfg(test)]
+mod completion_tests {
+    use super::*;
+
+    #[test]
+    fn failed_or_malformed_handshake_never_enables_writes() {
+        for message in [
+            "worker stopped",
+            "REAL",
+            "REAL||",
+            "OTHER|1|log|",
+            "MOCK|0||",
+        ] {
+            let event = SessionEvent {
+                sensors: None,
+                message: Some(message.into()),
+                error: true,
+                busy: false,
+                fan_result: None,
+                gpu_request: None,
+                cpu_power: None,
+            };
+            assert!(!parse_hello(&event).1, "{message}");
+        }
+        assert_eq!(BackendChoice::Real { elevated: true }.label(), "REAL");
+        assert_eq!(BackendChoice::Mock.label(), "MOCK");
+    }
+
+    #[test]
+    fn progress_event_is_not_a_fan_completion() {
+        assert_eq!(busy().fan_result, None);
+    }
+
+    #[test]
+    fn fan_completion_reports_success_and_failure_explicitly() {
+        let dir = std::env::temp_dir().join(format!(
+            "aero-completion-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let log = CallLog::open_in(&dir).unwrap();
+        let mut live = Live::Mock(Logged::new(MockAcpi::aero_17_yb_fixture(), log));
+        let mut restore_on_exit = false;
+        let success = finish_apply(&mut live, &mut restore_on_exit, Ok(Ok("applied".into())));
+        assert_eq!(success.fan_result, Some(true));
+        assert!(!success.busy);
+        let failure = finish_apply(
+            &mut live,
+            &mut restore_on_exit,
+            Ok(Err(ApplyError::Wmi(WmiError::NotAvailable("test failure")))),
+        );
+        assert_eq!(failure.fan_result, Some(false));
+        assert!(failure.error);
+        assert!(!failure.busy);
+        drop(live);
+        std::fs::remove_file(dir.join("aero-control.log")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+}
+
+fn finish_fan_apply(
+    live: &mut Live,
+    restore_on_exit: &mut bool,
+    outcome: Result<Result<String, ApplyError>, Box<dyn std::any::Any + Send>>,
+    requested_gpu: Option<bool>,
+) -> SessionEvent {
+    let mut event = finish_apply(live, restore_on_exit, outcome);
+    event.gpu_request = if event.error {
+        Some(Err("The GPU request is unconfirmed after recovery.".into()))
+    } else {
+        requested_gpu.map(Ok)
+    };
+    event
 }
 
 fn finish_apply(
@@ -358,31 +785,62 @@ fn finish_apply(
 ) -> SessionEvent {
     match outcome {
         Ok(Ok(text)) => SessionEvent {
-            sensors: read_sensors(live),
+            sensors: safe_read_sensors_and_power(live),
             message: Some(text),
             error: false,
             busy: false,
+            fan_result: Some(true),
+            gpu_request: None,
+            cpu_power: None,
         },
         Ok(Err(err)) => {
-            *restore_on_exit = false;
+            // Invalid data can fail before the core guarded sequence starts.
+            let err = match err {
+                ApplyError::Restored { .. } | ApplyError::RestoreFailed { .. } => err,
+                other => match safe_restore(live) {
+                    Ok(()) => ApplyError::Restored {
+                        reason: other.to_string(),
+                    },
+                    Err(restore) => ApplyError::RestoreFailed {
+                        reason: other.to_string(),
+                        restore,
+                    },
+                },
+            };
+            *restore_on_exit = matches!(err, ApplyError::RestoreFailed { .. });
             SessionEvent {
-                sensors: read_sensors(live),
+                sensors: safe_read_sensors_and_power(live),
                 message: Some(err.to_string()),
                 error: true,
                 busy: false,
+                fan_result: Some(false),
+                gpu_request: None,
+                cpu_power: None,
             }
         }
         Err(_) => {
-            restore_any(live);
-            *restore_on_exit = false;
+            let restored = safe_restore(live);
+            *restore_on_exit = restored.is_err();
             SessionEvent {
-                sensors: read_sensors(live),
-                message: Some("The fan command panicked. Firmware auto was restored.".to_string()),
+                sensors: safe_read_sensors_and_power(live),
+                message: Some(restored.map_or_else(
+                    |error| format!("Fan command panicked; recovery failed: {error}"),
+                    |_| "The fan command panicked. Normal mode restored.".into(),
+                )),
                 error: true,
                 busy: false,
+                fan_result: Some(false),
+                gpu_request: None,
+                cpu_power: None,
             }
         }
     }
+}
+
+fn safe_read_sensors_and_power(live: &mut Live) -> Option<SensorSnapshot> {
+    catch_unwind(AssertUnwindSafe(|| read_sensors_and_power(live)))
+        .ok()
+        .flatten()
 }
 
 fn report_from(label: &str, outcome: Result<String, ApplyError>) -> SessionEvent {
@@ -392,12 +850,18 @@ fn report_from(label: &str, outcome: Result<String, ApplyError>) -> SessionEvent
             message: Some(format!("{label}: {text}")),
             error: false,
             busy: true,
+            fan_result: None,
+            gpu_request: None,
+            cpu_power: None,
         },
         Err(err) => SessionEvent {
             sensors: None,
             message: Some(err.to_string()),
             error: true,
             busy: true,
+            fan_result: None,
+            gpu_request: None,
+            cpu_power: None,
         },
     }
 }
@@ -457,7 +921,12 @@ fn open_backend(choice: BackendChoice, log: Option<CallLog>) -> Result<Live, Str
         }
     };
     match choice {
-        BackendChoice::Mock => Ok(Live::Mock(Logged::new(MockAcpi::aero_17_yb_fixture(), log))),
+        BackendChoice::Mock => {
+            let mut mock = MockAcpi::aero_17_yb_fixture();
+            mock.auto = 0;
+            mock.consume_nv_power_requests = true;
+            Ok(Live::Mock(Logged::new(mock, log)))
+        }
         #[cfg(windows)]
         BackendChoice::Real { elevated: false } => {
             let reader = aero_wmi::WindowsReader::connect().map_err(|err| err.to_string())?;
@@ -557,6 +1026,15 @@ fn power_any(live: &mut Live, write: PowerWrite) -> Result<String, ApplyError> {
     }
 }
 
+fn safe_restore(live: &mut Live) -> Result<(), String> {
+    match catch_unwind(AssertUnwindSafe(|| {
+        apply_any(live, FanMode::Normal, 0, false)
+    })) {
+        Ok(result) => result.map(|_| ()).map_err(|error| error.to_string()),
+        Err(_) => Err("Normal recovery panicked.".into()),
+    }
+}
+
 fn run_power<W: AcpiWriter, P: Pacer>(
     writer: &mut W,
     pacer: &mut P,
@@ -572,22 +1050,211 @@ fn run_power<W: AcpiWriter, P: Pacer>(
         }
         PowerWrite::NvPowerConfig(on) => {
             set_nv_power_config(writer, pacer, on)?;
-            Ok(format!("NvPowerConfig set to {}.", u8::from(on)))
+            Ok(format!(
+                "GPU Level {} requested. Actual GPU power is not measured.",
+                if on { 2 } else { 1 }
+            ))
+        }
+        PowerWrite::ThermalTarget(quiet) => {
+            set_nv_thermal_target(writer, pacer, quiet)?;
+            Ok(format!(
+                "GPU thermal profile set to {}.",
+                if quiet { "Quiet" } else { "Standard" }
+            ))
+        }
+        PowerWrite::Camera(on) => {
+            set_flag_verified(writer, pacer, "SetCamera", "GetCamera", on)?;
+            Ok(format!(
+                "Camera {}.",
+                if on { "enabled" } else { "disabled" }
+            ))
+        }
+        PowerWrite::SleepUsbCharge(on) => {
+            set_flag_verified(writer, pacer, "SetSleepUSBCharge", "GetSleepUSBCharge", on)?;
+            Ok(format!(
+                "USB charging during sleep {}.",
+                if on { "enabled" } else { "disabled" }
+            ))
+        }
+        PowerWrite::HibernationUsbCharge(on) => {
+            set_flag_verified(
+                writer,
+                pacer,
+                "SetHibernationUSBCharge",
+                "GetHibernationUSBCharge",
+                on,
+            )?;
+            Ok(format!(
+                "USB charging during hibernation {}.",
+                if on { "enabled" } else { "disabled" }
+            ))
+        }
+        PowerWrite::DisplayOff => {
+            let outcome = writer.set("SetBrightnessOff", &WriteParams::Data(1))?;
+            if let Some(detail) = outcome.threw {
+                return Err(WmiError::CallFailed {
+                    method: "SetBrightnessOff".into(),
+                    detail,
+                }
+                .into());
+            }
+            Ok("Display power-off request sent; panel state is not verified.".into())
         }
     }
 }
 
-fn restore_any(live: &mut Live) {
+fn set_flag_verified<W: AcpiWriter, P: Pacer>(
+    writer: &mut W,
+    pacer: &mut P,
+    setter: &str,
+    getter: &str,
+    enabled: bool,
+) -> Result<(), ApplyError> {
+    let expected = u8::from(enabled);
+    let outcome = writer.set(setter, &WriteParams::Data(expected))?;
+    if let Some(detail) = outcome.threw {
+        return Err(WmiError::CallFailed {
+            method: setter.into(),
+            detail,
+        }
+        .into());
+    }
+    pacer.pause();
+    let output = writer.get(getter, &[])?;
+    let actual = output.get("Data").and_then(|value| value.as_u32());
+    if actual != Some(u32::from(expected)) {
+        return Err(WmiError::CallFailed {
+            method: getter.into(),
+            detail: format!("requested {expected}, but readback returned {actual:?}"),
+        }
+        .into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod firmware_control_tests {
+    use super::*;
+
+    #[test]
+    fn device_changes_verify_only_the_requested_setting() {
+        for (write, setter, getter, expected) in [
+            (PowerWrite::Camera(false), "SetCamera", "GetCamera", 0),
+            (
+                PowerWrite::SleepUsbCharge(true),
+                "SetSleepUSBCharge",
+                "GetSleepUSBCharge",
+                1,
+            ),
+            (
+                PowerWrite::HibernationUsbCharge(true),
+                "SetHibernationUSBCharge",
+                "GetHibernationUSBCharge",
+                1,
+            ),
+            (
+                PowerWrite::ThermalTarget(true),
+                "SetNvThermalTarget",
+                "GetNvThermalTarget",
+                1,
+            ),
+        ] {
+            let mut writer = MockAcpi::aero_17_yb_fixture();
+            let initial_fans = (
+                writer.auto,
+                writer.fixed,
+                writer.step,
+                writer.fixed_speed,
+                writer.gpu_duty,
+            );
+            let mut pacer = aero_wmi::CountPacer::default();
+            run_power(&mut writer, &mut pacer, write).unwrap();
+            assert_eq!(writer.calls.len(), 2);
+            assert_eq!(writer.calls[0].method, setter);
+            assert_eq!(writer.calls[0].params, [("Data".to_string(), expected)]);
+            assert_eq!(writer.calls[1].method, getter);
+            assert_eq!(pacer.pauses, 1);
+            assert_eq!(
+                (
+                    writer.auto,
+                    writer.fixed,
+                    writer.step,
+                    writer.fixed_speed,
+                    writer.gpu_duty
+                ),
+                initial_fans
+            );
+        }
+    }
+
+    #[test]
+    fn silent_noop_and_transport_failure_do_not_report_success_or_retry() {
+        let mut writer = MockAcpi::aero_17_yb_fixture();
+        writer.ignored_setters.insert("SetCamera".into());
+        let error = run_power(&mut writer, &mut NoPacer, PowerWrite::Camera(false)).unwrap_err();
+        assert!(error.to_string().contains("readback"));
+        assert_eq!(writer.calls_named("SetCamera").count(), 1);
+        assert_eq!(writer.camera, 1);
+
+        writer.calls.clear();
+        writer.throw_setters.insert("SetCamera".into());
+        assert!(run_power(&mut writer, &mut NoPacer, PowerWrite::Camera(false)).is_err());
+        assert_eq!(writer.calls.len(), 1);
+        assert_eq!(writer.calls[0].method, "SetCamera");
+    }
+
+    #[test]
+    fn snapshots_expose_confirmed_device_state_and_model_without_writes() {
+        let mut reader = MockAcpi::aero_17_yb_fixture();
+        reader.camera = 0;
+        reader.sleep_usb_charge = 1;
+        reader.hibernation_usb_charge = 0;
+        reader.nv_thermal_target = 1;
+        let power = power_snapshot(&mut reader);
+        assert_eq!(power.camera, Ok(0));
+        assert_eq!(power.sleep_usb_charge, Ok(1));
+        assert_eq!(power.hibernation_usb_charge, Ok(0));
+        assert_eq!(power.nv_thermal_target, Ok(1));
+        assert_eq!(power.identity.unwrap().model.as_deref(), Some("AERO 17 YB"));
+        assert!(reader
+            .calls
+            .iter()
+            .all(|call| call.class == aero_wmi::GET_CLASS));
+    }
+
+    #[test]
+    fn ordinary_sensor_polls_do_not_repeat_device_or_identity_reads() {
+        let mut reader = MockAcpi::aero_17_yb_fixture();
+        snapshot(&mut reader);
+        assert!(reader.calls.iter().all(|call| ![
+            "GetCamera",
+            "GetSleepUSBCharge",
+            "GetHibernationUSBCharge",
+            "GetNvThermalTarget",
+        ]
+        .contains(&call.method.as_str())));
+    }
+
+    #[test]
+    fn display_request_matches_official_data_and_never_touches_the_mock_fans() {
+        let mut writer = MockAcpi::aero_17_yb_fixture();
+        let message = run_power(&mut writer, &mut NoPacer, PowerWrite::DisplayOff).unwrap();
+        assert!(message.contains("not verified"));
+        assert_eq!(writer.calls.len(), 1);
+        assert_eq!(writer.calls[0].method, "SetBrightnessOff");
+        assert_eq!(writer.calls[0].params, [("Data".to_string(), 1)]);
+    }
+}
+
+fn restore_any(live: &mut Live) -> Result<(), ApplyError> {
     match live {
-        Live::Mock(backend) => {
-            let _ = restore_firmware_auto(backend, &mut NoPacer);
-        }
+        Live::Mock(backend) => restore_firmware_auto(backend, &mut NoPacer),
         #[cfg(windows)]
-        Live::Write(backend) => {
-            let _ = restore_firmware_auto(backend, &mut FixedPacer::standard());
-        }
+        Live::Write(backend) => restore_firmware_auto(backend, &mut FixedPacer::standard()),
         #[cfg(windows)]
-        Live::Read(_) => {}
+        Live::Read(_) => Err(ApplyError::Wmi(WmiError::NotAvailable(
+            "recovery requires elevation",
+        ))),
     }
 }
 
@@ -615,7 +1282,7 @@ fn read_sensors_and_power(live: &mut Live) -> Option<SensorSnapshot> {
     })
 }
 
-fn power_snapshot<R: AcpiReader>(reader: &mut R) -> PowerSnapshot {
+fn power_snapshot<R: AcpiReader + SkuSource>(reader: &mut R) -> PowerSnapshot {
     let mut read = |method: &str| {
         reader
             .get(method, &[])
@@ -624,11 +1291,27 @@ fn power_snapshot<R: AcpiReader>(reader: &mut R) -> PowerSnapshot {
             .and_then(|value| value.as_u32())
             .ok_or_else(|| format!("{method} returned no Data"))
     };
+    let charge_policy = read("GetChargePolicy");
+    let charge_stop = read("GetChargeStop");
+    let battery_health = read("GetBatteryHealth");
+    let nv_power_config = read("GetNvPowerConfig");
+    let nv_thermal_target = read("GetNvThermalTarget");
+    let camera = read("GetCamera");
+    let sleep_usb_charge = read("GetSleepUSBCharge");
+    let hibernation_usb_charge = read("GetHibernationUSBCharge");
+    let identity = reader.read_sku().map_err(|error| error.to_string());
+    let fan_state = crate::fan_state::read(reader, &nv_thermal_target);
     PowerSnapshot {
-        charge_policy: read("GetChargePolicy"),
-        charge_stop: read("GetChargeStop"),
-        battery_health: read("GetBatteryHealth"),
-        nv_power_config: read("GetNvPowerConfig"),
+        charge_policy,
+        charge_stop,
+        battery_health,
+        nv_power_config,
+        nv_thermal_target,
+        camera,
+        sleep_usb_charge,
+        hibernation_usb_charge,
+        identity,
+        fan_state,
     }
 }
 
@@ -719,6 +1402,12 @@ struct Logged<T> {
 impl<T> Logged<T> {
     fn new(inner: T, log: CallLog) -> Self {
         Self { inner, log }
+    }
+}
+
+impl<T: SkuSource> SkuSource for Logged<T> {
+    fn read_sku(&mut self) -> Result<SkuInfo, WmiError> {
+        self.inner.read_sku()
     }
 }
 

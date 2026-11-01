@@ -1,0 +1,32 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: Formatting
+        run: cargo fmt --all -- --check
+      - name: Workspace tests
+        run: cargo test --locked --workspace --exclude aero-gui
+      - name: GUI tests without production elevation manifest
+        shell: pwsh
+        run: ./scripts/test-gui.ps1
+      - name: Intel bridge tests with a fake SDK
+        shell: powershell
+        run: ./crates/aero-gui/tests/cpu_power_bridge.tests.ps1
+      - name: Release build
+        run: cargo build --locked --release -p aero-gui

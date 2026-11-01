@@ -2,12 +2,7 @@ use crate::catalog::NEVER_CALL;
 use crate::error::WmiError;
 use crate::read::AcpiReader;
 
-/// Result of a setter that was delivered to WMI.
-///
-/// Some Gigabyte setters return a WBEM error while the embedded controller
-/// still applies the write. `threw` records that. Callers verify with a getter
-/// instead of trusting the return code. `returned` is the firmware's output
-/// buffer, which echoes the stored value.
+/// Successful setter output. WMI transport failure does not establish whether firmware applied the request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetOutcome {
     pub threw: Option<String>,

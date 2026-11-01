@@ -1,7 +1,7 @@
 //! Status view and curve editor.
 //!
 //! On Windows the default backend is `WindowsWriter`. `--mock` and non-Windows
-//! builds keep the fake controller. Sensor reads are display only and never set a duty.
+//! builds keep the fake controller. The firmware controls the fans.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -18,11 +18,18 @@ use eframe::egui::{
 use crate::session::{BackendChoice, FanSession, PowerSnapshot, PowerWrite, SensorSnapshot};
 use crate::system_power::{Battery, Plan, SystemPower};
 
+mod apply_state;
+mod cpu_power;
 mod curve_chart;
+mod display_controls;
+mod firmware_controls;
 mod gauge;
 mod kbd_preview;
 mod keyboard;
 mod live_duty;
+mod profiles;
+mod startup;
+mod system_controls;
 use keyboard::KeyboardTab;
 use live_duty::{Input, LiveDuty};
 
@@ -36,7 +43,7 @@ const CARD: Color32 = Color32::from_rgb(26, 32, 42);
 const CARD_RAISED: Color32 = Color32::from_rgb(34, 42, 54);
 const STROKE: Color32 = Color32::from_rgb(52, 64, 80);
 const TEXT: Color32 = Color32::from_rgb(232, 236, 242);
-const MUTED: Color32 = Color32::from_rgb(148, 160, 176);
+const MUTED: Color32 = Color32::from_rgb(165, 177, 192);
 const ACCENT: Color32 = Color32::from_rgb(64, 196, 168);
 const ON_ACCENT: Color32 = Color32::from_rgb(10, 24, 22);
 const WARN: Color32 = Color32::from_rgb(214, 154, 72);
@@ -46,6 +53,8 @@ const HOT: Color32 = Color32::from_rgb(220, 72, 64);
 
 pub struct AeroApp {
     session: FanSession,
+    identity: aero_wmi::SkuInfo,
+    elevated: bool,
     busy: bool,
     report_error: bool,
     sensor_error: Option<String>,
@@ -54,7 +63,8 @@ pub struct AeroApp {
     points: Vec<CurvePoint>,
     issues: Vec<CurveIssue>,
     drag_index: Option<usize>,
-    applied_curve: Vec<CurvePoint>,
+    selected_curve_point: usize,
+    fan_apply: apply_state::ApplyState,
     fixed_percent: u8,
     live_duty: LiveDuty,
     expert: bool,
@@ -65,16 +75,34 @@ pub struct AeroApp {
     sensors: Sensors,
     history: History,
     started: Instant,
-    active_mode: Option<FanMode>,
-    pending_mode: Option<FanMode>,
     keyboard: KeyboardTab,
     firmware_power: Option<PowerSnapshot>,
+    /// Last request sent in this session; not inferred from transient TEMQ.
+    last_gpu_request: Option<bool>,
+    cpu_power: cpu_power::CpuPowerTab,
     charge_custom: bool,
     charge_stop: u8,
     system: SystemPower,
     plans: Vec<Plan>,
     active_plan: Result<Plan, String>,
     battery: Option<Battery>,
+    profiles: profiles::ProfilesTab,
+    controls: system_controls::ControlsTab,
+    display: display_controls::DisplayTab,
+    desktop: crate::desktop_events::DesktopEvents,
+    startup_checked: bool,
+    last_power_source: Option<bool>,
+    queued_profile: Option<(aero_core::Profile, aero_core::ApplyReason)>,
+    pending_profile_name: Option<String>,
+    last_resume: Option<Instant>,
+    tray_requested: bool,
+    exit_requested: bool,
+    hotkey_requested: bool,
+    wifi_hotkey_requested: bool,
+    display_off_hotkey_requested: bool,
+    startup_hide_pending: bool,
+    hotkey_restore: Option<aero_core::Profile>,
+    startup: startup::StartupTab,
 }
 
 const MODES: [(&str, FanMode, &str); 6] = [
@@ -91,7 +119,7 @@ const MODES: [(&str, FanMode, &str); 6] = [
     (
         "Gaming",
         FanMode::Gaming,
-        "Gaming: firmware boost fan curve and NvPowerConfig on, as Control Center.",
+        "Gaming: firmware boost fan curve and a Level 2 GPU power request, as Control Center.",
     ),
     (
         "Fixed",
@@ -124,6 +152,8 @@ enum Page {
     Battery,
     Keyboard,
     Log,
+    Profiles,
+    SystemControls,
 }
 
 struct Sensors {
@@ -187,15 +217,29 @@ impl AeroApp {
         let issues = issues(&points);
         let session = FanSession::start(choice);
         let report = session.banner.clone().unwrap_or_else(|| {
-            format!(
-                "{} backend. Log: {}",
-                session.backend_label, session.log_path
-            )
+            if mock {
+                "Simulation mode. Changes affect test data only.".into()
+            } else {
+                "Ready.".into()
+            }
         });
         let initial = session.initial_sensors.clone();
+        let identity = initial
+            .as_ref()
+            .and_then(|snapshot| snapshot.power.as_ref())
+            .and_then(|power| power.identity.as_ref().ok())
+            .cloned()
+            .unwrap_or_else(|| crate::device_identity::read(mock));
         let system = SystemPower::new(mock);
+        let profiles = profiles::ProfilesTab::new(mock);
+        let startup_hide_pending = profiles.settings().start_minimized;
+        let mut display = display_controls::DisplayTab::new(mock);
+        // Invalid saved files fall back to opt-in defaults in ProfilesTab.
+        let _ = display.set_settings(profiles.settings().display.clone());
         let mut app = Self {
             session,
+            identity,
+            elevated: matches!(choice, BackendChoice::Real { elevated: true }),
             busy: false,
             report_error: false,
             sensor_error: None,
@@ -204,7 +248,8 @@ impl AeroApp {
             points: points.clone(),
             issues,
             drag_index: None,
-            applied_curve: points,
+            selected_curve_point: 0,
+            fan_apply: apply_state::ApplyState::default(),
             fixed_percent: 50,
             live_duty: LiveDuty::new(50),
             expert: false,
@@ -222,35 +267,89 @@ impl AeroApp {
             },
             history: History::new(),
             started: Instant::now(),
-            active_mode: None,
-            pending_mode: None,
             keyboard: KeyboardTab::new(mock),
             firmware_power: None,
+            last_gpu_request: None,
+            cpu_power: cpu_power::CpuPowerTab::default(),
             charge_custom: false,
             charge_stop: 80,
             plans: system.plans(),
             active_plan: system.active(),
             battery: system.battery(),
             system,
+            profiles,
+            controls: system_controls::ControlsTab::new(mock),
+            display,
+            desktop: crate::desktop_events::DesktopEvents::new(mock),
+            startup_checked: false,
+            last_power_source: None,
+            queued_profile: None,
+            pending_profile_name: None,
+            last_resume: None,
+            tray_requested: false,
+            exit_requested: false,
+            hotkey_requested: false,
+            wifi_hotkey_requested: false,
+            display_off_hotkey_requested: false,
+            startup_hide_pending,
+            hotkey_restore: None,
+            startup: startup::StartupTab::new(mock),
         };
         if let Some(snapshot) = initial {
             app.apply_snapshot(snapshot);
+        }
+        if crate::device_identity::has_yb_command_set(&app.identity) {
+            if let Some(power) = &app.firmware_power {
+                if let Ok(state) = &power.fan_state {
+                    app.fan_apply = apply_state::ApplyState::from_readback(state);
+                    if let Some(raw) = state.fixed_raw {
+                        app.fixed_percent = aero_core::raw_to_percent(raw);
+                        app.expert = raw < aero_core::percent_to_raw(FIXED_FLOOR_PERCENT);
+                        app.live_duty.applied(app.fixed_percent);
+                    }
+                    if let Some(note) = state.note {
+                        app.report = format!("{} {note}", app.report);
+                    }
+                }
+            }
         }
         app
     }
 
     fn poll_session(&mut self) {
         while let Some(event) = self.session.poll() {
+            if let Some(request) = &event.gpu_request {
+                self.last_gpu_request = request.as_ref().ok().copied();
+            }
+            if let Some(reading) = event.cpu_power {
+                self.cpu_power.observe(reading);
+            }
+            let fresh_power = event
+                .sensors
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.power.is_some());
             self.busy = event.busy;
             if let Some(snapshot) = event.sensors {
                 self.apply_snapshot(snapshot);
             }
-            if let Some(message) = event.message {
-                if event.error {
-                    self.pending_mode = None;
-                } else if let Some(mode) = self.pending_mode.take() {
-                    self.active_mode = Some(mode);
+            self.fan_apply.complete(event.fan_result);
+            if fresh_power && event.fan_result != Some(false) {
+                self.reconcile_fan_readback();
+            }
+            if let Some(succeeded) = event.fan_result {
+                if let Some(name) = self.pending_profile_name.take() {
+                    if succeeded {
+                        if let Err(error) = self.profiles.mark_applied(&name) {
+                            self.report = format!(
+                                "Profile applied, but saving its selection failed: {error}"
+                            );
+                            self.report_error = true;
+                            continue;
+                        }
+                    }
                 }
+            }
+            if let Some(message) = event.message {
                 self.report = message;
                 self.report_error = event.error;
             }
@@ -267,6 +366,9 @@ impl AeroApp {
         self.sensors.flags = snapshot.flags;
         self.sensor_error = snapshot.error;
         if let Some(power) = snapshot.power {
+            if let Ok(identity) = &power.identity {
+                self.identity = identity.clone();
+            }
             if let Ok(policy) = power.charge_policy {
                 self.charge_custom = policy == u32::from(CHARGE_POLICY_CUSTOM);
             }
@@ -281,23 +383,44 @@ impl AeroApp {
         self.history.gpu.push(t, parse_temp(&self.sensors.gpu));
         self.history.rpm1.push(t, parse_rpm(&self.sensors.rpm1));
         self.history.rpm2.push(t, parse_rpm(&self.sensors.rpm2));
-        if self.active_mode.is_none() && self.pending_mode.is_none() {
-            self.active_mode = mode_from_flags(&self.sensors.flags);
-        }
+        // Startup mode detection uses the full readback; ordinary flag strings
+        // alone cannot distinguish every fan mode.
     }
 
     fn recompute(&mut self) {
         self.issues = issues(&self.points);
     }
 
+    fn reconcile_fan_readback(&mut self) {
+        if self.busy || !crate::device_identity::has_yb_command_set(&self.identity) {
+            return;
+        }
+        let Some(power) = &self.firmware_power else {
+            return;
+        };
+        self.fan_apply.reconcile_readback(&power.fan_state);
+        if let Some(raw) = self.fan_apply.applied_fixed_raw {
+            if !self.live_duty.pending(self.fixed_percent) {
+                self.fixed_percent = aero_core::raw_to_percent(raw);
+                self.expert = raw < aero_core::percent_to_raw(FIXED_FLOOR_PERCENT);
+                self.live_duty.applied(self.fixed_percent);
+            }
+        }
+    }
+
     fn writes_allowed(&self) -> bool {
-        self.session.writes_enabled && !self.busy
+        self.session.writes_enabled
+            && crate::device_identity::has_yb_command_set(&self.identity)
+            && !self.busy
+            && self.fan_apply.pending_mode.is_none()
     }
 
     fn apply_firmware(&mut self, mode: FanMode) {
         if !self.writes_allowed() {
             self.report = if self.busy {
                 "A firmware command is already running.".to_string()
+            } else if !crate::device_identity::has_yb_command_set(&self.identity) {
+                "Fan commands are not verified for the detected laptop model.".to_string()
             } else {
                 "Fan writes are off. Run aero-gui as Administrator.".to_string()
             };
@@ -305,18 +428,25 @@ impl AeroApp {
             return;
         }
         let raw = aero_core::percent_to_raw(self.fixed_percent);
+        self.queued_profile = None;
+        self.hotkey_restore = None;
         if mode == FanMode::Fixed {
             self.live_duty.applied(self.fixed_percent);
         }
         self.busy = true;
-        self.pending_mode = Some(mode);
+        self.fan_apply.pending_mode = Some(mode);
+        self.fan_apply.pending_fixed_raw = match mode {
+            FanMode::Fixed => Some(aero_core::clamp_fixed_duty(raw, self.expert)),
+            FanMode::Max => Some(229),
+            _ => None,
+        };
         self.session.apply(mode, raw, self.expert);
         self.arm_max = false;
         self.arm_max_test = false;
     }
 
     fn fixed_shown(&self) -> bool {
-        self.pending_mode.or(self.active_mode) == Some(FanMode::Fixed)
+        self.fan_apply.pending_mode.or(self.fan_apply.active_mode) == Some(FanMode::Fixed)
     }
 
     fn push_live_duty(&mut self, ctx: &egui::Context) {
@@ -331,13 +461,19 @@ impl AeroApp {
     }
 
     fn send_fixed_duty(&mut self) {
-        if self.active_mode != Some(FanMode::Fixed) || self.pending_mode.is_some() {
+        if self.fan_apply.active_mode != Some(FanMode::Fixed)
+            || self.fan_apply.pending_mode.is_some()
+        {
             self.apply_firmware(FanMode::Fixed);
             return;
         }
         self.live_duty.applied(self.fixed_percent);
         self.busy = true;
-        self.pending_mode = Some(FanMode::Fixed);
+        self.fan_apply.pending_mode = Some(FanMode::Fixed);
+        self.fan_apply.pending_fixed_raw = Some(aero_core::clamp_fixed_duty(
+            aero_core::percent_to_raw(self.fixed_percent),
+            self.expert,
+        ));
         self.session
             .fixed_duty(aero_core::percent_to_raw(self.fixed_percent), self.expert);
     }
@@ -350,10 +486,13 @@ impl AeroApp {
         }
         match FanCurve::try_new(self.points.clone()) {
             Ok(curve) => {
+                self.queued_profile = None;
+                self.hotkey_restore = None;
                 self.busy = true;
-                self.pending_mode = Some(FanMode::Custom);
-                self.applied_curve = curve.points().to_vec();
-                self.session.upload(self.applied_curve.clone());
+                self.fan_apply.pending_mode = Some(FanMode::Custom);
+                let points = curve.points().to_vec();
+                self.fan_apply.pending_curve = Some(points.clone());
+                self.session.upload(points);
             }
             Err(issues) => {
                 self.issues = issues;
@@ -364,32 +503,331 @@ impl AeroApp {
     }
 
     fn push_curve(&mut self) {
-        if self.active_mode == Some(FanMode::Custom)
-            && self.pending_mode.is_none()
+        if self.fan_apply.active_mode == Some(FanMode::Custom)
+            && self.fan_apply.pending_mode.is_none()
             && self.drag_index.is_none()
             && self.issues.is_empty()
             && self.writes_allowed()
-            && self.points != self.applied_curve
+            && self.points != self.fan_apply.applied_curve
         {
-            self.applied_curve = self.points.clone();
+            self.fan_apply.pending_curve = Some(self.points.clone());
             self.busy = true;
-            self.pending_mode = Some(FanMode::Custom);
-            self.session.update_curve(self.applied_curve.clone());
+            self.fan_apply.pending_mode = Some(FanMode::Custom);
+            self.session.update_curve(self.points.clone());
         }
     }
 
     fn load_curve(&mut self, curve: aero_core::FanCurve, report: &str) {
         self.points = curve.points().to_vec();
         self.drag_index = None;
+        self.selected_curve_point = 0;
         self.recompute();
         self.report = report.into();
         self.report_error = false;
+    }
+
+    fn apply_saved_profile(&mut self, profile: aero_core::Profile, reason: aero_core::ApplyReason) {
+        if !self.writes_allowed() {
+            return;
+        }
+        self.hotkey_restore = None;
+        let curve = if profile.fan_mode == FanMode::Custom {
+            match profile.fan_curve() {
+                Ok(curve) => Some(curve.points().to_vec()),
+                Err(_) => {
+                    self.report = format!("{} contains an invalid curve.", profile.name);
+                    self.report_error = true;
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        self.busy = true;
+        self.fan_apply.pending_mode = Some(profile.fan_mode);
+        self.fan_apply.pending_fixed_raw = match profile.fan_mode {
+            FanMode::Fixed => Some(aero_core::clamp_fixed_duty(
+                profile.fixed_duty_raw.unwrap_or_else(|| {
+                    aero_core::percent_to_raw(profile.fixed_duty_percent.unwrap_or(50))
+                }),
+                profile.expert_mode,
+            )),
+            FanMode::Max => Some(229),
+            _ => None,
+        };
+        self.fan_apply.pending_curve = curve.clone();
+        if let Some(curve) = curve {
+            self.points = curve;
+            self.recompute();
+        }
+        if profile.fan_mode == FanMode::Fixed {
+            self.fixed_percent = profile
+                .fixed_duty_raw
+                .map(aero_core::raw_to_percent)
+                .or(profile.fixed_duty_percent)
+                .unwrap_or(50);
+            self.live_duty.applied(self.fixed_percent);
+        }
+        self.pending_profile_name = Some(profile.name.clone());
+        self.session.profile(profile, reason);
+    }
+
+    fn capture_profile(&self, name: String) -> Option<aero_core::Profile> {
+        let mode = self.fan_apply.active_mode?;
+        let mut profile = aero_core::builtin_config().profile("Normal")?.clone();
+        profile.name = name;
+        profile.cpu_power_preset = self.cpu_power.confirmed_preset();
+        profile.fan_mode = mode;
+        profile.notes = "Saved from confirmed fan settings in aero-control.".into();
+        profile.expert_mode =
+            self.expert || self.fan_apply.applied_fixed_raw.is_some_and(|raw| raw < 80);
+        if mode == FanMode::Fixed {
+            profile.fixed_duty_raw = self.fan_apply.applied_fixed_raw;
+        }
+        if mode == FanMode::Custom {
+            if self.fan_apply.applied_curve.is_empty() {
+                return None;
+            }
+            profile.curve = self
+                .fan_apply
+                .applied_curve
+                .iter()
+                .map(|point| aero_core::CurvePointToml {
+                    temp_c: point.temp_c,
+                    duty_percent: Some(aero_core::raw_to_percent(point.duty_raw)),
+                    duty_raw: Some(point.duty_raw),
+                })
+                .collect();
+        }
+        if let Some(power) = &self.firmware_power {
+            profile.nv_power_config = self.last_gpu_request.map(u8::from);
+            profile.nv_thermal_target = power
+                .nv_thermal_target
+                .as_ref()
+                .ok()
+                .and_then(|value| u8::try_from(*value).ok())
+                .filter(|value| *value <= 1);
+            profile.charge_policy = power
+                .charge_policy
+                .as_ref()
+                .ok()
+                .and_then(|value| u8::try_from(*value).ok())
+                .filter(|value| *value == 0 || *value == 4);
+            if power.charge_policy == Ok(4) {
+                profile.charge_limit = power
+                    .charge_stop
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| u8::try_from(*value).ok())
+                    .filter(|value| (60..=100).contains(value));
+            }
+        }
+        Some(profile)
+    }
+
+    fn profiles_ui(&mut self, ui: &mut egui::Ui) {
+        let can_capture = self.writes_allowed()
+            && self.firmware_power.is_some()
+            && self.fan_apply.active_mode.is_some()
+            && (self.fan_apply.active_mode != Some(FanMode::Fixed)
+                || !self.live_duty.pending(self.fixed_percent));
+        let can_apply = self.writes_allowed();
+        let actions = ui
+            .add_enabled_ui(!self.busy, |ui| {
+                self.profiles.ui(ui, can_apply, can_capture)
+            })
+            .inner;
+        for action in actions {
+            match action {
+                profiles::ProfileAction::Apply(profile) => {
+                    self.queued_profile = None;
+                    self.apply_saved_profile(profile, aero_core::ApplyReason::User);
+                }
+                profiles::ProfileAction::Capture(name) => {
+                    if let Some(profile) = self.capture_profile(name) {
+                        if let Err(error) = self.profiles.capture(profile) {
+                            self.report = error;
+                            self.report_error = true;
+                        }
+                    }
+                }
+                profiles::ProfileAction::AutomationChanged => {
+                    self.queued_profile = None;
+                    if let Err(error) = self
+                        .display
+                        .set_settings(self.profiles.settings().display.clone())
+                    {
+                        self.report = error;
+                        self.report_error = true;
+                    }
+                }
+            }
+        }
+        if let Some(error) = self.desktop.last_error() {
+            ui.add_space(8.0);
+            banner(ui, &error, WARN);
+        }
+        ui.add_space(12.0);
+        self.startup.ui(ui);
+    }
+
+    fn poll_automation(&mut self, ctx: &egui::Context) {
+        if let Some((message, error)) = self.controls.poll_background() {
+            self.report = message;
+            self.report_error = error;
+        }
+        let tray_requested = self.profiles.settings().keep_in_tray;
+        if tray_requested != self.tray_requested {
+            self.desktop.set_tray_enabled(tray_requested);
+            self.tray_requested = tray_requested;
+        }
+        let hotkey_requested = self.profiles.settings().fan_hotkey;
+        if hotkey_requested != self.hotkey_requested {
+            self.desktop.set_fan_hotkey_enabled(hotkey_requested);
+            self.hotkey_requested = hotkey_requested;
+        }
+        let wifi_hotkey_requested = self.profiles.settings().wifi_hotkey;
+        if wifi_hotkey_requested != self.wifi_hotkey_requested {
+            self.desktop.set_wifi_hotkey_enabled(wifi_hotkey_requested);
+            self.wifi_hotkey_requested = wifi_hotkey_requested;
+        }
+        let display_off_requested = self.profiles.settings().display_off_hotkey;
+        if display_off_requested != self.display_off_hotkey_requested {
+            self.desktop
+                .set_display_off_hotkey_enabled(display_off_requested);
+            self.display_off_hotkey_requested = display_off_requested;
+        }
+        let mut resume = false;
+        while let Some(event) = self.desktop.poll() {
+            match event {
+                crate::desktop_events::DesktopEvent::Resume => resume = true,
+                crate::desktop_events::DesktopEvent::PowerChanged => {
+                    self.battery = self.system.battery()
+                }
+                crate::desktop_events::DesktopEvent::Show => {
+                    self.startup_hide_pending = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                crate::desktop_events::DesktopEvent::FanMode(mode) => self.apply_firmware(mode),
+                crate::desktop_events::DesktopEvent::FanHotkey => {
+                    if self.hotkey_requested
+                        && self.desktop.fan_hotkey_enabled()
+                        && self.writes_allowed()
+                    {
+                        if let Some(profile) = self.hotkey_restore.take() {
+                            self.apply_saved_profile(profile, aero_core::ApplyReason::User);
+                            self.pending_profile_name = None;
+                        } else {
+                            let mut profile = self
+                                .capture_profile("Previous fan mode".into())
+                                .unwrap_or_else(|| {
+                                    aero_core::builtin_config()
+                                        .profile("Normal")
+                                        .unwrap()
+                                        .clone()
+                                });
+                            profile.charge_policy = None;
+                            profile.charge_limit = None;
+                            self.apply_firmware(FanMode::Max);
+                            self.hotkey_restore = Some(profile);
+                        }
+                    }
+                }
+                crate::desktop_events::DesktopEvent::WifiHotkey => {
+                    if self.wifi_hotkey_requested && self.desktop.wifi_hotkey_enabled() {
+                        match self.controls.request_wifi_toggle() {
+                            Ok(()) => {
+                                self.report = "Requesting Wi-Fi change…".into();
+                                self.report_error = false;
+                            }
+                            Err(error) => {
+                                self.report = error;
+                                self.report_error = true;
+                            }
+                        }
+                    }
+                }
+                crate::desktop_events::DesktopEvent::DisplayOffHotkey => {
+                    if self.display_off_hotkey_requested
+                        && self.desktop.display_off_hotkey_enabled()
+                        && self.writes_allowed()
+                    {
+                        self.send_power(PowerWrite::DisplayOff);
+                    }
+                }
+                crate::desktop_events::DesktopEvent::Exit => {
+                    self.exit_requested = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+        if self.startup_hide_pending {
+            if self.desktop.can_hide_to_tray() {
+                self.startup_hide_pending = false;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            } else if !tray_requested || self.desktop.last_error().is_some() {
+                self.startup_hide_pending = false;
+            }
+        }
+        if resume {
+            self.battery = self.system.battery();
+        }
+        let on_ac = self.battery.and_then(|battery| battery.on_ac);
+        if let Some((message, error)) = self.display.on_power_source_changed(on_ac) {
+            self.report = message;
+            self.report_error = error;
+        }
+        if !self.startup_checked {
+            self.startup_checked = true;
+            self.last_power_source = on_ac;
+            if let Some(profile) = self.profiles.startup_profile(on_ac) {
+                self.queued_profile = Some((profile, aero_core::ApplyReason::Startup));
+            }
+        } else if let Some(on_ac) = on_ac {
+            if self
+                .last_power_source
+                .is_some_and(|previous| previous != on_ac)
+            {
+                if let Some(profile) = self.profiles.automation_profile(on_ac) {
+                    self.queued_profile = Some((profile, aero_core::ApplyReason::AcDcChanged));
+                }
+            }
+            self.last_power_source = Some(on_ac);
+        }
+        if resume
+            && self
+                .last_resume
+                .map_or(true, |last| last.elapsed() > Duration::from_secs(5))
+        {
+            self.last_resume = Some(Instant::now());
+            self.battery = self.system.battery();
+            if let Some(profile) = self
+                .profiles
+                .resume_profile(self.battery.and_then(|battery| battery.on_ac))
+            {
+                self.queued_profile = Some((profile, aero_core::ApplyReason::Resume));
+            }
+        }
+        if self.writes_allowed() {
+            if let Some((profile, reason)) = self.queued_profile.take() {
+                self.apply_saved_profile(profile, reason);
+            }
+        }
     }
 }
 
 impl eframe::App for AeroApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_session();
+        self.poll_automation(ctx);
+        if !self.exit_requested
+            && self.desktop.can_hide_to_tray()
+            && ctx.input(|input| input.viewport().close_requested())
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
         self.push_live_duty(ctx);
         self.push_curve();
         ctx.request_repaint_after(std::time::Duration::from_millis(400));
@@ -424,6 +862,7 @@ impl eframe::App for AeroApp {
             .frame(Frame::none().fill(BG).inner_margin(Margin::same(20.0)))
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical()
+                    .id_salt(("page", self.page as u8))
                     .auto_shrink([false, false])
                     .show(ui, |ui| match self.page {
                         Page::Fans => self.fans_ui(ui),
@@ -438,6 +877,46 @@ impl eframe::App for AeroApp {
                             }
                         }
                         Page::Log => self.log_ui(ui),
+                        Page::Profiles => self.profiles_ui(ui),
+                        Page::SystemControls => {
+                            if let Some((message, error)) = self.controls.ui(ui) {
+                                self.report = message;
+                                self.report_error = error;
+                            }
+                            ui.add_space(12.0);
+                            let actions = firmware_controls::ui(
+                                ui,
+                                self.firmware_power.as_ref(),
+                                self.writes_allowed(),
+                                !self.busy,
+                            );
+                            if actions.refresh && !self.busy {
+                                self.busy = true;
+                                self.session.refresh_power();
+                            }
+                            if let Some(write) = actions.write {
+                                self.send_power(write);
+                            }
+                            ui.add_space(12.0);
+                            if let Some((message, error)) = self.display.ui(ui) {
+                                self.report = message;
+                                self.report_error = error;
+                            }
+                            if self.display.take_settings_changed() {
+                                let next = self.display.settings().clone();
+                                if let Err(error) = self.profiles.save_display_settings(next) {
+                                    let _ = self
+                                        .display
+                                        .set_settings(self.profiles.settings().display.clone());
+                                    self.report = format!(
+                                        "Display switching settings were not saved: {error}"
+                                    );
+                                    self.report_error = true;
+                                } else {
+                                    self.display.settings_saved();
+                                }
+                            }
+                        }
                     });
             });
     }
@@ -452,34 +931,26 @@ impl AeroApp {
                     .strong()
                     .color(TEXT),
             );
-            ui.label(RichText::new("AERO 17 YB").size(13.0).color(MUTED));
+            ui.label(
+                RichText::new(concat!("v", env!("CARGO_PKG_VERSION")))
+                    .size(12.0)
+                    .color(MUTED),
+            );
+            ui.label(
+                RichText::new(crate::device_identity::model_name(&self.identity))
+                    .size(13.0)
+                    .color(MUTED),
+            )
+            .on_hover_text(crate::device_identity::support_note(&self.identity));
+            if !crate::device_identity::has_yb_command_set(&self.identity) {
+                ui.colored_label(WARN, "Model not verified");
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let (admin, admin_bg) = if self.session.backend_label == "REAL" {
-                    if self.session.writes_enabled {
-                        ("Administrator", ACCENT)
-                    } else {
-                        ("Not elevated", WARN)
-                    }
-                } else {
-                    ("Simulated", Color32::from_rgb(72, 96, 140))
-                };
-                pill(
-                    ui,
-                    admin,
-                    admin_bg,
-                    if admin_bg == WARN {
-                        ON_ACCENT
-                    } else {
-                        ON_ACCENT
-                    },
-                );
-                ui.add_space(8.0);
-                let (name, bg) = if self.session.backend_label == "REAL" {
-                    ("REAL", ACCENT)
-                } else {
-                    ("MOCK", Color32::from_rgb(96, 150, 214))
-                };
-                pill(ui, name, bg, ON_ACCENT);
+                if self.session.backend_label != "REAL" {
+                    pill(ui, "Simulation", Color32::from_rgb(96, 150, 214), ON_ACCENT);
+                } else if !self.elevated {
+                    pill(ui, "Administrator access needed", WARN, ON_ACCENT);
+                }
             });
         });
     }
@@ -495,6 +966,7 @@ impl AeroApp {
     }
 
     fn nav(&mut self, ui: &mut egui::Ui) {
+        let previous_page = self.page;
         ui.label(RichText::new("SECTIONS").size(11.0).color(MUTED));
         ui.add_space(8.0);
         for (label, page) in [
@@ -503,21 +975,34 @@ impl AeroApp {
             ("Power", Page::Power),
             ("Battery", Page::Battery),
             ("Keyboard", Page::Keyboard),
+            ("Profiles", Page::Profiles),
+            ("System", Page::SystemControls),
             ("Log", Page::Log),
         ] {
             nav_item(ui, label, self.page == page, &mut self.page, page);
             ui.add_space(4.0);
         }
+        if self.page == Page::SystemControls && previous_page != self.page {
+            self.controls.refresh_all();
+            self.display.refresh();
+        }
+        if self.page == Page::Power && previous_page != self.page {
+            self.cpu_power.enter();
+        }
     }
 
     fn fans_ui(&mut self, ui: &mut egui::Ui) {
-        page_header(
-            ui,
-            "Fans",
-            "Live readings. The firmware still runs the fans.",
-        );
+        page_header(ui, "Fans", "Live readings. The firmware controls the fans.");
         if let Some(error) = &self.sensor_error {
             banner(ui, error, DANGER);
+            ui.add_space(12.0);
+        }
+        if !crate::device_identity::has_yb_command_set(&self.identity) {
+            banner(
+                ui,
+                &crate::device_identity::support_note(&self.identity),
+                WARN,
+            );
             ui.add_space(12.0);
         }
         if ui.available_width() > 960.0 {
@@ -531,6 +1016,7 @@ impl AeroApp {
         }
         ui.add_space(10.0);
         ui.label(RichText::new(&self.sensors.flags).size(13.0).color(MUTED));
+        ui.add_space(16.0);
     }
 
     fn gauge_row(&self, ui: &mut egui::Ui) {
@@ -608,7 +1094,7 @@ impl AeroApp {
                     self.max_test_button(ui, allow);
                     if ui
                         .add_enabled(allow, secondary_button("Restore auto"))
-                        .on_hover_text("Sends the Normal sequence: fixed off, step off, auto on.")
+                        .on_hover_text("Applies the Control Center Normal fan and GPU settings.")
                         .clicked()
                     {
                         self.apply_firmware(FanMode::Normal);
@@ -624,9 +1110,9 @@ impl AeroApp {
             }
             let hint = MODES
                 .iter()
-                .find(|(_, mode, _)| self.active_mode == Some(*mode))
+                .find(|(_, mode, _)| self.fan_apply.active_mode == Some(*mode))
                 .map_or(
-                    "Mode unknown until the firmware flags are read.",
+                    "Choose a mode to confirm and apply its settings.",
                     |(_, _, tip)| tip,
                 );
             ui.label(RichText::new(hint).size(13.0).color(MUTED));
@@ -644,7 +1130,7 @@ impl AeroApp {
         });
         let on = MODES
             .iter()
-            .position(|(_, mode, _)| self.active_mode == Some(*mode));
+            .position(|(_, mode, _)| self.fan_apply.active_mode == Some(*mode));
         let armed = MODES
             .iter()
             .position(|(_, mode, _)| *mode == FanMode::Max)
@@ -678,6 +1164,7 @@ impl AeroApp {
         {
             if self.arm_max_test {
                 self.busy = true;
+                self.fan_apply.pending_mode = Some(FanMode::Normal);
                 self.session.max_test();
                 self.arm_max_test = false;
                 self.arm_max = false;
@@ -747,44 +1234,49 @@ impl AeroApp {
         page_header(
             ui,
             "Curve",
-            "One firmware table drives both fans. Each duty holds until the next point.",
+            "Edit the curve used by firmware to control both fans.",
         );
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 section_title(ui, "Custom curve");
                 ui.add_space(8.0);
                 self.curve_state(ui);
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if self.active_mode != Some(FanMode::Custom)
-                        && ui
-                            .add_enabled(
-                                self.issues.is_empty() && self.writes_allowed(),
-                                primary_button("Use this curve"),
-                            )
-                            .on_hover_text(
-                                "Switches the fans to this curve: writes all 15 slots and reads them back. A mismatch retries once, then restores firmware auto.",
-                            )
-                            .clicked()
-                    {
-                        self.upload();
-                    }
-                    if ui
-                        .add(secondary_button("Factory"))
-                        .on_hover_text("Loads the YB factory curve from Control Center.")
-                        .clicked()
-                    {
-                        self.load_curve(aero_core::factory_curve(), "Editor loaded the YB factory curve.");
-                    }
-                    if ui
-                        .add(secondary_button("Quiet"))
-                        .on_hover_text("Loads the quiet curve measured on this laptop: 25% at idle, about 50% under full load.")
-                        .clicked()
-                    {
-                        self.load_curve(aero_core::quiet_curve(), "Editor loaded the quiet curve.");
-                    }
-                });
             });
+            ui.add_space(8.0);
+            ui.horizontal_wrapped(|ui| {
+                if ui.add(secondary_button("Load Quiet")).clicked() {
+                    self.load_curve(aero_core::quiet_curve(), "Editor loaded the quiet curve.");
+                }
+                if ui.add(secondary_button("Load Factory")).clicked() {
+                    self.load_curve(
+                        aero_core::factory_curve(),
+                        "Editor loaded the YB factory curve.",
+                    );
+                }
+                if self.fan_apply.active_mode != Some(FanMode::Custom)
+                    && ui
+                        .add_enabled(
+                            self.issues.is_empty() && self.writes_allowed(),
+                            primary_button("Apply firmware curve"),
+                        )
+                        .on_hover_text("Applies the displayed curve to both fans.")
+                        .clicked()
+                {
+                    self.upload();
+                }
+            });
+            ui.add_space(6.0);
+            let instruction = if self.fan_apply.active_mode == Some(FanMode::Custom) {
+                if self.session.writes_enabled {
+                    "Custom mode is active. Valid edits and loaded presets apply automatically."
+                } else {
+                    "Read-only: edits and loaded presets are not applied."
+                }
+            } else {
+                "Preview only. Apply firmware curve uploads it to the controller."
+            };
+            ui.label(RichText::new(instruction).size(14.0).color(TEXT));
             ui.add_space(8.0);
             let markers: Vec<_> = [("CPU", &self.sensors.cpu), ("GPU", &self.sensors.gpu)]
                 .into_iter()
@@ -796,15 +1288,79 @@ impl AeroApp {
                     })
                 })
                 .collect();
-            let height = (ui.available_height() - 64.0).clamp(240.0, 460.0);
+            let height = (ui.available_height() - 110.0).clamp(240.0, 430.0);
             curve_chart::show(ui, &mut self.points, &mut self.drag_index, &markers, height);
             self.recompute();
             ui.add_space(6.0);
+            self.selected_curve_point = self
+                .selected_curve_point
+                .min(self.points.len().saturating_sub(1));
+            let suggestion = suggested_curve_point(&self.points);
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(
+                        suggestion.is_some() && self.points.len() < 15,
+                        secondary_button("Add point"),
+                    )
+                    .on_hover_text("Adds a point in the largest available gap; drag it to adjust.")
+                    .clicked()
+                {
+                    if let Some((temp, percent)) = suggestion {
+                        if aero_core::insert_point(&mut self.points, temp, percent).is_ok() {
+                            self.selected_curve_point = self
+                                .points
+                                .iter()
+                                .position(|point| point.temp_c == temp)
+                                .unwrap_or(0);
+                        }
+                    }
+                }
+                ui.label(RichText::new("Point to remove:").color(TEXT));
+                let selected = self
+                    .points
+                    .get(self.selected_curve_point)
+                    .map(|point| {
+                        format!(
+                            "{} °C · {}%",
+                            point.temp_c,
+                            aero_core::raw_to_percent(point.duty_raw)
+                        )
+                    })
+                    .unwrap_or_else(|| "No point".to_string());
+                egui::ComboBox::from_id_salt("curve_point")
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        for (index, point) in self.points.iter().enumerate() {
+                            ui.selectable_value(
+                                &mut self.selected_curve_point,
+                                index,
+                                format!(
+                                    "{} °C · {}%",
+                                    point.temp_c,
+                                    aero_core::raw_to_percent(point.duty_raw)
+                                ),
+                            );
+                        }
+                    });
+                if ui
+                    .add_enabled(self.points.len() > 2, secondary_button("Remove point"))
+                    .on_hover_text("Removes the point selected in the list.")
+                    .clicked()
+                {
+                    let _ = aero_core::remove_point(&mut self.points, self.selected_curve_point);
+                    self.selected_curve_point = self
+                        .selected_curve_point
+                        .min(self.points.len().saturating_sub(1));
+                }
+            });
             ui.label(
-                RichText::new("Drag a point to move it · double-click to add (max 15) · right-click to remove (min 2)")
-                    .size(13.0)
-                    .color(MUTED),
+                RichText::new(
+                    "Drag points to move them. Double-click to add; right-click to remove.",
+                )
+                .size(14.0)
+                .color(TEXT),
             );
+            self.recompute();
             for issue in &self.issues {
                 let where_ = issue
                     .index
@@ -859,16 +1415,20 @@ impl AeroApp {
     }
 
     fn curve_state(&self, ui: &mut egui::Ui) {
-        let (text, fill) = if self.busy && self.pending_mode == Some(FanMode::Custom) {
+        let (text, fill) = if self.busy && self.fan_apply.pending_mode == Some(FanMode::Custom) {
             ("Applying…", AMBER)
-        } else if self.active_mode == Some(FanMode::Custom) {
-            if self.issues.is_empty() {
+        } else if self.fan_apply.active_mode == Some(FanMode::Custom) {
+            if !self.session.writes_enabled {
+                ("Active · read-only", WARN)
+            } else if self.issues.is_empty() {
                 ("Active · edits apply on release", ACCENT)
             } else {
                 ("Active · fix the curve to apply", WARN)
             }
+        } else if self.fan_apply.active_mode.is_none() {
+            ("Preview · mode unknown", WARN)
         } else {
-            ("Not active", CARD_RAISED)
+            ("Preview · not active", WARN)
         };
         let fg = if fill == CARD_RAISED {
             MUTED
@@ -882,8 +1442,21 @@ impl AeroApp {
         page_header(
             ui,
             "Power",
-            "Windows power plan and the NVIDIA power config switch.",
+            "CPU power limits, GPU performance and the Windows power plan.",
         );
+        let allow_cpu = self.writes_allowed();
+        if let Some(preset) = self.cpu_power.ui(ui, allow_cpu, self.busy, &self.identity) {
+            self.busy = true;
+            self.report = if preset.is_some() {
+                "Applying and verifying CPU power limits…"
+            } else {
+                "Reading CPU limits…"
+            }
+            .into();
+            self.report_error = false;
+            self.session.cpu_power(preset);
+        }
+        ui.add_space(16.0);
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             section_title(ui, "Windows power plan");
@@ -935,37 +1508,60 @@ impl AeroApp {
             .map(|power| power.nv_power_config.clone());
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            section_title(ui, "NVIDIA power config");
+            section_title(ui, "GPU performance");
             ui.add_space(10.0);
-            let on = match current {
-                Some(Ok(0)) => Some(0),
-                Some(Ok(1)) => Some(1),
-                _ => None,
-            };
-            let items = [("Off (0)", "", allow), ("On (1)", "", allow)];
+            let on = self.last_gpu_request.map(usize::from);
+            let items = [("Level 1 · Standard", "", allow), ("Level 2 · Maximum", "", allow)];
             if let Some(index) = segmented(ui, "nv_power", &items, on, None) {
                 self.send_power(PowerWrite::NvPowerConfig(index == 1));
             }
             ui.add_space(8.0);
             let reading = match current {
-                Some(Ok(value)) => format!("GetNvPowerConfig reads {value}."),
-                Some(Err(err)) => format!("GetNvPowerConfig failed: {err}"),
-                None => "GetNvPowerConfig has not been read.".to_string(),
+                Some(Ok(value)) => format!("Firmware request flag: {value}. This flag can reset after a request."),
+                Some(Err(err)) => format!("GPU power read failed: {err}"),
+                None => "GPU power configuration has not been read.".to_string(),
             };
             ui.label(RichText::new(reading).size(13.0).color(MUTED));
+            ui.label(RichText::new(match self.last_gpu_request {
+                Some(on) => format!("Last requested in this session: Level {}.", if on { 2 } else { 1 }),
+                None => "No GPU level requested in this session. The current power budget is unknown.".into(),
+            }).color(MUTED));
             ui.label(
                 RichText::new(
-                    "Sends SetNvPowerConfig with Data 0 or 1, the values Control Center writes. Its effect on GPU power is not measured here.",
+                    "Uses Control Center’s two GPU requests for this model. Selection shows the last request, not measured GPU power. Fan modes can also send a GPU request; other apps or firmware may change the power budget.",
                 )
                 .size(13.0)
                 .color(MUTED),
             );
         });
         ui.add_space(16.0);
+        card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            section_title(ui, "GPU thermal profile");
+            ui.label("Choose the standard target or the quieter target used by Control Center.");
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(allow, secondary_button("Apply Standard")).clicked() {
+                    self.send_power(PowerWrite::ThermalTarget(false));
+                }
+                if ui.add_enabled(allow, secondary_button("Apply Quiet")).clicked() {
+                    self.send_power(PowerWrite::ThermalTarget(true));
+                }
+            });
+            let reading = match self.firmware_power.as_ref().map(|power| &power.nv_thermal_target) {
+                Some(Ok(0)) => "Current: Standard.".to_string(),
+                Some(Ok(1)) => "Current: Quiet.".to_string(),
+                Some(Ok(value)) => format!("Unknown thermal profile value: {value}."),
+                Some(Err(error)) => format!("Thermal profile read failed: {error}"),
+                None => "Thermal profile has not been read.".to_string(),
+            };
+            ui.label(RichText::new(reading).color(MUTED));
+            ui.label(RichText::new("Firmware readback confirms the selected profile; it does not measure resulting GPU temperature or power.").color(MUTED));
+        });
+        ui.add_space(16.0);
         info_card(
             ui,
-            "Not controlled here",
-            "CPU PL1/PL2, Dynamic Boost, the NVIDIA thermal target and the GPU MUX. A profile can store some of these, but nothing in this build writes them.",
+            "Model support",
+            &format!("{} CPU presets require a supported processor and a compatible Intel XTU installation. AI and Pantone integrations are excluded. MUX and Dynamic Boost controls are not implemented.", crate::device_identity::support_note(&self.identity)),
         );
     }
 
@@ -988,7 +1584,7 @@ impl AeroApp {
             card().show(&mut cols[1], |ui| {
                 ui.set_width(ui.available_width());
                 ui.set_min_height(118.0);
-                section_title(ui, "Battery health code");
+                section_title(ui, "Battery health");
                 ui.add_space(8.0);
                 let code = match power.as_ref().map(|power| &power.battery_health) {
                     Some(Ok(code)) => code.to_string(),
@@ -996,13 +1592,15 @@ impl AeroApp {
                     None => "—".to_string(),
                 };
                 ui.label(RichText::new(code).size(34.0).color(TEXT));
-                ui.label(
-                    RichText::new(
-                        "Raw GetBatteryHealth value. Gigabyte does not document what the code means.",
-                    )
-                    .size(13.0)
-                    .color(MUTED),
-                );
+                let health = match power
+                    .as_ref()
+                    .and_then(|power| power.battery_health.as_ref().ok())
+                {
+                    Some(1) => "Good · Control Center health status.",
+                    Some(2) => "Aging · Control Center health status.",
+                    _ => "Unknown health status. The raw firmware code is shown above.",
+                };
+                ui.label(RichText::new(health).size(13.0).color(MUTED));
             });
         });
         ui.add_space(16.0);
@@ -1011,6 +1609,19 @@ impl AeroApp {
             ui.set_width(ui.available_width());
             section_title(ui, "Charging policy");
             ui.add_space(10.0);
+            ui.horizontal_wrapped(|ui| {
+                for (label, limit) in [
+                    ("Mostly plugged in · 60%", 60),
+                    ("Balanced · 80%", 80),
+                    ("Full charge · 100%", 100),
+                ] {
+                    if ui.button(label).clicked() {
+                        self.charge_custom = limit != 100;
+                        self.charge_stop = limit;
+                    }
+                }
+            });
+            ui.label(RichText::new("Choose a preset, then Apply to change charging.").color(MUTED));
             let items = [
                 ("Standard", "Charge to 100%.", true),
                 ("Custom", "Stop charging at the percent below.", true),
@@ -1063,7 +1674,12 @@ impl AeroApp {
 
     fn send_power(&mut self, write: PowerWrite) {
         if !self.writes_allowed() {
-            self.report = "Battery and power writes need an elevated aero-gui.".to_string();
+            self.report = if !crate::device_identity::has_yb_command_set(&self.identity) {
+                "Firmware writes are not verified for the detected laptop model.".to_string()
+            } else {
+                "Battery and power writes need an elevated aero-gui and an idle session."
+                    .to_string()
+            };
             self.report_error = true;
             return;
         }
@@ -1089,11 +1705,11 @@ impl AeroApp {
         egui::CollapsingHeader::new("About")
             .default_open(false)
             .show(ui, |ui| {
-                ui.label("The firmware runs the fans. Sensor reads are display only and never set a duty. Thermal shutdown still belongs to the CPU, the GPU, and the embedded controller (PROCHOT and GPU slowdown).");
+                ui.label("The firmware controls the fans. Sensor readings are for display. Thermal protection still belongs to the CPU, GPU and embedded controller.");
                 ui.add_space(6.0);
                 ui.label("Curve upload writes all 15 slots, reads them back, and restores firmware auto on a mismatch or a panic. Closing the window does the same if the last command was Fixed or Max.");
                 ui.add_space(6.0);
-                ui.label("The editor starts from the quiet curve measured on this laptop. Factory loads Control Center's YB curve (DeepFan setDefault_Click, confirmed by GetFanIndexValue on this P77YB). Upload rounds percent half-up, so 30% is raw 69 here and raw 68 on the chip, which truncates.");
+                ui.label("The editor starts from a reference quiet curve. Factory loads the reference Control Center curve, including its exact raw duty values. Their descriptions identify the model where they were verified.");
             });
     }
 }
@@ -1192,6 +1808,66 @@ fn nav_item(ui: &mut egui::Ui, label: &str, on: bool, page: &mut Page, value: Pa
         FontId::proportional(15.0),
         if on { TEXT } else { MUTED },
     );
+}
+
+/// Pick a point inside the widest available gap without changing neighbouring duties.
+fn suggested_curve_point(points: &[CurvePoint]) -> Option<(u8, u8)> {
+    let first = points.first()?;
+    // Include both edge intervals. Keep suggestions within the editor's lower
+    // limit and the core's maximum final temperature, so insertion stays valid.
+    let mut boundaries = vec![29];
+    boundaries.extend(points.iter().filter_map(|point| {
+        (30..=aero_core::LAST_TEMP_MAX)
+            .contains(&point.temp_c)
+            .then_some(point.temp_c)
+    }));
+    boundaries.push(aero_core::LAST_TEMP_MAX + 1);
+    boundaries
+        .windows(2)
+        .filter_map(|pair| {
+            let low = pair[0] + 1;
+            let high = pair[1] - 1;
+            (low <= high).then(|| {
+                let temp = low + (high - low) / 2;
+                let duty = aero_core::duty_at(points, temp).unwrap_or(first.duty_raw);
+                (high - low, temp, aero_core::raw_to_percent(duty))
+            })
+        })
+        .max_by_key(|entry| entry.0)
+        .map(|(_, temp, percent)| (temp, percent))
+}
+
+#[cfg(test)]
+mod curve_editor_tests {
+    use super::*;
+
+    #[test]
+    fn add_point_can_use_space_before_the_first_point() {
+        let curve = aero_core::curve_from_percent(&[(85, 80), (86, 100)]);
+        let mut points = curve.points().to_vec();
+        let (temp, percent) = suggested_curve_point(&points).unwrap();
+        assert!((30..85).contains(&temp));
+        aero_core::insert_point(&mut points, temp, percent).unwrap();
+        assert!(issues(&points).is_empty());
+    }
+
+    #[test]
+    fn add_point_can_use_space_after_the_last_point() {
+        let curve = aero_core::curve_from_percent(&[(30, 80), (31, 100)]);
+        let mut points = curve.points().to_vec();
+        let (temp, percent) = suggested_curve_point(&points).unwrap();
+        assert!((32..=aero_core::LAST_TEMP_MAX).contains(&temp));
+        aero_core::insert_point(&mut points, temp, percent).unwrap();
+        assert!(issues(&points).is_empty());
+    }
+
+    #[test]
+    fn add_point_does_not_select_an_existing_temperature() {
+        let points = aero_core::quiet_curve().points().to_vec();
+        let (temp, _) = suggested_curve_point(&points).unwrap();
+        assert!(!points.iter().any(|point| point.temp_c == temp));
+        assert!(suggested_curve_point(&[]).is_none());
+    }
 }
 
 fn page_header(ui: &mut egui::Ui, title: &str, subtitle: &str) {
@@ -1476,21 +2152,4 @@ fn parse_rpm(text: &str) -> Option<f32> {
         .trim_end_matches('?')
         .parse()
         .ok()
-}
-
-fn mode_from_flags(flags: &str) -> Option<FanMode> {
-    let value = |key: &str| {
-        flags.split(" · ").find_map(|part| {
-            part.strip_prefix(key)
-                .map(str::trim)
-                .filter(|rest| !rest.is_empty())
-        })
-    };
-    if value("super quiet") == Some("1") {
-        Some(FanMode::Quiet)
-    } else if value("auto") == Some("1") {
-        Some(FanMode::Normal)
-    } else {
-        None
-    }
 }

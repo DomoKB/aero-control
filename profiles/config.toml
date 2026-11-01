@@ -5,8 +5,8 @@ dc_profile = "Quiet"
 [[profiles]]
 name = "Quiet"
 fan_mode = "quiet"
-provisional = true
-notes = "PROVISIONAL. Firmware Super Quiet. Auto is left on; see docs/SOURCES.md."
+provisional = false
+notes = "YB manual Quiet fan and GPU thermal settings."
 
 [[profiles]]
 name = "Normal"
@@ -16,8 +16,8 @@ notes = "Firmware automatic fan control."
 [[profiles]]
 name = "Gaming"
 fan_mode = "gaming"
-provisional = true
-notes = "PROVISIONAL. Fan commands match Normal until an AERO 17 YB probe shows a distinct gaming script."
+provisional = false
+notes = "YB manual Gaming fan and GPU power settings."
 
 [[profiles]]
 name = "Max"
@@ -34,64 +34,79 @@ notes = "One duty for both fans. Floor is 35% unless expert_mode is true."
 name = "Deep Control"
 fan_mode = "custom"
 provisional = false
-notes = "Control Center Default for YB-family models (DeepFan.dll setDefault_Click), matching GetFanIndexValue 0..14 on this AERO 17 YB (P77YB, BIOS FB10). Upload rounds percent half-up; the chip stores Control Center's truncation, so 30% is raw 69 here and raw 68 on the chip."
+notes = "Control Center YB default curve with exact factory duty bytes."
 
 [[profiles.curve]]
 temp_c = 0
 duty_percent = 25
+duty_raw = 57
 
 [[profiles.curve]]
 temp_c = 50
 duty_percent = 30
+duty_raw = 68
 
 [[profiles.curve]]
 temp_c = 53
 duty_percent = 35
+duty_raw = 80
 
 [[profiles.curve]]
 temp_c = 56
 duty_percent = 40
+duty_raw = 91
 
 [[profiles.curve]]
 temp_c = 59
 duty_percent = 45
+duty_raw = 103
 
 [[profiles.curve]]
 temp_c = 62
 duty_percent = 50
+duty_raw = 114
 
 [[profiles.curve]]
 temp_c = 65
 duty_percent = 55
+duty_raw = 125
 
 [[profiles.curve]]
 temp_c = 68
 duty_percent = 60
+duty_raw = 137
 
 [[profiles.curve]]
 temp_c = 71
 duty_percent = 65
+duty_raw = 148
 
 [[profiles.curve]]
 temp_c = 74
 duty_percent = 70
+duty_raw = 160
 
 [[profiles.curve]]
 temp_c = 77
 duty_percent = 75
+duty_raw = 171
 
 [[profiles.curve]]
 temp_c = 80
 duty_percent = 80
+duty_raw = 183
 
 [[profiles.curve]]
 temp_c = 83
 duty_percent = 85
+duty_raw = 194
 
 [[profiles.curve]]
 temp_c = 86
 duty_percent = 90
+duty_raw = 206
 
 [[profiles.curve]]
 temp_c = 89
 duty_percent = 100
+duty_raw = 229

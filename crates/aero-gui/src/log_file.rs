@@ -154,15 +154,21 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "aero-log-{}-{}",
             std::process::id(),
-            utc_timestamp(0)
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
-        let _ = fs::remove_dir_all(&root);
         let dir = choose_log_directory(Some(root.clone()), PathBuf::from("/tmp/exe"));
         assert_eq!(dir, root.join("AeroCtl").join("logs"));
         let mut log = CallLog::open_in(&dir).unwrap();
         log.record(&format_call("GET", "getCpuTemp", "", "OK Data=61"));
         let text = fs::read_to_string(dir.join("aero-control.log")).unwrap();
         assert!(text.contains("GET getCpuTemp"));
-        let _ = fs::remove_dir_all(&root);
+        drop(log);
+        fs::remove_file(dir.join("aero-control.log")).unwrap();
+        fs::remove_dir(&dir).unwrap();
+        fs::remove_dir(root.join("AeroCtl")).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 }

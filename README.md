@@ -1,121 +1,133 @@
 # aero-control
 
-Open-source fan, profile, and sensor UI for a Gigabyte **AERO 17 YB** (Windows 10/11, i7-10875H, RTX 2080 Super Max-Q). It talks to the laptop's embedded controller the same way Gigabyte Control Center does: `GB_WMIACPI_Get` / `GB_WMIACPI_Set` in `root\WMI`.
+A native Rust desktop control panel for supported Gigabyte AERO laptops, built as an independent alternative to Gigabyte Control Center and selected AeroCtl features.
 
-The firmware runs the fans. This program does **not** poll temperatures and write fan speeds in a loop. Sensor reads are for display, the probe, and a getter-only drift check. If an upload fails or the apply path panics, it sends the firmware back to automatic mode.
+Control firmware fan modes and curves, request GPU performance levels, manage charging, adjust keyboard lighting, and use everyday Windows controls from one interface. **The firmware backend does not require Gigabyte's `acpimof.dll`, Control Center, or registration of Gigabyte MOF classes.** It opens the laptop's WMI firmware blocks directly through Windows APIs.
 
-Thermal protection is still the CPU, the GPU, and the embedded controller (PROCHOT and GPU slowdown). Validation here reduces mistakes. It does not replace those limits.
+**Version: 0.2.0 — pre-release.** Current hardware support targets the **AERO 17 YB / P77YB, BIOS FB10, Intel Core i7-10875H and RTX 2080 Super Max-Q**. Other model names are detected and displayed, but their fan and firmware power writes remain disabled until their command sets are verified.
 
-AeroCtl is GPLv3 and is not a code source. Facts and the ones we could not confirm are listed in [docs/SOURCES.md](docs/SOURCES.md). The design notes are in [docs/SCOPE.md](docs/SCOPE.md).
+![aero-control v0.2.0 Fans tab](docs/images/fans.png)
 
-## Layout
+*Fans tab in Simulation mode. Readings shown are sample data.*
 
-```
-crates/aero-wmi/     WMI transport, mock EC, RPM and curve decoding
-crates/aero-core/    Modes, curve rules, TOML profiles, upload and restore
-crates/aero-proto/   Versioned JSON messages for a future pipe
-crates/aero-svc/     Dispatch for that pipe. The Windows service host is not wired.
-crates/aero-probe/   Getter-only capability dump. The writer feature is off.
-crates/aero-gui/     egui status view and curve editor (real WMI on Windows, mock otherwise)
-profiles/            Example TOML profiles
-```
+## Features
 
-Rust 1.85 or newer.
+| Area | Available controls |
+|---|---|
+| Fans | Normal, Quiet, Gaming, Fixed, Max and a firmware curve editor; temperature and RPM history; startup mode detection |
+| Curves | Official reference Factory curve, editable points, exact raw duty values, registry/text import, complete 15-slot upload and readback |
+| GPU | Control Center's Level 1 / Level 2 power requests and Standard / Quiet thermal profiles |
+| CPU | Official i7 power presets through an optional compatible Intel XTU installation; availability checks, readback and rollback |
+| Battery | Standard charging or a custom 60–100% stop limit; battery status |
+| Keyboard | Built-in Gigabyte ITE lighting effects, colours, brightness, speed, direction, five saved profiles and solid custom pictures |
+| Profiles | Named settings, opt-in startup/resume apply, charger/battery switching, tray operation and Windows logon startup |
+| System | Volume/mute, AC/DC brightness, Wi-Fi/Bluetooth radios, camera, sleep/hibernation USB charging, display refresh rates and device information |
+| Laptop keys | Opt-in fan and Wi-Fi Fn handling, plus an explicit Fn+F6 display-off assignment |
 
-## Linux (no laptop required)
+See the detailed [Control Center coverage](docs/PARITY.md) and [AeroCtl comparison](docs/AEROCTL_PARITY.md). Implemented controls are not a claim that every feature has been physically validated.
 
-```bash
-cargo test --workspace
-cargo run -p aero-probe -- --mock
-cargo run -p aero-gui
-```
+## Rust and DLL dependencies
 
-`--mock` prints a JSON dump of a fake AERO 17 YB. `setters_invoked` is 0. RPM values in the fixture are byte-swapped on the wire; the report shows raw, swapped, and the decoded RPM.
+The desktop app, firmware transport, fan logic, keyboard HID implementation and Windows controls are written in Rust. There is no bundled Gigabyte helper DLL, custom kernel driver, or aero-control background service.
 
-On Linux the GUI is a mock (`--mock` is forced). Status refresh only calls getters. **Upload** and the firmware-mode tiles run the real command sequences against that mock, including the 15-slot upload and the readback.
+Optional **CPU power tuning is an exception**: a small embedded PowerShell bridge calls the signed Intel XTU SDK already installed on the machine. It needs a compatible Intel service and processor configuration. CPU tuning can be unavailable while the rest of the app works. Intel binaries are not bundled, installed or replaced by aero-control.
 
-`cargo check --workspace --target x86_64-pc-windows-gnu` and the same command for `x86_64-pc-windows-msvc` both typecheck, including the Windows WMI backend. Calls go to the first WMI instance path, with `NULL` in-params when a method has no inputs, and integer width taken from the CIM signature. The `wmi` crate stays on 0.14; 0.18 does not typecheck against the `windows` crates this workspace resolves.
+Normal Windows libraries, device drivers and the NVIDIA driver are still used. "No Gigabyte DLL required" does not mean the executable has no operating-system dependencies.
 
-## Windows
+## Build and run
 
-Build from a normal terminal. Run the probe from an **elevated** PowerShell. Admin is required for `root\WMI` on these machines. The probe still never calls a setter.
+Use Windows 10/11 x64, a Rust toolchain (declared minimum Rust 1.85), and the Microsoft C++ build tools with a Windows SDK. Build from the repository root:
 
 ```powershell
-rustup target add x86_64-pc-windows-msvc
-cargo build --release -p aero-probe
-.\target\release\aero-probe.exe
-```
-
-`cargo build --release -p aero-gui` embeds an administrator manifest. Launch the exe from an elevated shell (or accept the UAC prompt). The window shows **REAL** and talks to `GB_WMIACPI` on the instance path. `--mock` keeps the fake controller. If the process is not elevated, the window stays read-only and says so.
-
-Every WMI call is appended to `%ProgramData%\AeroCtl\logs\aero-control.log` (or `logs` next to the exe). Closing the window restores firmware auto when the last command was Fixed or Max.
-
-The first supervised write is **Test: Max for 10 s then restore Auto**.
-
-```powershell
-cargo build --release -p aero-probe
-.\target\release\aero-probe.exe --diag
-cargo build --release -p aero-gui
+cargo build --locked --release -p aero-gui
 .\target\release\aero-gui.exe
 ```
 
-`--diag` prints each getter and setter signature (names and CIM types) and the instance path, then still calls only getters.
+The release GUI opens **without a console window**. Windows requests administrator access for firmware operations. The app shows its version in the header and in the executable's Windows file properties.
 
-Useful probe flags:
+For a debug build, use `cargo build --locked -p aero-gui` and run `target\debug\aero-gui.exe`. Debug builds keep the console for diagnostics. Run the executable directly and approve elevation rather than relying on a non-elevated `cargo run` session.
 
-```powershell
-.\aero-probe.exe --help
-.\aero-probe.exe --mock
-.\aero-probe.exe --no-pace
-.\aero-probe.exe --rpm-order auto-swap
-```
-
-On real hardware each WMI call waits 500 ms, so a full dump takes about a minute. `--no-pace` skips that. `--rpm-order` is `auto-swap` (default, right for an older AERO), `auto-native`, `swap`, or `native`. The JSON always contains both byte orders.
-
-Exit codes: `0` report written, `2` bad arguments or no Windows backend, `4` `GB_WMIACPI_Get` is not registered. Individual getters that this SKU does not implement are failures inside the JSON, not a failed process.
-
-If the class is missing, keep Gigabyte's `acpimof.dll` registration, or compile the MIT clean-room subset from [aero-keyboard-fan](https://github.com/ejempty/aero-keyboard-fan) once:
+To explore without controlling hardware:
 
 ```powershell
-mofcomp aero_fan.mof
+.\target\release\aero-gui.exe --mock
 ```
 
-That MOF only declares a few setters. The probe wants the full getter class, which ships with Control Center's `acpimof.dll`.
+Simulation is clearly labelled and uses in-memory hardware and settings. A Windows production executable may still request administrator consent because its manifest is embedded at build time.
 
-## Fan modes and curves
+If using a packaged release, extract the whole ZIP to a permanent folder and launch `aero-gui.exe`. Keep that path stable if you enable Windows logon startup. Close older copies before opening an updated build.
 
-| Control | What is sent | Confirmed? |
-|---|---|---|
-| Normal, Restore auto | Fixed off, step off, auto on, current step 0, quiet off | Tail is the Control Center restore sequence |
-| Quiet (Super Quiet) | Same clears, auto left **on**, then `SetSuperQuiet 1` | Provisional. Quiet and Super Quiet are one switch |
-| Gaming | Same fan writes as Normal | Provisional. See SOURCES.md |
-| Max | Both fans raw **229** | Duty 229 and the fixed-mode shape |
-| Fixed | Same shape as Max, with your duty | Floor is 35% (raw 80) unless the profile sets `expert_mode` |
-| Upload curve | Full 15-slot write, then readback | Sequence is the §5.1 bugfix |
-| Factory / Deep Control | YB default custom curve | DeepFan `setDefault_Click` and this laptop's `GetFanIndexValue` |
+## How fan control works
 
-The curve editor opens on that factory table. **Reset to Factory** reloads it into the editor and does not send it. **Upload** is what writes the EC. Percents round half up, so 30% is raw 69. Control Center truncates, and this chip currently stores raw 68 for that point. Readback is exact, so uploading the rounded table can miss by one count and then restore firmware auto. The difference is listed in [docs/SOURCES.md](docs/SOURCES.md).
+The app sends a mode or curve to the embedded controller; **the firmware runs the fans**. Sensor polling displays readings and does not continuously calculate or write fan speeds. There is no software fan-control loop.
 
-What the upload does, and Control Center does not:
+- **Normal** uses the official normal firmware sequence.
+- **Quiet** selects the quiet thermal profile and official quiet fan settings.
+- **Gaming** enables the firmware boost fan curve, selects the Standard thermal profile and sends a GPU Level 2 request.
+- **Fixed** sets one duty for both fans. **Max** requests raw duty 229, the protocol's full-scale value.
+- **Custom** uploads the validated firmware curve. Once Custom is active, valid editor changes apply automatically when editing finishes.
 
-- Sends all 15 slots in order. Unused slots are `(0, 0)`, which is the terminator, so an old point cannot linger after it.
-- Reads every slot back with `GetFanIndexValue`. One mismatch retries the whole upload once, then restores firmware auto.
-- Clears auto, fixed, the current step, and (if the method exists) the custom cap before the points. Control Center's apply path skipped `SetCurrentFanStep(0)` and never cleared that cap.
-- Rounds percent ↔ raw half up. 50% is raw 115, and 30% is raw 69. Control Center truncates (`percent * 229 / 100`), so those two are 114 and 68 on this chip.
-- Rejects a `(0, 0)` point anywhere in the curve, including the middle, because the firmware treats it as the end of the table.
+Factory and reference quiet curves identify the hardware where they were obtained; they are not automatically factory curves for every model the app can name. The plotted step response is an estimate of firmware behaviour. See [fan control details](docs/FAN_CONTROL.md).
 
-Pasting `HKLM\SOFTWARE\Gigabyte\SmartManager\CustomFanTable` into the curve tab parses it. On a Windows build, **Read CustomFanTable from the registry** opens that key read-only. Nothing in this repo writes the Gigabyte registry.
+Mode and curve operations check durable fan/thermal settings and curve bytes. Failures attempt the official Normal recovery sequence and report failed recovery explicitly. Normal application exit attempts Normal restoration after Fixed or Max. A forced termination cannot run cleanup, so a fixed setting may remain until another controller or the firmware changes it. CPU/GPU/EC thermal protection remains essential.
 
-Profiles are TOML. `profiles/config.toml` binds Gaming to AC and Quiet to DC. `curve_pairs` are percent. A `duty_raw` field, when present, is the exact byte that will be sent. CPU power limits and the GPU/battery fields are stored and **not** sent; applying a profile says so.
+## GPU and CPU power
 
-## What is still stubbed
+**GPU Level 1 and Level 2 are requests, not wattage sliders.** The NVIDIA request flag can clear within milliseconds after a command. It is not used as a permanent confirmation of the GPU's active power budget. The UI shows the last request sent in the current session; it starts unknown after restart. The thermal profile has a separate, durable Standard/Quiet getter. Actual GPU power and performance under load are not yet validated.
 
-- No Windows service, no named pipe, no SDDL, no resume listener. `aero-svc` dispatches the same apply engine in-process and exits if you run the binary. Power-event re-apply is implemented and tested; nothing yet subscribes to `WM_POWERBROADCAST`.
-- No tray icon, global hotkey, XTU/PL1/PL2 bridge, charge-limit or GPU WMI writes, MOF installer, or GCC coexistence wizard. The Power and Battery pages only say those fields are stored and not sent.
-- `SetDeepFan` (the old 5-point call) and `TurnOffFan` are known and never called. `TurnOffFan` is refused if something asks for it.
+The supported i7 CPU presets match Control Center's reference table:
 
-## On the laptop
+| Preset | Sustained limit | Short-burst limit |
+|---|---:|---:|
+| Level 1 | 38 W | 107 W |
+| Level 2 | 45 W | 107 W |
+| Level 3 / official default | 52 W | 107 W |
+| Level 4 | 58 W | 107 W |
+| Level 5 | 62 W | 107 W |
+| Official battery preset | 45 W | 56.25 W |
 
-Rebuild after this tree. The GUI manifest asks for administrator (`/MANIFESTUAC:NO` so the linker does not also embed `asInvoker`). `aero-probe.exe --diag` prints method signatures and the instance path, then still calls only getters. The window shows **REAL** when it is talking to the EC and **MOCK** with `--mock`. A process that is not elevated stays read-only.
+CPU changes require an explicit Apply or an explicitly enabled profile action. The bridge checks compatibility and supported writable values, verifies both limits, and attempts rollback on a failed pair write. A timeout can leave a partial change. The development machine's installed Intel XTU currently fails compatibility/connection checks, so real CPU tuning remains unverified. The app does not change Windows security settings to bypass Intel restrictions.
 
-The first supervised write is still **Test: Max for 10 s**. Uploading Factory will not bit-match the current chip table where rounding and truncation disagree; the upload then restores auto. That is the documented difference, not a second curve.
+## Profiles and everyday use
+
+Profiles store confirmed fan/curve values, an available CPU preset, the last locally requested GPU level and the charging policy. Saving a profile does not apply it. Automation and laptop hotkeys are opt-in; profile switching and tray operation require the app to remain running.
+
+System settings refresh on page entry, explicit refresh and relevant changes. Wi-Fi/Bluetooth controls enumerate Windows radios; they do not scan for nearby devices. There is no periodic refresh loop on the System page.
+
+Settings are separate from Control Center:
+
+- Profiles and automation: `%APPDATA%\aero-control\profiles.toml`
+- Keyboard settings: `%APPDATA%\aero-control\keyboard-lighting.txt`
+- WMI call logs: normally `%ProgramData%\AeroCtl\logs`; see **Log** for the active path.
+
+The Gigabyte `CustomFanTable` registry import is read-only. Running multiple control apps can overwrite the same firmware settings. See the [user guide](docs/USER_GUIDE.md) for lifecycle behaviour, troubleshooting and profile details.
+
+## Status and limitations
+
+Gaming command completion, the GPU request path and Normal restoration have been checked on the reference laptop. Automated tests cover command sequences, simulated hardware failures, profiles, model gates, radio/display logic and CPU bridge failure handling. Those checks do not establish universal hardware support or thermal safety under every workload.
+
+Current exclusions include vendor AI/cloud integration, Pantone calibration, full Fusion keyboard macros and a physical per-key editor, newer-model MUX/Dynamic Boost paths, and software fan control. There is no installed aero-control service, automatic driver installer or vendor-app coexistence manager. CPU tuning depends on Intel compatibility; full charging, display, radio, hotkey, resume and thermal/load validation is still incomplete.
+
+## Development and documentation
+
+```powershell
+cargo fmt --all -- --check
+cargo test --locked --workspace --exclude aero-gui
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-gui.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\crates\aero-gui\tests\cpu_power_bridge.tests.ps1
+```
+
+The GUI test helper compiles the actual GUI/session source into a test-only executable without the production administrator manifest. Tests use simulated hardware. Windows CI runs these checks and builds the release GUI; it does not validate laptop hardware. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+- [User guide](docs/USER_GUIDE.md)
+- [Architecture and implementation](docs/ARCHITECTURE.md)
+- [Fan modes, curves and validation](docs/FAN_CONTROL.md)
+- [Verified sources and hardware observations](docs/SOURCES.md)
+- [Control Center feature coverage](docs/PARITY.md) / [AeroCtl comparison](docs/AEROCTL_PARITY.md)
+- [Release preparation](docs/RELEASING.md) / [Changelog](CHANGELOG.md)
+
+## License and provenance
+
+The repository declares dual licensing under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Dependency licenses are separate.
+
+This is an independent project, not an official Gigabyte product. Its Rust implementations were developed from the local firmware/Control Center reference material, protocol observations and Windows APIs. AeroCtl is a functional comparison target; its GPLv3 source is not copied or vendored. This repository does not distribute Gigabyte/Intel application binaries or the separate decompiled reference project. Evidence and remaining uncertainties are recorded in [SOURCES.md](docs/SOURCES.md).

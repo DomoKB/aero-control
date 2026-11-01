@@ -63,13 +63,13 @@ pub fn presets() -> Vec<Preset> {
             kind: PresetKind::Fixed { duty_percent: 50 },
         },
         curve_preset("quiet-curve", "Quiet curve", false, QUIET_NOTES, QUIET_YB_PERCENT),
-        curve_preset(
-            "factory",
-            "Factory",
-            false,
-            FACTORY_NOTES,
-            FACTORY_YB_PERCENT,
-        ),
+        Preset {
+            id: "factory",
+            name: "Factory",
+            provisional: false,
+            notes: FACTORY_NOTES,
+            kind: PresetKind::Curve(factory_curve()),
+        },
     ]
 }
 
@@ -108,14 +108,14 @@ pub const QUIET_YB_PERCENT: &[(u8, u8)] = &[
     (90, 80),
 ];
 
-const QUIET_NOTES: &str = "Quiet-first curve measured on this AERO 17 YB: 25% at idle, 50 to 55% under sustained full load, where the CPU holds about 90°C regardless of fan speed.";
+const QUIET_NOTES: &str = "Reference quiet-first curve measured on an AERO 17 YB: 25% at idle, 50 to 55% under sustained full load, where the CPU held about 90°C regardless of fan speed. These measurements do not describe every detected laptop.";
 
 /// Raw duty bytes read from that laptop. They are `floor(percent * 229 / 100)`.
 pub const FACTORY_YB_CHIP_RAW: &[u8] = &[
     57, 68, 80, 91, 103, 114, 125, 137, 148, 160, 171, 183, 194, 206, 229,
 ];
 
-const FACTORY_NOTES: &str = "Control Center Default for YB-family models (DeepFan.dll setDefault_Click), matching GetFanIndexValue 0..14 on this AERO 17 YB (P77YB, BIOS FB10). Quiet, Normal, Gaming, and Max are firmware switches, not curves. Upload rounds percent half-up; the chip currently stores Control Center's truncation, so 30% is raw 69 here and raw 68 on the chip.";
+const FACTORY_NOTES: &str = "Reference Control Center curve verified on an AERO 17 YB (P77YB, BIOS FB10), including its exact raw duty bytes. It is not automatically a factory curve for other detected models.";
 
 fn curve_preset(
     id: &'static str,
@@ -138,7 +138,14 @@ pub fn quiet_curve() -> FanCurve {
 }
 
 pub fn factory_curve() -> FanCurve {
-    curve_from_percent(FACTORY_YB_PERCENT)
+    let points = FACTORY_YB_PERCENT
+        .iter()
+        .map(|(temp, percent)| CurvePoint {
+            temp_c: *temp,
+            duty_raw: gcc_floor_raw(*percent),
+        })
+        .collect();
+    FanCurve::try_new(points).expect("factory curve must pass validation")
 }
 
 /// Control Center truncates percent to the 0–229 duty byte.
@@ -199,11 +206,13 @@ pub fn builtin_config() -> Config {
                 nv_thermal_target: None,
                 ai_boost: None,
                 charge_limit: None,
+                charge_policy: None,
                 expert_mode: false,
                 provisional: preset.provisional,
                 notes: preset.notes.to_string(),
                 cpu_pl1_w: None,
                 cpu_pl2_w: None,
+                cpu_power_preset: None,
             })
             .collect(),
     }
@@ -225,6 +234,11 @@ mod tests {
         assert_eq!(quiet_curve().points().len(), QUIET_YB_PERCENT.len());
         assert!(presets.iter().all(|preset| !preset.provisional));
         let curve = factory_curve();
+        let preset = presets
+            .iter()
+            .find(|preset| preset.id == "factory")
+            .unwrap();
+        assert!(matches!(&preset.kind, PresetKind::Curve(stored) if *stored == curve));
         assert_eq!(curve.points().len(), 15);
         assert!(curve
             .points()
@@ -232,10 +246,14 @@ mod tests {
             .all(|point| !(point.temp_c == 0 && point.duty_raw == 0)));
         for ((temp, percent), chip) in FACTORY_YB_PERCENT.iter().zip(FACTORY_YB_CHIP_RAW) {
             assert_eq!(gcc_floor_raw(*percent), *chip, "{temp}°C");
+            assert!(curve
+                .points()
+                .iter()
+                .any(|point| point.temp_c == *temp && point.duty_raw == *chip));
         }
         assert_eq!(percent_to_raw(30), 69);
         assert_eq!(gcc_floor_raw(30), 68);
-        assert_eq!(curve.points()[1].duty_raw, 69);
+        assert_eq!(curve.points()[1].duty_raw, 68);
         assert_eq!(curve.points()[1].temp_c, 50);
     }
 
@@ -249,8 +267,6 @@ mod tests {
         assert_eq!(deep.fan_mode, FanMode::Custom);
         assert!(!deep.provisional);
         let curve = deep.fan_curve().unwrap();
-        assert_eq!(curve.points().len(), FACTORY_YB_PERCENT.len());
-        assert_eq!(curve.points()[0].duty_raw, percent_to_raw(25));
-        assert_eq!(curve.points()[1].duty_raw, percent_to_raw(30));
+        assert_eq!(curve, factory_curve());
     }
 }

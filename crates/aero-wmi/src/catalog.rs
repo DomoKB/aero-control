@@ -76,6 +76,8 @@ pub static GETTERS: &[MethodSpec] = &[
     get("GetCPUFanDuty", 70, DATA_U8),
     get("GetGPUFanDuty", 71, DATA_U8),
     get("GetNvPowerConfig", 81, DATA_U8),
+    get("GetAIBoostStatus", 129, DATA_U8),
+    get("GetNvThermalTarget", 87, DATA_U8),
     get("GetBatteryHealth", 97, DATA_U8),
     get("GetChargePolicy", 100, DATA_U16),
     get("GetChargeStop", 101, DATA_U16),
@@ -91,6 +93,9 @@ pub static GETTERS: &[MethodSpec] = &[
     get("GetFixedFanSpeed", 107, DATA_U16),
     get("GetFanAdjustStatus", 112, DATA_U8),
     get("GetAutoFanStatus", 113, DATA_U8),
+    get("GetSleepUSBCharge", 122, DATA_U8),
+    get("GetHibernationUSBCharge", 123, DATA_U8),
+    get("GetCamera", 197, DATA_U8),
     get("GetFanSpeed", 125, DATA_U8),
     get("GetWhisperMode", 133, DATA_U8),
     get("getCpuTemp", 225, DATA_U16),
@@ -101,6 +106,7 @@ pub static GETTERS: &[MethodSpec] = &[
 ];
 
 pub static SETTERS: &[MethodSpec] = &[
+    set("SetAIBoostStatus", 129, DATA_OUT),
     set("SetGPUFanDuty", 71, DATA_OUT),
     set("SetNvPowerConfig", 81, &[]),
     set("SetNvThermalTarget", 87, &[]),
@@ -120,6 +126,10 @@ pub static SETTERS: &[MethodSpec] = &[
     set("SetFixedFanSpeed", 107, DATA_OUT),
     set("SetFanAdjustStatus", 112, DATA_OUT),
     set("SetAutoFanStatus", 113, DATA_OUT),
+    set("SetSleepUSBCharge", 122, DATA_OUT),
+    set("SetHibernationUSBCharge", 123, DATA_OUT),
+    set("SetBrightnessOff", 196, DATA_OUT),
+    set("SetCamera", 197, DATA_OUT),
     set("SetDynamicBoostStatus", 231, &[]),
 ];
 
@@ -267,6 +277,28 @@ mod tests {
             decode_output(find_getter("GetFanIndexValue").unwrap(), &[45, 80, 0, 0]).unwrap();
         assert_eq!(point.get("Temperture"), Some(WmiNumber::U8(45)));
         assert_eq!(point.get("Value"), Some(WmiNumber::U8(80)));
+    }
+
+    #[test]
+    fn device_controls_follow_the_yb_mof_ids_and_byte_layouts() {
+        for (getter, setter, id) in [
+            ("GetNvThermalTarget", "SetNvThermalTarget", 87),
+            ("GetSleepUSBCharge", "SetSleepUSBCharge", 122),
+            ("GetHibernationUSBCharge", "SetHibernationUSBCharge", 123),
+            ("GetCamera", "SetCamera", 197),
+        ] {
+            let read = find_getter(getter).unwrap();
+            let write = find_setter(setter).unwrap();
+            assert_eq!(read.id, id);
+            assert_eq!(write.id, id);
+            assert_eq!(read.outputs, DATA_U8);
+            assert_eq!(pack_input(write, &[("Data", 1)]).unwrap(), [1]);
+            assert_eq!(
+                decode_output(read, &[1]).unwrap().get("Data"),
+                Some(WmiNumber::U8(1))
+            );
+        }
+        assert_eq!(find_setter("SetBrightnessOff").unwrap().id, 196);
     }
 
     #[test]

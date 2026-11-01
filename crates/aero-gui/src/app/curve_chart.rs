@@ -117,7 +117,7 @@ fn paint(
 ) {
     let plot = axes.plot;
     painter.rect_filled(plot.expand(2.0), Rounding::same(8.0), BG);
-    let small = FontId::proportional(12.0);
+    let small = FontId::proportional(13.0);
     for step in 0..=10 {
         let v = step as f32 * 10.0;
         let x = axes.to_screen(v, 0.0).x;
@@ -203,10 +203,10 @@ fn paint(
             painter.circle(at, 6.0, marker.color, Stroke::new(2.0_f32, BG));
         }
         let text = match target {
-            Some(target) => format!("{} {temp:.0}°C · fans {target}%", marker.label),
+            Some(target) => format!("{} {temp:.0}°C · curve target {target}%", marker.label),
             None => format!("{} {temp:.0}°C", marker.label),
         };
-        let galley = painter.layout_no_wrap(text, FontId::proportional(12.5), marker.color);
+        let galley = painter.layout_no_wrap(text, FontId::proportional(13.5), marker.color);
         let at = plot.left_top() + egui::vec2(12.0, 12.0 + row as f32 * 26.0);
         let chip = Rect::from_min_size(at, galley.size() + egui::vec2(14.0, 6.0));
         painter.rect(

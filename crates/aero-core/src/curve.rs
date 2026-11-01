@@ -188,7 +188,13 @@ pub fn constrain_drag(
     let max_raw = next
         .map(|point| u16::from(point.duty_raw))
         .unwrap_or(u16::from(DUTY_MAX));
-    let requested = u16::from(percent_to_raw(duty_percent.clamp(0, 100) as u8));
+    let percent = duty_percent.clamp(0, 100) as u8;
+    // Keep exact imported or factory bytes when a drag changes only temperature.
+    let requested = u16::from(if percent == raw_to_percent(current.duty_raw) {
+        current.duty_raw
+    } else {
+        percent_to_raw(percent)
+    });
     let duty_raw = if min_raw > max_raw {
         current.duty_raw
     } else {
@@ -360,6 +366,26 @@ mod tests {
         let slots = planned_slots(&curve);
         assert!(slots.iter().all(|slot| *slot != (0, 0)));
         assert_eq!(slots[14].0, 90);
+    }
+
+    #[test]
+    fn drag_keeps_exact_raw_duty_when_percent_is_unchanged() {
+        let points = vec![
+            point(40, 25),
+            CurvePoint {
+                temp_c: 50,
+                duty_raw: 68,
+            },
+            point(90, 100),
+        ];
+        let moved = constrain_drag(&points, 1, 51, 30).unwrap();
+        assert_eq!(
+            moved,
+            CurvePoint {
+                temp_c: 51,
+                duty_raw: 68
+            }
+        );
     }
 
     #[test]

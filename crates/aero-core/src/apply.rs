@@ -5,9 +5,7 @@
 
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
-use aero_wmi::{
-    decode_fan_index, AcpiReader, AcpiWriter, Pacer, WmiError, WriteParams, FAN_CURVE_SLOTS,
-};
+use aero_wmi::{decode_fan_index, AcpiReader, AcpiWriter, Pacer, WmiError, FAN_CURVE_SLOTS};
 use thiserror::Error;
 use tracing::debug;
 
@@ -43,6 +41,8 @@ pub fn reason_for(event: PowerEvent) -> ApplyReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlotDiff {
+    /// Getter which produced the mismatch. Flags have no curve-slot meaning.
+    pub getter: &'static str,
     pub index: u8,
     pub expected_temp: u8,
     pub expected_duty: u8,
@@ -58,14 +58,40 @@ pub struct ApplyReport {
     pub diffs: Vec<SlotDiff>,
 }
 
+impl std::fmt::Display for ApplyReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (position, diff) in self.diffs.iter().enumerate() {
+            if position > 0 {
+                write!(f, "; ")?;
+            }
+            if diff.getter == "GetFanIndexValue" {
+                write!(f, "{} slot {} returned temperature {:?}, duty {:?}; expected temperature {}, duty {}", diff.getter, diff.index, diff.actual_temp, diff.actual_duty, diff.expected_temp, diff.expected_duty)?;
+            } else {
+                write!(
+                    f,
+                    "{} returned {:?}; expected {}",
+                    diff.getter, diff.actual_duty, diff.expected_duty
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum ApplyError {
+    #[error("this profile requires the CPU power bridge; use the desktop app")]
+    CpuBridgeRequired,
     #[error("the curve is not valid")]
     InvalidCurve(Vec<CurveIssue>),
     #[error("custom mode needs a curve")]
     CurveRequired,
     #[error("charge limit {0}% is outside 60..=100")]
     InvalidCharge(u8),
+    #[error("charge policy must be Standard (0) or Custom (4)")]
+    InvalidChargePolicy,
+    #[error("{field} must be 0 or 1, got {value}")]
+    InvalidSwitch { field: &'static str, value: u8 },
     #[error(transparent)]
     Wmi(#[from] WmiError),
     #[error("{getter} read back {actual:?}, expected {expected}")]
@@ -74,7 +100,7 @@ pub enum ApplyError {
         expected: u8,
         actual: Option<u32>,
     },
-    #[error("the firmware did not match after one retry")]
+    #[error("the firmware did not match after one retry: {report}")]
     VerifyFailed { report: ApplyReport },
     #[error("{reason} (firmware auto was restored)")]
     Restored { reason: String },
@@ -143,7 +169,20 @@ pub fn restore_firmware_auto<W: AcpiWriter, P: Pacer>(
         &mut gate,
         &crate::normal_script(),
         &mut warnings,
-    )
+    )?;
+    let diffs = read_flags(writer, pacer, &mut gate, FanMode::Normal, 0)?;
+    if diffs.is_empty() {
+        Ok(())
+    } else {
+        Err(ApplyError::VerifyFailed {
+            report: ApplyReport {
+                attempts: 1,
+                warnings,
+                restored_auto: false,
+                diffs,
+            },
+        })
+    }
 }
 
 pub fn upload_curve<W: AcpiWriter, P: Pacer>(
@@ -259,6 +298,7 @@ fn read_curve<W: AcpiWriter, P: Pacer>(
         let actual_duty = reading.duty_raw;
         if actual_temp != Some(expected_temp) || actual_duty != Some(expected_duty) {
             diffs.push(SlotDiff {
+                getter: "GetFanIndexValue",
                 index: index as u8,
                 expected_temp,
                 expected_duty,
@@ -393,6 +433,17 @@ fn read_flags<W: AcpiWriter, P: Pacer>(
         &mut diffs,
     )?;
     check_flag(writer, pacer, gate, "GetStepFanStatus", 2, step, &mut diffs)?;
+    // GetNvPowerConfig exposes the transient TEMQ request, which may already
+    // have reset to zero. Only durable fan/thermal flags establish this mode.
+    check_flag(
+        writer,
+        pacer,
+        gate,
+        "GetNvThermalTarget",
+        7,
+        u8::from(mode == FanMode::Quiet),
+        &mut diffs,
+    )?;
     if let Some(duty) = speed {
         check_flag(writer, pacer, gate, "GetFixedFanSpeed", 4, duty, &mut diffs)?;
         check_flag(writer, pacer, gate, "GetGPUFanDuty", 5, duty, &mut diffs)?;
@@ -404,7 +455,7 @@ fn check_flag<W: AcpiWriter, P: Pacer>(
     writer: &mut W,
     pacer: &mut P,
     gate: &mut Gate,
-    method: &str,
+    method: &'static str,
     index: u8,
     expected: u8,
     diffs: &mut Vec<SlotDiff>,
@@ -415,6 +466,7 @@ fn check_flag<W: AcpiWriter, P: Pacer>(
             let actual = output.first(&["Data"]).and_then(|value| value.as_u8());
             if actual != Some(expected) {
                 diffs.push(SlotDiff {
+                    getter: method,
                     index,
                     expected_temp: 0,
                     expected_duty: expected,
@@ -453,6 +505,16 @@ fn exec_write<W: AcpiWriter, P: Pacer>(
     match writer.set(write.method, &write.params) {
         Ok(outcome) => {
             if let Some(message) = outcome.threw {
+                // A consumed NVIDIA request has no durable success getter.
+                // Legacy transports which return an exception inside Ok must
+                // not turn that request into a claimed successful operation.
+                if write.method == "SetNvPowerConfig" {
+                    return Err(WmiError::CallFailed {
+                        method: write.method.into(),
+                        detail: message,
+                    }
+                    .into());
+                }
                 warnings.push(format!(
                     "{}: WMI returned an error ({message}); the call is kept and checked with a getter",
                     write.method
@@ -470,9 +532,28 @@ pub fn apply_profile<W: AcpiWriter, P: Pacer>(
     profile: &Profile,
     reason: ApplyReason,
 ) -> Result<ApplyReport, ApplyError> {
+    if profile.cpu_power_preset.is_some() {
+        return Err(ApplyError::CpuBridgeRequired);
+    }
     if let Some(limit) = profile.charge_limit {
         if !(60..=100).contains(&limit) {
             return Err(ApplyError::InvalidCharge(limit));
+        }
+    }
+    if profile
+        .charge_policy
+        .is_some_and(|policy| policy != 0 && policy != 4)
+        || (profile.charge_policy == Some(4) && profile.charge_limit.is_none())
+        || (profile.charge_policy == Some(0) && profile.charge_limit.is_some())
+    {
+        return Err(ApplyError::InvalidChargePolicy);
+    }
+    for (field, value) in [
+        ("nv_power_config", profile.nv_power_config),
+        ("nv_thermal_target", profile.nv_thermal_target),
+    ] {
+        if let Some(value) = value.filter(|value| *value > 1) {
+            return Err(ApplyError::InvalidSwitch { field, value });
         }
     }
     debug!(profile = %profile.name, ?reason, "apply profile");
@@ -491,30 +572,29 @@ pub fn apply_profile<W: AcpiWriter, P: Pacer>(
     if profile.cpu_pl1_w.is_some() || profile.cpu_pl2_w.is_some() {
         report
             .warnings
-            .push("CPU PL1/PL2 is stored only; the XTU bridge is not implemented".to_string());
+            .push("Legacy CPU PL1/PL2 fields are stored only; select a CPU power preset in the desktop app".to_string());
     }
-    let overrides: Vec<PlannedWrite> = [
-        ("SetNvThermalTarget", profile.nv_thermal_target),
-        ("SetNvPowerConfig", profile.nv_power_config),
-    ]
-    .into_iter()
-    .filter_map(|(method, value)| {
-        value.map(|value| PlannedWrite {
-            method,
-            params: WriteParams::Data(value),
-        })
-    })
-    .collect();
-    let mut gate = Gate { started: true };
-    for write in &overrides {
-        exec_write(writer, pacer, &mut gate, write, &mut report.warnings)?;
-    }
-    if profile.dynamic_boost.is_some()
-        || profile.ai_boost.is_some()
-        || profile.charge_limit.is_some()
-    {
+    guarded(writer, pacer, |writer, pacer| {
+        if let Some(value) = profile.nv_thermal_target {
+            pacer.pause();
+            crate::set_nv_thermal_target(writer, pacer, value == 1)?;
+        }
+        if let Some(value) = profile.nv_power_config {
+            pacer.pause();
+            crate::set_nv_power_config(writer, pacer, value == 1)?;
+        }
+        if profile.charge_policy == Some(0) {
+            pacer.pause();
+            crate::set_charge_policy(writer, pacer, crate::ChargePolicy::Standard)?;
+        } else if let Some(limit) = profile.charge_limit {
+            pacer.pause();
+            crate::set_charge_policy(writer, pacer, crate::ChargePolicy::Custom(limit))?;
+        }
+        Ok(())
+    })?;
+    if profile.dynamic_boost.is_some() || profile.ai_boost.is_some() {
         report.warnings.push(
-            "Dynamic Boost, AI Boost and battery charge fields are stored only; they are not sent to WMI yet"
+            "Dynamic Boost and AI Boost fields are stored only; they are not sent to WMI"
                 .to_string(),
         );
     }
@@ -538,6 +618,7 @@ pub fn curve_drift<R: AcpiReader>(
         let (expected_temp, expected_duty) = slots[index];
         if reading.temperature_c != Some(expected_temp) || reading.duty_raw != Some(expected_duty) {
             diffs.push(SlotDiff {
+                getter: "GetFanIndexValue",
                 index: index as u8,
                 expected_temp,
                 expected_duty,
@@ -586,7 +667,25 @@ mod tests {
             assert_eq!(params[2], ("Value".to_string(), slots[index].1));
         }
         assert!(slots.iter().all(|slot| *slot != (0, 0)));
-        assert_eq!(slots[1], (50, percent_to_raw(30)));
+        let expected = [
+            (0, 57),
+            (50, 68),
+            (53, 80),
+            (56, 91),
+            (59, 103),
+            (62, 114),
+            (65, 125),
+            (68, 137),
+            (71, 148),
+            (74, 160),
+            (77, 171),
+            (80, 183),
+            (83, 194),
+            (86, 206),
+            (89, 229),
+        ];
+        assert_eq!(mock.curve, expected);
+        assert_eq!(slots, expected);
         assert_eq!(mock.calls_named("GetFanIndexValue").count(), 15);
         assert_eq!(pacer.pauses, mock.calls.len() - 1);
         assert_eq!(mock.auto, 0);
@@ -653,15 +752,21 @@ mod tests {
     }
 
     #[test]
-    fn setter_throw_is_kept_and_verified() {
+    fn failed_setter_stops_upload_and_restores_firmware_mode() {
         let mut mock = MockAcpi::aero_17_yb_fixture();
-        mock.throw_setters.insert("SetStepFanStatus".to_string());
-        let report = upload_curve(&mut mock, &mut NoPacer, &sample()).unwrap();
-        assert!(report
-            .warnings
-            .iter()
-            .any(|warning| warning.contains("SetStepFanStatus")));
-        assert_eq!(mock.step, 1);
+        mock.throw_setters.insert("SetFanIndexValue".to_string());
+        let err = upload_curve(&mut mock, &mut NoPacer, &sample()).unwrap_err();
+        assert!(matches!(err, ApplyError::Restored { .. }));
+        assert_eq!(mock.calls_named("SetFanIndexValue").count(), 1);
+        assert_eq!((mock.fixed, mock.step), (0, 0));
+    }
+
+    #[test]
+    fn failed_recovery_is_reported() {
+        let mut mock = MockAcpi::aero_17_yb_fixture();
+        mock.throw_setters.insert("SetFixedFanStatus".into());
+        let err = upload_curve(&mut mock, &mut NoPacer, &sample()).unwrap_err();
+        assert!(matches!(err, ApplyError::RestoreFailed { .. }));
     }
 
     #[test]
@@ -783,6 +888,19 @@ mod tests {
     }
 
     #[test]
+    fn transitions_clear_quiet_and_gaming_power_settings() {
+        let mut mock = MockAcpi::aero_17_yb_fixture();
+        apply_mode(&mut mock, &mut NoPacer, FanMode::Quiet, 0, false).unwrap();
+        apply_mode(&mut mock, &mut NoPacer, FanMode::Gaming, 0, false).unwrap();
+        assert_eq!((mock.nv_thermal_target, mock.nv_power_config), (0, 1));
+        apply_mode(&mut mock, &mut NoPacer, FanMode::Fixed, 120, false).unwrap();
+        assert_eq!((mock.nv_thermal_target, mock.nv_power_config), (0, 0));
+        apply_mode(&mut mock, &mut NoPacer, FanMode::Gaming, 0, false).unwrap();
+        upload_curve(&mut mock, &mut NoPacer, &sample()).unwrap();
+        assert_eq!((mock.nv_thermal_target, mock.nv_power_config), (0, 0));
+    }
+
+    #[test]
     fn profile_gpu_power_fields_override_the_mode_defaults() {
         let mut profile = crate::builtin_config().profile("Normal").unwrap().clone();
         profile.fan_mode = FanMode::Gaming;
@@ -793,6 +911,88 @@ mod tests {
         assert_eq!(mock.auto, 1);
         assert_eq!(mock.nv_power_config, 0);
         assert_eq!(mock.nv_thermal_target, 1);
+    }
+
+    #[test]
+    fn profile_thermal_override_noop_is_rejected_and_recovers_normal() {
+        let mut profile = crate::builtin_config().profile("Normal").unwrap().clone();
+        profile.nv_thermal_target = Some(1);
+        let mut mock = MockAcpi::aero_17_yb_fixture();
+        mock.ignored_setters.insert("SetNvThermalTarget".into());
+        let result = apply_profile(&mut mock, &mut NoPacer, &profile, ApplyReason::User);
+        assert!(matches!(result, Err(ApplyError::Restored { .. })));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("GetNvThermalTarget"));
+        assert_eq!(
+            (mock.auto, mock.fixed, mock.step, mock.nv_thermal_target),
+            (0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn durable_flag_mismatches_name_the_getter_then_restore_normal() {
+        for (mode, setter, getter) in [
+            (FanMode::Gaming, "SetAutoFanStatus", "GetAutoFanStatus"),
+            (FanMode::Quiet, "SetNvThermalTarget", "GetNvThermalTarget"),
+        ] {
+            let mut mock = MockAcpi::aero_17_yb_fixture();
+            mock.auto = 0;
+            mock.ignored_setters.insert(setter.into());
+            let error = apply_mode(&mut mock, &mut NoPacer, mode, 0, false).unwrap_err();
+            assert!(matches!(error, ApplyError::Restored { .. }));
+            assert!(error.to_string().contains(getter), "{error}");
+            assert_eq!(
+                mock.calls_named(setter).count(),
+                3,
+                "two attempts and Normal recovery"
+            );
+            assert_eq!(mock.calls_named(getter).count(), 3);
+            assert_eq!(
+                (
+                    mock.auto,
+                    mock.fixed,
+                    mock.step,
+                    mock.nv_power_config,
+                    mock.nv_thermal_target
+                ),
+                (0, 0, 0, 0, 0)
+            );
+        }
+    }
+
+    #[test]
+    fn gaming_does_not_rollback_when_the_gpu_request_has_been_consumed() {
+        let mut mock = MockAcpi::aero_17_yb_fixture();
+        mock.auto = 0;
+        mock.consume_nv_power_requests = true;
+        let report = apply_mode(&mut mock, &mut NoPacer, FanMode::Gaming, 0, false).unwrap();
+        assert_eq!(report.attempts, 1);
+        assert_eq!(
+            mock.get("GetNvPowerConfig", &[])
+                .unwrap()
+                .get("Data")
+                .unwrap()
+                .as_u32(),
+            Some(0)
+        );
+        assert_eq!((mock.auto, mock.fixed, mock.step), (1, 0, 0));
+        assert_eq!(mock.calls_named("SetNvPowerConfig").count(), 1);
+        assert_eq!(mock.calls_named("SetAutoFanStatus").count(), 1);
+    }
+
+    #[test]
+    fn normal_recovery_does_not_claim_success_when_thermal_clear_is_ignored() {
+        let mut mock = MockAcpi::aero_17_yb_fixture();
+        apply_mode(&mut mock, &mut NoPacer, FanMode::Quiet, 0, false).unwrap();
+        mock.ignored_setters.insert("SetNvThermalTarget".into());
+        assert!(matches!(
+            apply_mode(&mut mock, &mut NoPacer, FanMode::Normal, 0, false),
+            Err(ApplyError::RestoreFailed { .. })
+        ));
+        assert_eq!(mock.nv_thermal_target, 1);
+        assert_eq!((mock.auto, mock.fixed, mock.step), (0, 0, 0));
     }
 
     #[test]
@@ -812,6 +1012,45 @@ mod tests {
             .calls
             .iter()
             .all(|call| call.class == aero_wmi::GET_CLASS));
+    }
+
+    #[test]
+    fn profiles_restore_standard_charging_after_a_custom_limit() {
+        let mut profile = crate::builtin_config().profile("Normal").unwrap().clone();
+        let mut mock = MockAcpi::aero_17_yb_fixture();
+        profile.charge_policy = Some(4);
+        profile.charge_limit = Some(80);
+        apply_profile(&mut mock, &mut NoPacer, &profile, ApplyReason::User).unwrap();
+        assert_eq!((mock.charge_policy, mock.charge_stop), (4, 80));
+        profile.charge_policy = Some(0);
+        profile.charge_limit = None;
+        apply_profile(&mut mock, &mut NoPacer, &profile, ApplyReason::User).unwrap();
+        assert_eq!(mock.charge_policy, 0);
+    }
+
+    #[test]
+    fn failed_profile_charge_write_recovers_fixed_fans() {
+        let mut profile = crate::builtin_config().profile("Fixed").unwrap().clone();
+        profile.charge_limit = Some(80);
+        let mut mock = MockAcpi::aero_17_yb_fixture();
+        mock.throw_setters.insert("SetChargeStop".into());
+        assert!(matches!(
+            apply_profile(&mut mock, &mut NoPacer, &profile, ApplyReason::User),
+            Err(ApplyError::Restored { .. })
+        ));
+        assert_eq!((mock.fixed, mock.step), (0, 0));
+    }
+
+    #[test]
+    fn invalid_profile_switch_is_rejected_before_any_write() {
+        let mut profile = crate::builtin_config().profile("Normal").unwrap().clone();
+        profile.nv_power_config = Some(2);
+        let mut mock = MockAcpi::aero_17_yb_fixture();
+        assert!(matches!(
+            apply_profile(&mut mock, &mut NoPacer, &profile, ApplyReason::User),
+            Err(ApplyError::InvalidSwitch { .. })
+        ));
+        assert!(mock.calls.is_empty());
     }
 
     #[test]
@@ -869,12 +1108,24 @@ mod tests {
         assert!(report
             .warnings
             .iter()
-            .any(|warning| warning.contains("XTU")));
+            .any(|warning| warning.contains("Legacy CPU")));
         assert!(report
             .warnings
             .iter()
             .any(|warning| warning.contains("not sent")));
         assert_eq!(mock.calls_named("SetDynamicBoostStatus").count(), 0);
+    }
+
+    #[test]
+    fn cpu_preset_requires_a_bridge_before_any_wmi_write() {
+        let mut profile = crate::builtin_config().profile("Gaming").unwrap().clone();
+        profile.cpu_power_preset = Some(crate::CpuPowerPreset::Level5);
+        let mut mock = MockAcpi::aero_17_yb_fixture();
+        assert!(matches!(
+            apply_profile(&mut mock, &mut NoPacer, &profile, ApplyReason::User),
+            Err(ApplyError::CpuBridgeRequired)
+        ));
+        assert!(mock.calls.is_empty());
     }
 
     #[test]

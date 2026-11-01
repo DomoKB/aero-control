@@ -43,7 +43,7 @@ pub use value::{WmiNumber, WmiOutput};
 pub use write::{AcpiWriter, SetOutcome, WriteParams};
 
 #[cfg(windows)]
-pub use platform::WindowsReader;
+pub use platform::{read_system_sku, WindowsReader};
 
 #[cfg(all(windows, feature = "writer"))]
 pub use platform::WindowsWriter;

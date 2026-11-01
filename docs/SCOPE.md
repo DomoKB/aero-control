@@ -1,5 +1,7 @@
 # aero-control — Scope Document
 
+> Historical design proposal. Current behaviour and verified command meanings are documented in README.md, SOURCES.md, PARITY.md and AEROCTL_PARITY.md. The replacement scope includes AeroCtl features, except software fan control, which was removed at the user's request. The backend uses Windows' direct WMI data-block API and does not require `acpimof.dll` or MOF registration; contrary statements below are historical. Earlier proposed command sequences and unverified capabilities below are not current implementation instructions.
+
 **Project location:** `/workspace/Development/aero-control/` (this file: `SCOPE.md`). This is a scope document only. No code has been written and no `cargo init` has been run.
 
 **Target:** Gigabyte AERO 17 YB, Windows 10/11, i7-10875H, RTX 2080 Super Max-Q.

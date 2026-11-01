@@ -37,6 +37,9 @@ pub struct Profile {
     pub ai_boost: Option<u8>,
     #[serde(default)]
     pub charge_limit: Option<u8>,
+    /// 0 = Standard, 4 = Custom. None leaves policy unchanged unless charge_limit is set.
+    #[serde(default)]
+    pub charge_policy: Option<u8>,
     #[serde(default)]
     pub expert_mode: bool,
     #[serde(default)]
@@ -47,6 +50,9 @@ pub struct Profile {
     pub cpu_pl1_w: Option<u16>,
     #[serde(default)]
     pub cpu_pl2_w: Option<u16>,
+    /// Applied by the GUI's Intel XTU bridge, separately from WMI.
+    #[serde(default)]
+    pub cpu_power_preset: Option<crate::CpuPowerPreset>,
 }
 
 impl Profile {
@@ -83,7 +89,6 @@ impl Profile {
     pub fn has_deferred_fields(&self) -> bool {
         self.dynamic_boost.is_some()
             || self.ai_boost.is_some()
-            || self.charge_limit.is_some()
             || self.cpu_pl1_w.is_some()
             || self.cpu_pl2_w.is_some()
     }
@@ -201,7 +206,7 @@ mod tests {
         let curve = deep.fan_curve().unwrap();
         assert_eq!(curve.points().len(), 15);
         assert_eq!(curve.points()[1].temp_c, 50);
-        assert_eq!(curve.points()[1].duty_raw, crate::percent_to_raw(30));
+        assert_eq!(curve, crate::factory_curve());
         assert!(std::fs::read_dir(&root)
             .unwrap()
             .filter_map(|entry| entry.ok())
