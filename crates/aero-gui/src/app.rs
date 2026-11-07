@@ -91,6 +91,7 @@ pub struct AeroApp {
     display: display_controls::DisplayTab,
     desktop: crate::desktop_events::DesktopEvents,
     startup_checked: bool,
+    startup_setup_checked: bool,
     last_power_source: Option<bool>,
     queued_profile: Option<QueuedApply>,
     pending_profile_name: Option<String>,
@@ -303,6 +304,7 @@ impl AeroApp {
             display,
             desktop: crate::desktop_events::DesktopEvents::new(mock),
             startup_checked: false,
+            startup_setup_checked: false,
             last_power_source: None,
             queued_profile: None,
             pending_profile_name: None,
@@ -714,7 +716,36 @@ impl AeroApp {
         self.startup.ui(ui);
     }
 
+    fn setup_startup_once(&mut self, release_build: bool) {
+        if !self.startup_setup_checked {
+            self.startup_setup_checked = true;
+            if release_build
+                && self.elevated
+                && self.session.writes_enabled
+                && crate::device_identity::has_yb_command_set(&self.identity)
+                && self.profiles.load_error().is_none()
+                && !self.profiles.settings().startup_setup_complete
+            {
+                self.startup.setup_first_launch();
+            }
+        }
+    }
+
     fn poll_automation(&mut self, ctx: &egui::Context) {
+        self.setup_startup_once(!cfg!(debug_assertions));
+        if let Some(result) = self.startup.poll() {
+            let saved = result.and_then(|remember_choice| {
+                if remember_choice {
+                    self.profiles.mark_startup_setup_complete()
+                } else {
+                    Ok(())
+                }
+            });
+            if let Err(error) = saved {
+                self.report = format!("Windows startup: {error}");
+                self.report_error = true;
+            }
+        }
         if self.instance.take_show_request() {
             self.show_window(ctx);
         }
@@ -2232,6 +2263,24 @@ mod background_tests {
             .unwrap()
             .unwrap();
         AeroApp::new(BackendChoice::Mock, true, instance)
+    }
+
+    #[test]
+    fn first_launch_setup_completes_through_the_app_without_opening_profiles() {
+        let mut app = app();
+        // Simulate the real launch eligibility while keeping task registration
+        // and all hardware in the mock backend.
+        app.elevated = true;
+        app.setup_startup_once(true);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app.profiles.settings().startup_setup_complete {
+            assert_eq!(app.poll_background(&ctx), BackgroundAction::Wait);
+            assert!(Instant::now() < deadline, "{}", app.report);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(matches!(app.page, Page::Fans));
+        assert!(!app.open_window_requested);
     }
 
     fn finish(app: &mut AeroApp, ctx: &egui::Context, mode: FanMode) {

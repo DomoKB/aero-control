@@ -84,6 +84,15 @@ impl ProfilesTab {
         &self.saved
     }
 
+    pub fn mark_startup_setup_complete(&mut self) -> Result<(), String> {
+        if self.saved.startup_setup_complete {
+            return Ok(());
+        }
+        let mut next = self.saved.clone();
+        next.startup_setup_complete = true;
+        self.commit(next)
+    }
+
     pub fn fan_restore_profile(&self) -> Option<Profile> {
         if self.load_error.is_some() || !self.saved.restore_fan_mode {
             return None;
@@ -441,6 +450,32 @@ fn power_profile_choice(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_setup_completion_persists_without_enabling_other_automation() {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("startup-setup-{}.toml", std::process::id()));
+        let mut tab = ProfilesTab::new(true);
+        tab.path = Some(path.clone());
+        assert!(!tab.settings().startup_setup_complete);
+        tab.mark_startup_setup_complete().unwrap();
+        let saved = profile_store::load(&path).unwrap();
+        assert!(saved.startup_setup_complete);
+        assert!(
+            !saved.apply_at_startup && !saved.reapply_on_resume && !saved.switch_on_power_change
+        );
+        let bytes = std::fs::read(&path).unwrap();
+        tab.mark_startup_setup_complete().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::remove_file(&path).unwrap();
+
+        let mut invalid = ProfilesTab::new(true);
+        invalid.load_error = Some("invalid settings".into());
+        assert!(invalid.mark_startup_setup_complete().is_err());
+        assert!(!invalid.settings().startup_setup_complete);
+    }
 
     #[test]
     fn captures_exact_curve_without_applying_or_changing_active_profile() {

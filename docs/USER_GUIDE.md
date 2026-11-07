@@ -4,6 +4,8 @@
 
 Run the release executable directly and approve Windows administrator access when using real firmware controls. The header shows the detected model and app version. Unsupported models retain their own name and show unavailable controls. Simulation is labelled explicitly; successful administrator access is not shown as a badge during normal use.
 
+Extract the app to a permanent folder before this first launch. On supported hardware, the release automatically configures background startup using the same administrator approval; there is no separate setup button to find. Choose a fan mode and it is remembered for later Windows sign-ins. You can disable startup on Profiles. Simulation, debug builds, unsupported hardware, non-elevated sessions and invalid saved settings never trigger automatic registration.
+
 Use one hardware-control app at a time while comparing behaviour. aero-control does not uninstall or disable Control Center, its services, or Intel XTU.
 
 ## Fans and curves
@@ -32,9 +34,11 @@ Successful fan changes are saved automatically, including raw fixed duty and cus
 
 Full-profile startup/resume apply, charger/battery switching and native Fn handling remain separate opt-ins. Tray operation is optional for manual launches and automatic for Windows background startup. Enabled full-profile rules take priority over fan-only restoration. Saving automation settings does not immediately apply a profile. Display refresh-rate switching is also opt-in and tied to a selected monitor's identity.
 
-For cold-boot restoration, use **Profiles → Start with Windows → Enable logon startup**. The task starts this executable with `--background` and administrator privileges after signing in. It restores the saved preference without creating the control window and keeps a notification icon for opening the app or exiting. You do not need to launch the app manually, enable "Start in the notification area", or run Gigabyte Control Center. Restoration occurs after Windows sign-in, not before login or while the laptop is off. It requires this background process; the preference is not stored permanently in the firmware.
+Cold-boot restoration is configured automatically on the first supported release launch. The task starts this executable with `--background` and administrator privileges after signing in. It restores the saved preference without creating the control window and keeps a notification icon for opening the app or exiting. You do not need to launch the app manually, enable "Start in the notification area", or run Gigabyte Control Center. Restoration occurs after Windows sign-in, not before login or while the laptop is off. It requires this background process; the preference is not stored permanently in the firmware.
 
-Keep a release in a permanent folder before enabling startup. If an older task says it opens the window, choose **Use background startup**. If moving an installation, disable the task using the old copy and recreate it from the new copy. No task is created merely by opening the app. For deployment, `aero-gui.exe --enable-startup` registers or upgrades the task and exits without touching fan hardware; `--disable-startup` disables it.
+**Profiles → Start with Windows** shows the verified result and provides Disable/Enable controls. Existing disabled tasks are respected. First-launch setup upgrades a verified enabled legacy task to background launch; **Use background startup** remains available for manual upgrades. Successful setup or a manual startup choice is saved, so opening the app again will not recreate a subsequently removed task or undo an opt-out. A setup failure is reported and can be retried using the controls or on the next launch. No other profile automation is enabled by this setup.
+
+Keep the registered executable path stable. If moving an installation, disable the task using the old copy and inspect/remove the old task in Windows Task Scheduler before enabling startup from the new copy; an existing task pointing elsewhere is never silently taken over. For deployment, `aero-gui.exe --enable-startup` registers or upgrades the task and exits without touching fan hardware; `--disable-startup` disables it.
 
 Opening aero-control again brings up the running controller instead of starting a second one. Startup failures, invalid saved settings or an unavailable tray icon open the window so the problem is visible. Simulation has no real tray icon and falls back to a visible window.
 

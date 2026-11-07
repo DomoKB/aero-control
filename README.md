@@ -55,9 +55,9 @@ To explore without controlling hardware:
 
 Simulation is clearly labelled and uses in-memory hardware and settings. A Windows production executable may still request administrator consent because its manifest is embedded at build time.
 
-If using a packaged release, extract the whole ZIP to a permanent folder and launch `aero-gui.exe`. Keep that path stable if you enable Windows logon startup. Close older copies before opening an updated build.
+If using a packaged release, extract the whole ZIP to a permanent folder and launch `aero-gui.exe`. Keep that path stable: the app registers it for Windows background startup. Close older copies before opening an updated build.
 
-For automatic fan restoration after a restart, enable **Profiles → Start with Windows → Enable logon startup** once. Merely opening the app does not enable startup. After setup, Windows starts it silently at sign-in and restores your last saved fan mode. Quitting the app does not disable this startup setting; use **Disable logon startup** to turn it off.
+On its first supported release launch, the app automatically sets up Windows background startup after the normal administrator prompt. Choose your fan mode; future Windows sign-ins restore it silently. Quitting the app does not disable startup. To opt out, use **Profiles → Start with Windows → Disable logon startup**; later launches respect that choice. Simulation, debug builds, unsupported hardware and invalid settings do not trigger automatic setup. Setup errors are shown rather than reported as success.
 
 ## How fan control works
 
@@ -92,7 +92,7 @@ CPU changes require an explicit Apply or an explicitly enabled profile action. T
 
 ## Profiles and everyday use
 
-Successful fan changes are remembered automatically and restored when the app opens or resumes from sleep, matching Control Center's manual-mode lifecycle. This includes exact fixed duties and custom curves. Failed requests and the ten-second Max test do not replace the remembered preference. Fan restoration is enabled by default, including when upgrading existing settings; it can be disabled on **Profiles**. Enable **Profiles → Start with Windows → Enable logon startup** to restore the mode silently after signing in following a cold boot. Startup keeps aero-control in the notification area without creating the control window; opening the app later brings up that same running controller.
+Successful fan changes are remembered automatically and restored when the app opens or resumes from sleep, matching Control Center's manual-mode lifecycle. This includes exact fixed duties and custom curves. Failed requests and the ten-second Max test do not replace the remembered preference. Fan restoration is enabled by default, including when upgrading existing settings; it can be disabled on **Profiles**. Windows startup is set up automatically on the first supported release launch and keeps aero-control in the notification area without creating the control window. Opening the app later brings up that same running controller. Startup can be disabled or re-enabled on **Profiles**.
 
 Named profiles also store an available CPU preset, the last locally requested GPU level and the charging policy. Saving a profile does not apply it. Full-profile startup/resume rules, charger switching and laptop hotkeys remain opt-in. Enabled full-profile rules take priority over fan-only restoration. Background resume handling, profile switching and tray operation require the app to remain running.
 

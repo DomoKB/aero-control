@@ -9,6 +9,7 @@
 - Start silently at Windows sign-in, restoring the fan preference without creating the control window. Keep a tray icon for opening the app, resume handling and Exit; report startup failures visibly.
 - Prevent duplicate Windows controllers: an interactive second launch opens the existing copy, while a repeated background launch stays silent. Existing startup tasks can be upgraded to background launch from Profiles.
 - Resolve Task Scheduler account names to Windows user IDs before checking ownership, so Windows' normalization of a logon trigger cannot falsely reject the app's own task.
+- Automatically configure background startup on the first supported, elevated release launch. Preserve disabled tasks and later opt-outs, verify registration before saving completion, and report failures with retry available. Simulation, debug builds, unsupported hardware and invalid settings skip setup.
 
 ## 0.2.0 — 2026-11-01
 

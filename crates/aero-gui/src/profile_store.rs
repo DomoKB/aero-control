@@ -16,6 +16,8 @@ pub struct SavedProfiles {
     pub config: Config,
     pub restore_fan_mode: bool,
     pub last_fan: Option<Profile>,
+    /// Successful setup or explicit choice; later opt-outs are not undone.
+    pub startup_setup_complete: bool,
     pub apply_at_startup: bool,
     pub switch_on_power_change: bool,
     pub reapply_on_resume: bool,
@@ -33,6 +35,7 @@ impl Default for SavedProfiles {
             config: aero_core::builtin_config(),
             restore_fan_mode: true,
             last_fan: None,
+            startup_setup_complete: false,
             apply_at_startup: false,
             switch_on_power_change: false,
             reapply_on_resume: false,
@@ -95,6 +98,7 @@ pub fn parse(text: &str) -> Result<SavedProfiles, String> {
         restore_fan_mode: !root.contains_key("restore_fan_mode")
             || top_level_flag(&root, "restore_fan_mode")?,
         last_fan: last_fan.as_ref().map(fan_only),
+        startup_setup_complete: top_level_flag(&root, "startup_setup_complete")?,
         apply_at_startup: top_level_flag(&root, "apply_at_startup")?,
         switch_on_power_change: top_level_flag(&root, "switch_on_power_change")?,
         reapply_on_resume: top_level_flag(&root, "reapply_on_resume")?,
@@ -261,6 +265,7 @@ pub fn save(path: &Path, saved: &SavedProfiles) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
     for (name, enabled) in [
         ("restore_fan_mode", saved.restore_fan_mode),
+        ("startup_setup_complete", saved.startup_setup_complete),
         ("apply_at_startup", saved.apply_at_startup),
         ("switch_on_power_change", saved.switch_on_power_change),
         ("reapply_on_resume", saved.reapply_on_resume),
@@ -370,6 +375,7 @@ mod tests {
         original.display_off_hotkey = true;
         original.keep_in_tray = true;
         original.start_minimized = true;
+        original.startup_setup_complete = true;
         save(&path, &original).unwrap();
         let loaded = load(&path).unwrap();
         assert_eq!(loaded, original);

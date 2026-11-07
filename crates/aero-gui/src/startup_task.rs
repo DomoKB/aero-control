@@ -11,6 +11,7 @@ const BACKGROUND_ARGUMENT: &str = "--background";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StartupStatus {
+    pub exists: bool,
     pub enabled: bool,
     pub background: bool,
 }
@@ -18,6 +19,8 @@ pub struct StartupStatus {
 pub enum StartupTask {
     Mock {
         enabled: bool,
+        exists: bool,
+        background: bool,
     },
     #[cfg(windows)]
     Real,
@@ -30,25 +33,50 @@ impl StartupTask {
             return Self::Real;
         }
         let _ = mock;
-        Self::Mock { enabled: false }
+        Self::Mock {
+            enabled: false,
+            exists: false,
+            background: false,
+        }
     }
 
     pub fn status(&self) -> Result<StartupStatus, String> {
         match self {
-            Self::Mock { enabled } => Ok(StartupStatus {
+            Self::Mock {
+                enabled,
+                exists,
+                background,
+            } => Ok(StartupStatus {
+                exists: *exists,
                 enabled: *enabled,
-                background: true,
+                background: *background,
             }),
             #[cfg(windows)]
             Self::Real => real::status(),
         }
     }
 
-    /// Must be invoked only after an explicit user action; real calls can require elevation.
+    /// First supported launch may create the task. A previously disabled task
+    /// is an opt-out, and must never be automatically re-enabled.
+    pub fn setup_first_launch(&mut self) -> Result<StartupStatus, String> {
+        let status = self.status()?;
+        if !status.exists || (status.enabled && !status.background) {
+            self.set_enabled(true)?;
+        }
+        self.status()
+    }
+
+    /// Used by first-launch setup or an explicit user action; requires elevation.
     pub fn set_enabled(&mut self, enabled: bool) -> Result<(), String> {
         match self {
-            Self::Mock { enabled: value } => {
+            Self::Mock {
+                enabled: value,
+                exists,
+                background,
+            } => {
                 *value = enabled;
+                *exists |= enabled;
+                *background |= enabled;
                 Ok(())
             }
             #[cfg(windows)]
@@ -425,6 +453,7 @@ mod real {
         let folder = folder()?;
         let Some(task) = find(&folder, &task_name(&sid)?)? else {
             return Ok(StartupStatus {
+                exists: false,
                 enabled: false,
                 background: true,
             });
@@ -433,6 +462,7 @@ mod real {
         validate_identity(&identity, &executable, &sid)?;
         unsafe { task.Enabled() }
             .map(|value| StartupStatus {
+                exists: true,
                 enabled: value.0 != 0,
                 background: identity.arguments.trim() == BACKGROUND_ARGUMENT,
             })
@@ -534,6 +564,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn first_launch_creates_or_upgrades_startup_but_preserves_disabled_tasks() {
+        let mut fresh = StartupTask::new(true);
+        assert!(!fresh.status().unwrap().exists);
+        let enabled = fresh.setup_first_launch().unwrap();
+        assert!(enabled.exists && enabled.enabled && enabled.background);
+        fresh.set_enabled(false).unwrap();
+        assert!(!fresh.setup_first_launch().unwrap().enabled);
+
+        let mut legacy = StartupTask::Mock {
+            exists: true,
+            enabled: true,
+            background: false,
+        };
+        assert!(legacy.setup_first_launch().unwrap().background);
+        let mut disabled_legacy = StartupTask::Mock {
+            exists: true,
+            enabled: false,
+            background: false,
+        };
+        let unchanged = disabled_legacy.setup_first_launch().unwrap();
+        assert!(!unchanged.enabled && !unchanged.background);
+    }
+
+    #[test]
     fn mock_startup_is_explicit_and_reversible() {
         let mut task = StartupTask::new(true);
         assert!(!task.status().unwrap().enabled);
@@ -541,6 +595,7 @@ mod tests {
         assert_eq!(
             task.status().unwrap(),
             StartupStatus {
+                exists: true,
                 enabled: true,
                 background: true
             }

@@ -11,7 +11,7 @@ The comparison uses [AeroCtl's README](https://gitlab.com/wtwrp/aeroctl/-/raw/ma
 | Hardware fan modes and curve | Normal, Quiet, Gaming, Fixed, Max, full validated hardware curve | Separate capped Auto semantics are not reproduced; target MOF lacks SetFanCustomStatus. |
 | Restart mode highlight | Durable fan flags and GPU thermal profile | The transient NVIDIA power-request flag does not invalidate Gaming. Ambiguous step/custom stays unknown; Fixed at 100% is labelled Max. |
 | Software fan controller | Not provided at the user's request | Firmware modes and curves remain available. |
-| Saved profiles/lifecycle | Automatic fan-mode memory and startup/resume restoration, exact curve bytes, optional full-profile and charger rules | Legacy software tuning is ignored and omitted when settings are next saved. Windows logon launch remains explicit. |
+| Saved profiles/lifecycle | Automatic fan-mode memory and startup/resume restoration, exact curve bytes, optional full-profile and charger rules | Legacy software tuning is ignored and omitted when settings are next saved. The first supported release launch sets up Windows background startup and respects opt-outs. |
 | Notification area and minimized launch | Silent Windows startup with tray access; optional tray/minimized behaviour for manual launch | Background startup creates no control window; native icon registration is checked and failures open the UI. A second launch opens the same controller. |
 | Wi-Fi/Bluetooth | Explicit per-radio controls and opt-in native Wi-Fi Fn group toggle | Windows consent and hardware/policy restrictions apply. |
 | Fan Fn and Fn+F6 | Opt-in fan toggle; explicit Fn+F6 display-off assignment | No inferred OLED workstation-lock assignment. |
