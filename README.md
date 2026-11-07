@@ -4,7 +4,7 @@ A native Rust desktop control panel for supported Gigabyte AERO laptops, built a
 
 Control firmware fan modes and curves, request GPU performance levels, manage charging, adjust keyboard lighting, and use everyday Windows controls from one interface. **The firmware backend does not require Gigabyte's `acpimof.dll`, Control Center, or registration of Gigabyte MOF classes.** It opens the laptop's WMI firmware blocks directly through Windows APIs.
 
-**Version: 0.2.0 — pre-release.** Current hardware support targets the **AERO 17 YB / P77YB, BIOS FB10, Intel Core i7-10875H and RTX 2080 Super Max-Q**. Other model names are detected and displayed, but their fan and firmware power writes remain disabled until their command sets are verified.
+**Version: 0.2.1 — pre-release.** Current hardware support targets the **AERO 17 YB / P77YB, BIOS FB10, Intel Core i7-10875H and RTX 2080 Super Max-Q**. Other model names are detected and displayed, but their fan and firmware power writes remain disabled until their command sets are verified.
 
 ![aero-control v0.2.0 Fans tab](docs/images/fans.png)
 
@@ -20,7 +20,7 @@ Control firmware fan modes and curves, request GPU performance levels, manage ch
 | CPU | Official i7 power presets through an optional compatible Intel XTU installation; availability checks, readback and rollback |
 | Battery | Standard charging or a custom 60–100% stop limit; battery status |
 | Keyboard | Built-in Gigabyte ITE lighting effects, colours, brightness, speed, direction, five saved profiles and solid custom pictures |
-| Profiles | Named settings, opt-in startup/resume apply, charger/battery switching, tray operation and Windows logon startup |
+| Profiles | Automatic fan-mode memory and startup/resume restoration; named settings, optional full-profile rules, charger/battery switching, tray operation and Windows logon startup |
 | System | Volume/mute, AC/DC brightness, Wi-Fi/Bluetooth radios, camera, sleep/hibernation USB charging, display refresh rates and device information |
 | Laptop keys | Opt-in fan and Wi-Fi Fn handling, plus an explicit Fn+F6 display-off assignment |
 
@@ -57,6 +57,8 @@ Simulation is clearly labelled and uses in-memory hardware and settings. A Windo
 
 If using a packaged release, extract the whole ZIP to a permanent folder and launch `aero-gui.exe`. Keep that path stable if you enable Windows logon startup. Close older copies before opening an updated build.
 
+For automatic fan restoration after a restart, enable **Profiles → Start with Windows → Enable logon startup** once. Merely opening the app does not enable startup. After setup, Windows starts it silently at sign-in and restores your last saved fan mode. Quitting the app does not disable this startup setting; use **Disable logon startup** to turn it off.
+
 ## How fan control works
 
 The app sends a mode or curve to the embedded controller; **the firmware runs the fans**. Sensor polling displays readings and does not continuously calculate or write fan speeds. There is no software fan-control loop.
@@ -90,7 +92,9 @@ CPU changes require an explicit Apply or an explicitly enabled profile action. T
 
 ## Profiles and everyday use
 
-Profiles store confirmed fan/curve values, an available CPU preset, the last locally requested GPU level and the charging policy. Saving a profile does not apply it. Automation and laptop hotkeys are opt-in; profile switching and tray operation require the app to remain running.
+Successful fan changes are remembered automatically and restored when the app opens or resumes from sleep, matching Control Center's manual-mode lifecycle. This includes exact fixed duties and custom curves. Failed requests and the ten-second Max test do not replace the remembered preference. Fan restoration is enabled by default, including when upgrading existing settings; it can be disabled on **Profiles**. Enable **Profiles → Start with Windows → Enable logon startup** to restore the mode silently after signing in following a cold boot. Startup keeps aero-control in the notification area without creating the control window; opening the app later brings up that same running controller.
+
+Named profiles also store an available CPU preset, the last locally requested GPU level and the charging policy. Saving a profile does not apply it. Full-profile startup/resume rules, charger switching and laptop hotkeys remain opt-in. Enabled full-profile rules take priority over fan-only restoration. Background resume handling, profile switching and tray operation require the app to remain running.
 
 System settings refresh on page entry, explicit refresh and relevant changes. Wi-Fi/Bluetooth controls enumerate Windows radios; they do not scan for nearby devices. There is no periodic refresh loop on the System page.
 

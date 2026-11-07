@@ -77,6 +77,8 @@ fn hotkey_reports(data: &[u8], report_size: u32, report_count: u32) -> Vec<Deskt
 }
 
 pub struct DesktopEvents {
+    #[cfg(test)]
+    test_events: mpsc::Sender<DesktopEvent>,
     rx: mpsc::Receiver<DesktopEvent>,
     stop: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
@@ -110,6 +112,8 @@ impl DesktopEvents {
         let display_off_requested = Arc::new(AtomicBool::new(false));
         let display_off_confirmed = Arc::new(AtomicBool::new(false));
         let mut events = Self {
+            #[cfg(test)]
+            test_events: tx.clone(),
             rx,
             stop: stop.clone(),
             error: error.clone(),
@@ -174,6 +178,11 @@ impl DesktopEvents {
 
     pub fn poll(&self) -> Option<DesktopEvent> {
         self.rx.try_recv().ok()
+    }
+
+    #[cfg(test)]
+    pub fn inject_event(&self, event: DesktopEvent) {
+        self.test_events.send(event).unwrap();
     }
 
     pub fn last_error(&self) -> Option<String> {

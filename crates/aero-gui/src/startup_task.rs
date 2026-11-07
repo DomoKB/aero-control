@@ -7,6 +7,13 @@
 use std::path::{Path, PathBuf};
 
 const TASK_SOURCE: &str = "aero-control/startup/v1";
+const BACKGROUND_ARGUMENT: &str = "--background";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StartupStatus {
+    pub enabled: bool,
+    pub background: bool,
+}
 
 pub enum StartupTask {
     Mock {
@@ -26,11 +33,14 @@ impl StartupTask {
         Self::Mock { enabled: false }
     }
 
-    pub fn enabled(&self) -> Result<bool, String> {
+    pub fn status(&self) -> Result<StartupStatus, String> {
         match self {
-            Self::Mock { enabled } => Ok(*enabled),
+            Self::Mock { enabled } => Ok(StartupStatus {
+                enabled: *enabled,
+                background: true,
+            }),
             #[cfg(windows)]
-            Self::Real => real::enabled(),
+            Self::Real => real::status(),
         }
     }
 
@@ -91,11 +101,11 @@ fn task_xml(executable: &Path, sid: &str) -> Result<String, String> {
     Ok(format!(
         r#"<?xml version="1.0"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>Start aero-control when this user logs on.</Description><Source>{TASK_SOURCE}</Source></RegistrationInfo>
+  <RegistrationInfo><Description>Restore aero-control settings in the background when this user signs in.</Description><Source>{TASK_SOURCE}</Source></RegistrationInfo>
   <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{sid}</UserId></LogonTrigger></Triggers>
   <Principals><Principal id="CurrentUser"><UserId>{sid}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
   <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><AllowHardTerminate>true</AllowHardTerminate><StartWhenAvailable>true</StartWhenAvailable><RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable><AllowStartOnDemand>true</AllowStartOnDemand><Enabled>true</Enabled><Hidden>false</Hidden><WakeToRun>false</WakeToRun><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>
-  <Actions Context="CurrentUser"><Exec><Command>{command}</Command><WorkingDirectory>{parent}</WorkingDirectory></Exec></Actions>
+  <Actions Context="CurrentUser"><Exec><Command>{command}</Command><Arguments>{BACKGROUND_ARGUMENT}</Arguments><WorkingDirectory>{parent}</WorkingDirectory></Exec></Actions>
 </Task>"#
     ))
 }
@@ -117,7 +127,7 @@ fn validate_identity(identity: &TaskIdentity, executable: &Path, sid: &str) -> R
         || identity.principal_sid != sid
         || identity.trigger_sid != sid
         || identity.executable != executable
-        || !identity.arguments.trim().is_empty()
+        || !matches!(identity.arguments.trim(), "" | BACKGROUND_ARGUMENT)
         || executable.parent() != Some(identity.working_directory.as_path())
         || !identity.interactive_logon
         || !identity.highest_available
@@ -131,17 +141,20 @@ fn validate_identity(identity: &TaskIdentity, executable: &Path, sid: &str) -> R
 
 #[cfg(windows)]
 mod real {
-    use windows::core::{Interface, BSTR, PWSTR};
+    use windows::core::{Interface, BSTR, PCWSTR, PWSTR};
     use windows::Win32::Foundation::{CloseHandle, LocalFree, HANDLE, HLOCAL, VARIANT_BOOL};
     use windows::Win32::Security::Authorization::ConvertSidToStringSidW;
-    use windows::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER};
+    use windows::Win32::Security::{
+        GetTokenInformation, LookupAccountNameW, SidTypeUser, TokenUser, PSID, SID_NAME_USE,
+        TOKEN_QUERY, TOKEN_USER,
+    };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_MULTITHREADED,
     };
     use windows::Win32::System::TaskScheduler::{
         IExecAction, ILogonTrigger, IRegisteredTask, ITaskFolder, ITaskService, TaskScheduler,
-        TASK_CREATE, TASK_LOGON_INTERACTIVE_TOKEN, TASK_RUNLEVEL_HIGHEST,
+        TASK_CREATE, TASK_LOGON_INTERACTIVE_TOKEN, TASK_RUNLEVEL_HIGHEST, TASK_UPDATE,
     };
     use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::Win32::System::Variant::VARIANT;
@@ -233,6 +246,68 @@ mod real {
         Ok(path)
     }
 
+    /// Task Scheduler can return a SID, a local name or DOMAIN\\name for the
+    /// same account. Resolve names through Windows before ownership checks;
+    /// never treat an unqualified username alone as proof of task ownership.
+    fn account_sid(account: &str) -> Result<String, String> {
+        if account.starts_with("S-1-") {
+            // Literal SIDs must still equal the actual current token SID in
+            // validate_identity; malformed/different literals cannot match.
+            return Ok(account.to_owned());
+        }
+        if account.is_empty() || account.len() > 4096 || account.contains('\0') {
+            return Err("The startup task contains an invalid Windows account.".into());
+        }
+        let name: Vec<_> = account.encode_utf16().chain(Some(0)).collect();
+        let mut sid_bytes = 0;
+        let mut domain_chars = 0;
+        let mut kind = SID_NAME_USE::default();
+        let sized = unsafe {
+            LookupAccountNameW(
+                PCWSTR::null(),
+                PCWSTR(name.as_ptr()),
+                None,
+                &mut sid_bytes,
+                None,
+                &mut domain_chars,
+                &mut kind,
+            )
+        };
+        if sid_bytes == 0 || sid_bytes > 1024 || domain_chars > 32768 {
+            return Err(format!(
+                "Could not resolve the startup task's Windows account: {:?}",
+                sized.err()
+            ));
+        }
+        let mut sid_storage =
+            vec![0usize; (sid_bytes as usize).div_ceil(std::mem::size_of::<usize>())];
+        let mut domain = vec![0u16; (domain_chars as usize).max(1)];
+        let sid = PSID(sid_storage.as_mut_ptr().cast());
+        unsafe {
+            LookupAccountNameW(
+                PCWSTR::null(),
+                PCWSTR(name.as_ptr()),
+                Some(sid),
+                &mut sid_bytes,
+                Some(PWSTR(domain.as_mut_ptr())),
+                &mut domain_chars,
+                &mut kind,
+            )
+        }
+        .map_err(|error| {
+            format!("Could not resolve the startup task's Windows account: {error}")
+        })?;
+        if kind != SidTypeUser {
+            return Err("The startup task account is not a Windows user.".into());
+        }
+        let mut text = PWSTR::null();
+        unsafe { ConvertSidToStringSidW(sid, &mut text) }
+            .map_err(|error| format!("Could not convert the startup task account SID: {error}"))?;
+        let text = SidText(text);
+        unsafe { text.0.to_string() }
+            .map_err(|error| format!("Could not decode the startup task account SID: {error}"))
+    }
+
     fn folder() -> Result<ITaskFolder, String> {
         let service: ITaskService =
             unsafe { CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER) }
@@ -311,6 +386,8 @@ mod real {
             })
         };
         let mut identity = get().map_err(|error| format!("The existing task is not a recognized aero-control startup task and was not changed: {error}"))?;
+        identity.principal_sid = account_sid(&identity.principal_sid)?;
+        identity.trigger_sid = account_sid(&identity.trigger_sid)?;
         identity.executable = identity.executable.canonicalize().map_err(|error| {
             format!("The existing task executable cannot be verified and was not changed: {error}")
         })?;
@@ -318,18 +395,65 @@ mod real {
         Ok(identity)
     }
 
-    pub fn enabled() -> Result<bool, String> {
+    #[test]
+    #[ignore = "Requires the interactive user's Windows account environment"]
+    fn scheduler_account_name_and_sid_identify_the_same_user() {
+        let expected = current_sid().unwrap();
+        let user = std::env::var("USERNAME").unwrap();
+        let domain = std::env::var("USERDOMAIN").unwrap();
+        for account in [
+            expected.clone(),
+            user.clone(),
+            format!("{domain}\\{user}"),
+            format!("{domain}\\{user}").to_lowercase(),
+        ] {
+            assert_eq!(account_sid(&account).unwrap(), expected);
+        }
+        assert!(account_sid("").is_err());
+        assert!(account_sid("user\0hidden").is_err());
+        assert!(account_sid(&format!(
+            "{domain}\\AeroControlMissingUser{}",
+            std::process::id()
+        ))
+        .is_err());
+    }
+
+    pub fn status() -> Result<StartupStatus, String> {
         let _com = ComGuard::new()?;
         let sid = current_sid()?;
         let executable = current_executable()?;
         let folder = folder()?;
         let Some(task) = find(&folder, &task_name(&sid)?)? else {
-            return Ok(false);
+            return Ok(StartupStatus {
+                enabled: false,
+                background: true,
+            });
         };
-        validate_identity(&identity(&task)?, &executable, &sid)?;
+        let identity = identity(&task)?;
+        validate_identity(&identity, &executable, &sid)?;
         unsafe { task.Enabled() }
-            .map(|value| value.0 != 0)
+            .map(|value| StartupStatus {
+                enabled: value.0 != 0,
+                background: identity.arguments.trim() == BACKGROUND_ARGUMENT,
+            })
             .map_err(|error| format!("Could not read startup task state: {error}"))
+    }
+
+    #[test]
+    #[ignore = "Requires a registered task and AERO_TEST_STARTUP_EXE pointing to its executable"]
+    fn registered_background_task_passes_the_real_ownership_check() {
+        let _com = ComGuard::new().unwrap();
+        let sid = current_sid().unwrap();
+        let executable = PathBuf::from(std::env::var_os("AERO_TEST_STARTUP_EXE").unwrap())
+            .canonicalize()
+            .unwrap();
+        let task = find(&folder().unwrap(), &task_name(&sid).unwrap())
+            .unwrap()
+            .unwrap();
+        let identity = identity(&task).unwrap();
+        validate_identity(&identity, &executable, &sid).unwrap();
+        assert_eq!(identity.arguments, BACKGROUND_ARGUMENT);
+        assert!(unsafe { task.Enabled() }.unwrap().0 != 0);
     }
 
     pub fn set_enabled(enabled: bool) -> Result<(), String> {
@@ -339,8 +463,33 @@ mod real {
         let folder = folder()?;
         let name = task_name(&sid)?;
         let task = if let Some(task) = find(&folder, &name)? {
-            validate_identity(&identity(&task)?, &executable, &sid)?;
-            task
+            let identity = identity(&task)?;
+            validate_identity(&identity, &executable, &sid)?;
+            if enabled && identity.arguments.trim().is_empty() {
+                // Upgrade only the verified legacy action, and only on an
+                // explicit enable/update request. Preserve all other settings.
+                let update = || -> windows::core::Result<IRegisteredTask> {
+                    let definition = unsafe { task.Definition()? };
+                    let action: IExecAction =
+                        unsafe { definition.Actions()?.get_Item(1)? }.cast()?;
+                    unsafe { action.SetArguments(&BSTR::from(BACKGROUND_ARGUMENT))? };
+                    let empty = VARIANT::default();
+                    unsafe {
+                        folder.RegisterTaskDefinition(
+                            &BSTR::from(name.as_str()),
+                            &definition,
+                            TASK_UPDATE.0,
+                            &empty,
+                            &empty,
+                            TASK_LOGON_INTERACTIVE_TOKEN,
+                            &empty,
+                        )
+                    }
+                };
+                update().map_err(|error| format!("Could not update background startup: {error}"))?
+            } else {
+                task
+            }
         } else if !enabled {
             return Ok(());
         } else {
@@ -363,12 +512,16 @@ mod real {
                 )
             })?
         };
-        // Do not replace or delete a task definition; only toggle this verified task.
+        // Never delete or change unrelated tasks.
         unsafe { task.SetEnabled(VARIANT_BOOL(if enabled { -1 } else { 0 })) }
             .map_err(|error| format!("Could not change logon startup: {error}"))?;
         let confirmed = unsafe { task.Enabled() }
             .map_err(|error| format!("Could not verify logon startup: {error}"))?;
-        if (confirmed.0 != 0) == enabled {
+        let identity = identity(&task)?;
+        validate_identity(&identity, &executable, &sid)?;
+        if (confirmed.0 != 0) == enabled
+            && (!enabled || identity.arguments.trim() == BACKGROUND_ARGUMENT)
+        {
             Ok(())
         } else {
             Err("Task Scheduler did not confirm the requested startup state.".into())
@@ -383,11 +536,17 @@ mod tests {
     #[test]
     fn mock_startup_is_explicit_and_reversible() {
         let mut task = StartupTask::new(true);
-        assert!(!task.enabled().unwrap());
+        assert!(!task.status().unwrap().enabled);
         task.set_enabled(true).unwrap();
-        assert!(task.enabled().unwrap());
+        assert_eq!(
+            task.status().unwrap(),
+            StartupStatus {
+                enabled: true,
+                background: true
+            }
+        );
         task.set_enabled(false).unwrap();
-        assert!(!task.enabled().unwrap());
+        assert!(!task.status().unwrap().enabled);
     }
 
     #[test]
@@ -397,6 +556,7 @@ mod tests {
         assert_eq!(xml.matches("<UserId>S-1-5-21-1000</UserId>").count(), 2);
         assert!(xml.contains("<LogonType>InteractiveToken</LogonType>"));
         assert!(xml.contains("<RunLevel>HighestAvailable</RunLevel>"));
+        assert!(xml.contains("<Arguments>--background</Arguments>"));
         assert!(!xml.contains("Password"));
         assert!(task_name("S-1-5-21-1000")
             .unwrap()
@@ -421,12 +581,19 @@ mod tests {
             trigger_enabled: true,
         };
         assert!(validate_identity(&identity, executable, sid).is_ok());
+        identity.arguments = "--background".into();
+        assert!(validate_identity(&identity, executable, sid).is_ok());
+        identity.arguments = "--background --mock".into();
+        assert!(validate_identity(&identity, executable, sid).is_err());
         identity.arguments = "--unrelated".into();
         assert!(validate_identity(&identity, executable, sid).is_err());
         identity.arguments.clear();
         identity.source = "another app".into();
         assert!(validate_identity(&identity, executable, sid).is_err());
         identity.source = TASK_SOURCE.into();
+        identity.principal_sid = "S-1-5-21-2000".into();
+        assert!(validate_identity(&identity, executable, sid).is_err());
+        identity.principal_sid = sid.into();
         identity.trigger_sid = "S-1-5-21-2000".into();
         assert!(validate_identity(&identity, executable, sid).is_err());
         identity.trigger_sid = sid.into();

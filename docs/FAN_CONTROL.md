@@ -13,7 +13,9 @@ Mode commands follow the AERO 17 YB Control Center manual button paths with AI d
 
 The editor opens on the separate Quiet curve. **Factory** loads the official YB table, including its exact raw duty bytes. **Apply firmware curve** uploads it; if Custom mode is already active, editor changes are applied automatically. Readback compares against the raw bytes sent; a mismatch after retry triggers recovery. See [source notes](SOURCES.md).
 
-At startup, durable fan flags and the thermal profile identify Normal, Quiet, Gaming, Fixed or Max and restore the highlight without sending a mode command. The transient NVIDIA request flag is not used to recognize a fan mode. Ambiguous step/custom configurations remain unknown. Fixed at 100% is indistinguishable from Max in firmware and is labelled Max.
+At startup, durable fan flags and the thermal profile first identify the firmware state. By default, the app then reapplies its last successfully selected fan mode, fixed duty or exact custom curve; it does the same after resume. Initial readings and failed operations are not saved as preferences, and the ten-second Max test is temporary. An older settings file falls back to its active named profile's fan settings. Automatic fan restoration excludes CPU, charging and separate GPU overrides; explicit full-profile automation can take priority. The transient NVIDIA request flag is not used to recognize a fan mode. Ambiguous step/custom configurations remain unknown until a curve is reapplied and verified. Fixed at 100% is indistinguishable from Max in firmware and is labelled Max.
+
+Windows logon startup runs this restoration in the background without creating the control window. The process remains in the notification area to handle resume and future fan changes. This is application-level restoration after sign-in, not permanent firmware storage or pre-login restoration. Opening the app later attaches its window to the same controller; it does not rerun startup restoration.
 
 What the upload does, and Control Center does not:
 

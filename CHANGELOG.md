@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1 — 2026-11-08
+
+- Remember successful fan-mode changes, fixed duties and exact custom curves automatically, and restore them when the app opens or resumes from sleep, matching Control Center's manual fan lifecycle.
+- Migrate existing settings using the active profile's fan settings without enabling CPU or charging automation. Full-profile rules remain optional and take priority when enabled.
+- Keep failed commands, startup readbacks and the temporary Max test out of fan-mode memory. Resolve queued resume restoration from the latest confirmed preference.
+- Clarify fan restoration and Windows logon startup on Profiles. Invalid settings files continue to block automatic writes.
+- Start silently at Windows sign-in, restoring the fan preference without creating the control window. Keep a tray icon for opening the app, resume handling and Exit; report startup failures visibly.
+- Prevent duplicate Windows controllers: an interactive second launch opens the existing copy, while a repeated background launch stays silent. Existing startup tasks can be upgraded to background launch from Profiles.
+- Resolve Task Scheduler account names to Windows user IDs before checking ownership, so Windows' normalization of a logon trigger cannot falsely reject the app's own task.
+
 ## 0.2.0 — 2026-11-01
 
 First documented pre-release for the AERO 17 YB / P77YB / BIOS FB10 reference hardware.

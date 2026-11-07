@@ -14,7 +14,7 @@ Fixed sets the same duty for both fans. The normal fixed-duty floor is 35%; Expe
 
 On Curve, Factory loads the official reference YB table; the quiet reference curve is a separate preset. Editing a preview does not apply it until **Apply firmware curve**. When Custom is active, valid edits apply automatically after editing finishes. The complete table is written and read back. An unused slot is a `(0, 0)` terminator, so such points cannot appear inside a user curve.
 
-At restart, the app recognizes durable fan flags and thermal settings without writing a mode. A matching Fixed 100% state is labelled Max because those configurations are indistinguishable. Step control without enough evidence for a particular curve remains unknown.
+On opening, the app first reads the durable fan flags and thermal settings to identify the current firmware state. It then restores the remembered fan preference by default. A matching Fixed 100% state is labelled Max because those configurations are indistinguishable. Step control without enough evidence for a particular curve remains unknown until a remembered custom curve is successfully reapplied.
 
 ## Power controls
 
@@ -28,17 +28,23 @@ CPU controls show the reference sustained and short-burst limits. Select a suppo
 
 **Save current** captures settings without applying them. Built-in profile names cannot be overwritten. A GPU request is captured only if this session sent one; the app does not manufacture a current level from a cleared flag.
 
-Automation options are separate opt-ins: startup apply, charger/battery switching, resume reapply, tray operation and native Fn handling. Saving automation settings does not immediately apply a profile. Display refresh-rate switching is also opt-in and tied to a selected monitor's identity.
+Successful fan changes are saved automatically, including raw fixed duty and custom-curve bytes. **Restore the last fan mode when the app opens and after sleep** is enabled by default on Profiles. Fan-only restoration sends the mode's normal firmware/GPU sequence and leaves CPU presets, charging settings and separate GPU overrides alone. Failed commands, initial firmware readings and the temporary ten-second Max test do not replace the saved preference. Existing settings use their last applied named profile's fan settings until the next successful fan change is remembered.
 
-The optional Windows logon task launches this executable at its current path with administrator privileges. Keep a release in a permanent folder before enabling that task. If moving an installation, disable the startup task using the old copy and recreate it from the new copy. No task is created automatically.
+Full-profile startup/resume apply, charger/battery switching and native Fn handling remain separate opt-ins. Tray operation is optional for manual launches and automatic for Windows background startup. Enabled full-profile rules take priority over fan-only restoration. Saving automation settings does not immediately apply a profile. Display refresh-rate switching is also opt-in and tied to a selected monitor's identity.
+
+For cold-boot restoration, use **Profiles → Start with Windows → Enable logon startup**. The task starts this executable with `--background` and administrator privileges after signing in. It restores the saved preference without creating the control window and keeps a notification icon for opening the app or exiting. You do not need to launch the app manually, enable "Start in the notification area", or run Gigabyte Control Center. Restoration occurs after Windows sign-in, not before login or while the laptop is off. It requires this background process; the preference is not stored permanently in the firmware.
+
+Keep a release in a permanent folder before enabling startup. If an older task says it opens the window, choose **Use background startup**. If moving an installation, disable the task using the old copy and recreate it from the new copy. No task is created merely by opening the app. For deployment, `aero-gui.exe --enable-startup` registers or upgrades the task and exits without touching fan hardware; `--disable-startup` disables it.
+
+Opening aero-control again brings up the running controller instead of starting a second one. Startup failures, invalid saved settings or an unavailable tray icon open the window so the problem is visible. Simulation has no real tray icon and falls back to a visible window.
 
 Profiles may use `cpu_power_preset` values `level-1` through `level-5`, `default` or `battery`. Legacy `cpu_pl1_w` / `cpu_pl2_w` entries are retained as data but do not apply arbitrary CPU limits; do not combine them with a preset. CPU is applied before a profile's firmware writes. CPU failure prevents those writes. If firmware application later fails, its recovery runs and the already-applied CPU preset remains, as the report explains.
 
 ## Closing the app
 
-With tray operation enabled and a registered icon, closing the window can hide it instead of exiting. Use the tray's Exit command to end the session. Background automation needs the app running.
+With tray operation enabled and a registered icon, closing the window hides it instead of exiting. Windows background startup always uses this behaviour for its running session. Use the tray's Exit command to end the session. Background automation needs the app running; exiting stops resume handling until the next launch or Windows sign-in. Disabling the startup task prevents future automatic launches but does not stop the current session.
 
-Normal, Quiet, Gaming and an uploaded hardware curve run in firmware. Normal exit attempts the Normal sequence after Fixed or Max. Recovery can fail and cannot run after a force-kill or crash. CPU limits are not automatically restored on exit. Keyboard lighting can remain in the device after closing.
+Normal, Quiet, Gaming and an uploaded hardware curve run in firmware. Normal exit attempts the Normal sequence after Fixed or Max. This cleanup does not erase the remembered preference: reopening restores Fixed or Max if that was the last successful selection and fan restoration remains enabled. Recovery can fail and cannot run after a force-kill or crash. CPU limits are not automatically restored on exit. Keyboard lighting can remain in the device after closing.
 
 ## System and keyboard
 

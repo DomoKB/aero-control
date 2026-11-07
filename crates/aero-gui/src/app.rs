@@ -92,7 +92,7 @@ pub struct AeroApp {
     desktop: crate::desktop_events::DesktopEvents,
     startup_checked: bool,
     last_power_source: Option<bool>,
-    queued_profile: Option<(aero_core::Profile, aero_core::ApplyReason)>,
+    queued_profile: Option<QueuedApply>,
     pending_profile_name: Option<String>,
     last_resume: Option<Instant>,
     tray_requested: bool,
@@ -103,6 +103,24 @@ pub struct AeroApp {
     startup_hide_pending: bool,
     hotkey_restore: Option<aero_core::Profile>,
     startup: startup::StartupTab,
+    background_launch: bool,
+    open_window_requested: bool,
+    // Drop ownership only after the hardware session and desktop worker stop.
+    instance: crate::instance::Instance,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum BackgroundAction {
+    Wait,
+    Open,
+    Exit,
+}
+
+enum QueuedApply {
+    Profile(aero_core::Profile, aero_core::ApplyReason),
+    // Resolve the latest preference only when the worker is free, so a resume
+    // during a user command cannot later restore a stale fan mode.
+    FanRestore(aero_core::ApplyReason),
 }
 
 const MODES: [(&str, FanMode, &str); 6] = [
@@ -210,8 +228,11 @@ impl History {
 }
 
 impl AeroApp {
-    pub fn new(cc: &eframe::CreationContext<'_>, choice: BackendChoice) -> Self {
-        install_theme(&cc.egui_ctx);
+    pub fn new(
+        choice: BackendChoice,
+        background: bool,
+        instance: crate::instance::Instance,
+    ) -> Self {
         let mock = matches!(choice, BackendChoice::Mock);
         let points = aero_core::quiet_curve().points().to_vec();
         let issues = issues(&points);
@@ -232,7 +253,7 @@ impl AeroApp {
             .unwrap_or_else(|| crate::device_identity::read(mock));
         let system = SystemPower::new(mock);
         let profiles = profiles::ProfilesTab::new(mock);
-        let startup_hide_pending = profiles.settings().start_minimized;
+        let startup_hide_pending = !background && profiles.settings().start_minimized;
         let mut display = display_controls::DisplayTab::new(mock);
         // Invalid saved files fall back to opt-in defaults in ProfilesTab.
         let _ = display.set_settings(profiles.settings().display.clone());
@@ -294,6 +315,9 @@ impl AeroApp {
             startup_hide_pending,
             hotkey_restore: None,
             startup: startup::StartupTab::new(mock),
+            background_launch: background,
+            open_window_requested: false,
+            instance,
         };
         if let Some(snapshot) = initial {
             app.apply_snapshot(snapshot);
@@ -316,6 +340,43 @@ impl AeroApp {
         app
     }
 
+    pub fn attach_window(&mut self, ctx: &egui::Context) {
+        install_theme(ctx);
+    }
+
+    /// No native control window or renderer exists during this loop. The same
+    /// session and automation state are moved into the GUI when it is opened.
+    pub fn poll_background(&mut self, ctx: &egui::Context) -> BackgroundAction {
+        let _ = ctx.run(Default::default(), |ctx| {
+            self.poll_session();
+            self.poll_automation(ctx);
+        });
+        if self.exit_requested {
+            BackgroundAction::Exit
+        } else if self.open_window_requested
+            || self.report_error
+            || self.profiles.load_error().is_some()
+            || !self.session.writes_enabled
+            || self.desktop.last_error().is_some()
+            || (!self.desktop.can_hide_to_tray()
+                && self.started.elapsed() > Duration::from_secs(10))
+        {
+            // Fail visibly instead of leaving an inaccessible process or a
+            // silently failed restoration in the notification area.
+            BackgroundAction::Open
+        } else {
+            BackgroundAction::Wait
+        }
+    }
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.open_window_requested = true;
+        self.startup_hide_pending = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
     fn poll_session(&mut self) {
         while let Some(event) = self.session.poll() {
             if let Some(request) = &event.gpu_request {
@@ -332,16 +393,17 @@ impl AeroApp {
             if let Some(snapshot) = event.sensors {
                 self.apply_snapshot(snapshot);
             }
-            self.fan_apply.complete(event.fan_result);
+            let remembered_fan = self.fan_apply.complete(event.fan_result);
             if fresh_power && event.fan_result != Some(false) {
                 self.reconcile_fan_readback();
             }
             if let Some(succeeded) = event.fan_result {
-                if let Some(name) = self.pending_profile_name.take() {
-                    if succeeded {
-                        if let Err(error) = self.profiles.mark_applied(&name) {
+                let name = self.pending_profile_name.take();
+                if succeeded {
+                    if let Some(profile) = remembered_fan {
+                        if let Err(error) = self.profiles.remember_fan(profile, name.as_deref()) {
                             self.report = format!(
-                                "Profile applied, but saving its selection failed: {error}"
+                                "Fan settings applied, but remembering them failed: {error}"
                             );
                             self.report_error = true;
                             continue;
@@ -573,32 +635,10 @@ impl AeroApp {
     }
 
     fn capture_profile(&self, name: String) -> Option<aero_core::Profile> {
-        let mode = self.fan_apply.active_mode?;
-        let mut profile = aero_core::builtin_config().profile("Normal")?.clone();
-        profile.name = name;
+        let mut profile = self.fan_apply.fan_profile(name)?;
         profile.cpu_power_preset = self.cpu_power.confirmed_preset();
-        profile.fan_mode = mode;
-        profile.notes = "Saved from confirmed fan settings in aero-control.".into();
         profile.expert_mode =
             self.expert || self.fan_apply.applied_fixed_raw.is_some_and(|raw| raw < 80);
-        if mode == FanMode::Fixed {
-            profile.fixed_duty_raw = self.fan_apply.applied_fixed_raw;
-        }
-        if mode == FanMode::Custom {
-            if self.fan_apply.applied_curve.is_empty() {
-                return None;
-            }
-            profile.curve = self
-                .fan_apply
-                .applied_curve
-                .iter()
-                .map(|point| aero_core::CurvePointToml {
-                    temp_c: point.temp_c,
-                    duty_percent: Some(aero_core::raw_to_percent(point.duty_raw)),
-                    duty_raw: Some(point.duty_raw),
-                })
-                .collect();
-        }
         if let Some(power) = &self.firmware_power {
             profile.nv_power_config = self.last_gpu_request.map(u8::from);
             profile.nv_thermal_target = power
@@ -668,15 +708,21 @@ impl AeroApp {
             banner(ui, &error, WARN);
         }
         ui.add_space(12.0);
+        if self.background_launch {
+            ui.label("Started with Windows: this session stays in the notification area when closed. Choose Exit from its tray menu to stop it.");
+        }
         self.startup.ui(ui);
     }
 
     fn poll_automation(&mut self, ctx: &egui::Context) {
+        if self.instance.take_show_request() {
+            self.show_window(ctx);
+        }
         if let Some((message, error)) = self.controls.poll_background() {
             self.report = message;
             self.report_error = error;
         }
-        let tray_requested = self.profiles.settings().keep_in_tray;
+        let tray_requested = self.background_launch || self.profiles.settings().keep_in_tray;
         if tray_requested != self.tray_requested {
             self.desktop.set_tray_enabled(tray_requested);
             self.tray_requested = tray_requested;
@@ -705,9 +751,7 @@ impl AeroApp {
                     self.battery = self.system.battery()
                 }
                 crate::desktop_events::DesktopEvent::Show => {
-                    self.startup_hide_pending = false;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    self.show_window(ctx);
                 }
                 crate::desktop_events::DesktopEvent::FanMode(mode) => self.apply_firmware(mode),
                 crate::desktop_events::DesktopEvent::FanHotkey => {
@@ -782,7 +826,13 @@ impl AeroApp {
             self.startup_checked = true;
             self.last_power_source = on_ac;
             if let Some(profile) = self.profiles.startup_profile(on_ac) {
-                self.queued_profile = Some((profile, aero_core::ApplyReason::Startup));
+                self.queued_profile = Some(QueuedApply::Profile(
+                    profile,
+                    aero_core::ApplyReason::Startup,
+                ));
+            } else {
+                self.queued_profile =
+                    Some(QueuedApply::FanRestore(aero_core::ApplyReason::Startup));
             }
         } else if let Some(on_ac) = on_ac {
             if self
@@ -790,7 +840,10 @@ impl AeroApp {
                 .is_some_and(|previous| previous != on_ac)
             {
                 if let Some(profile) = self.profiles.automation_profile(on_ac) {
-                    self.queued_profile = Some((profile, aero_core::ApplyReason::AcDcChanged));
+                    self.queued_profile = Some(QueuedApply::Profile(
+                        profile,
+                        aero_core::ApplyReason::AcDcChanged,
+                    ));
                 }
             }
             self.last_power_source = Some(on_ac);
@@ -806,12 +859,27 @@ impl AeroApp {
                 .profiles
                 .resume_profile(self.battery.and_then(|battery| battery.on_ac))
             {
-                self.queued_profile = Some((profile, aero_core::ApplyReason::Resume));
+                self.queued_profile = Some(QueuedApply::Profile(
+                    profile,
+                    aero_core::ApplyReason::Resume,
+                ));
+            } else if !matches!(self.queued_profile, Some(QueuedApply::Profile(_, _))) {
+                self.queued_profile = Some(QueuedApply::FanRestore(aero_core::ApplyReason::Resume));
             }
         }
         if self.writes_allowed() {
-            if let Some((profile, reason)) = self.queued_profile.take() {
-                self.apply_saved_profile(profile, reason);
+            if let Some(request) = self.queued_profile.take() {
+                match request {
+                    QueuedApply::Profile(profile, reason) => {
+                        self.apply_saved_profile(profile, reason)
+                    }
+                    QueuedApply::FanRestore(reason) => {
+                        if let Some(profile) = self.profiles.fan_restore_profile() {
+                            self.apply_saved_profile(profile, reason);
+                            self.pending_profile_name = None;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1165,6 +1233,7 @@ impl AeroApp {
             if self.arm_max_test {
                 self.busy = true;
                 self.fan_apply.pending_mode = Some(FanMode::Normal);
+                self.fan_apply.pending_temporary = true;
                 self.session.max_test();
                 self.arm_max_test = false;
                 self.arm_max = false;
@@ -2152,4 +2221,111 @@ fn parse_rpm(text: &str) -> Option<f32> {
         .trim_end_matches('?')
         .parse()
         .ok()
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::*;
+
+    fn app() -> AeroApp {
+        let instance = crate::instance::Instance::acquire(true, true)
+            .unwrap()
+            .unwrap();
+        AeroApp::new(BackendChoice::Mock, true, instance)
+    }
+
+    fn finish(app: &mut AeroApp, ctx: &egui::Context, mode: FanMode) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert_eq!(
+                app.poll_background(ctx),
+                BackgroundAction::Wait,
+                "report: {}; desktop: {:?}",
+                app.report,
+                app.desktop.last_error()
+            );
+            if !app.busy
+                && app.fan_apply.pending_mode.is_none()
+                && app.fan_apply.active_mode == Some(mode)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "{}", app.report);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn background_start_and_resume_restore_gaming_without_opening_a_window() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        let gaming = aero_core::builtin_config()
+            .profile("Gaming")
+            .unwrap()
+            .clone();
+        app.profiles.remember_fan(gaming, None).unwrap();
+        assert!(!app.profiles.settings().keep_in_tray);
+        finish(&mut app, &ctx, FanMode::Gaming);
+        assert!(app.tray_requested);
+        assert_eq!(app.last_gpu_request, Some(true));
+        assert!(!app.open_window_requested);
+
+        // Simulate firmware reset independently of the saved user preference.
+        app.session.apply(FanMode::Normal, 0, false);
+        finish(&mut app, &ctx, FanMode::Normal);
+        assert_eq!(
+            app.profiles.fan_restore_profile().unwrap().fan_mode,
+            FanMode::Gaming
+        );
+        app.desktop
+            .inject_event(crate::desktop_events::DesktopEvent::Resume);
+        finish(&mut app, &ctx, FanMode::Gaming);
+        assert!(!app.open_window_requested);
+
+        app.desktop
+            .inject_event(crate::desktop_events::DesktopEvent::Show);
+        assert_eq!(app.poll_background(&ctx), BackgroundAction::Open);
+        // Opening uses this existing session; it does not rerun restoration.
+        assert!(app.startup_checked);
+        assert!(app.queued_profile.is_none());
+    }
+
+    #[test]
+    fn background_exit_and_errors_do_not_leave_an_inaccessible_controller() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        finish(&mut app, &ctx, FanMode::Normal);
+        app.report_error = true;
+        assert_eq!(app.poll_background(&ctx), BackgroundAction::Open);
+        app.desktop
+            .inject_event(crate::desktop_events::DesktopEvent::Exit);
+        assert_eq!(app.poll_background(&ctx), BackgroundAction::Exit);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "Requires an interactive Windows desktop for the real notification icon"]
+    fn native_tray_keeps_mock_restoration_accessible_without_a_control_window() {
+        let mut app = app();
+        // Exercise the real desktop/tray integration, with all hardware and
+        // saved settings still isolated in the mock backend.
+        app.desktop = crate::desktop_events::DesktopEvents::new(false);
+        let ctx = egui::Context::default();
+        let gaming = aero_core::builtin_config()
+            .profile("Gaming")
+            .unwrap()
+            .clone();
+        app.profiles.remember_fan(gaming, None).unwrap();
+        finish(&mut app, &ctx, FanMode::Gaming);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !app.desktop.can_hide_to_tray() {
+            assert_eq!(app.poll_background(&ctx), BackgroundAction::Wait);
+            assert!(Instant::now() < deadline, "{:?}", app.desktop.last_error());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!app.open_window_requested);
+        app.desktop
+            .inject_event(crate::desktop_events::DesktopEvent::Show);
+        assert_eq!(app.poll_background(&ctx), BackgroundAction::Open);
+    }
 }

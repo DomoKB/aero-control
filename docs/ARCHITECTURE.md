@@ -18,7 +18,7 @@ Keyboard lighting uses native Windows HID access. Windows power, audio, display,
 | `aero-proto` | Versioned messages for possible future inter-process use |
 | `aero-svc` | In-process request dispatcher; the Windows service/pipe host is not implemented |
 
-`profiles/config.toml` is an example configuration, not an automatic installation or startup policy. Per-user profile automation defaults to off.
+`profiles/config.toml` is an example configuration, not an automatic installation or startup policy. Per-user full-profile automation defaults to off. Fan-only restoration defaults to on and uses a separate `last_fan` snapshot; older settings fall back to the fan part of their active profile.
 
 ## Firmware execution
 
@@ -40,7 +40,9 @@ The bridge checks the installed SDK's signature, CPU identity, platform compatib
 
 Fan completion, CPU results and GPU requests are separate event fields. UI drafts are kept apart from confirmed readings. Profiles use per-user TOML with validation and atomic replacement; invalid files are preserved and do not enable automation. Settings and imports do not overwrite Control Center's registry data.
 
-Automation, hotkeys, minimized launch and tray behaviour are explicit opt-ins. Window hiding requires confirmed icon registration. Startup uses a per-user scheduled task pointing to this executable. No aero-control Windows service is installed, so ongoing automation ends with the process.
+Verified fan completions update `last_fan` atomically with any named-profile selection. Initial readbacks, progress events, failed writes and temporary Max tests cannot replace it. The snapshot contains fan settings only. Startup/resume restoration resolves the latest snapshot after any in-flight command completes, avoiding stale resume requests. Full-profile automation and hotkeys remain explicit opt-ins. No aero-control Windows service is installed, so ongoing automation ends with the process.
+
+The per-user logon task passes `--background`. This path polls the same session/automation state without creating an eframe control window or renderer. It registers the native tray icon and handles resume broadcasts. Open requests move that same app into eframe; errors fall back to the visible UI. Background launches always keep the tray available. Manual launches retain the saved tray/minimized preferences. A session-local named mutex excludes duplicate controllers; an auto-reset event brings up the existing instance on a second manual launch. Mock instances use a separate name. The guard outlives the hardware worker. Legacy tasks are recognized, but their arguments change only through an explicit enable/upgrade request after ownership and action validation.
 
 ## Verification boundaries
 

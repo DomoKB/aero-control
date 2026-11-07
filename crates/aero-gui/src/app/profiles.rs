@@ -24,6 +24,7 @@ pub struct ProfilesTab {
     load_error: Option<String>,
     selected: String,
     new_name: String,
+    restore_fan_draft: bool,
     startup_draft: bool,
     switch_draft: bool,
     resume_draft: bool,
@@ -38,6 +39,10 @@ pub struct ProfilesTab {
 }
 
 impl ProfilesTab {
+    pub fn load_error(&self) -> Option<&str> {
+        self.load_error.as_deref()
+    }
+
     pub fn new(mock: bool) -> Self {
         let (path, result) = if mock {
             (None, Ok(SavedProfiles::default()))
@@ -57,6 +62,7 @@ impl ProfilesTab {
         Self {
             selected: saved.config.active.clone(),
             new_name: String::new(),
+            restore_fan_draft: saved.restore_fan_mode,
             startup_draft: saved.apply_at_startup,
             switch_draft: saved.switch_on_power_change,
             resume_draft: saved.reapply_on_resume,
@@ -76,6 +82,17 @@ impl ProfilesTab {
 
     pub fn settings(&self) -> &SavedProfiles {
         &self.saved
+    }
+
+    pub fn fan_restore_profile(&self) -> Option<Profile> {
+        if self.load_error.is_some() || !self.saved.restore_fan_mode {
+            return None;
+        }
+        self.saved
+            .last_fan
+            .as_ref()
+            .or_else(|| self.saved.config.profile(&self.saved.config.active))
+            .map(profile_store::fan_only)
     }
 
     pub fn save_display_settings(
@@ -170,10 +187,20 @@ impl ProfilesTab {
         result
     }
 
-    /// Call only after a profile apply succeeds, not after the request is queued.
-    pub fn mark_applied(&mut self, name: &str) -> Result<(), String> {
+    /// Called only after verification. Temporary fan tests never reach this path.
+    pub fn remember_fan(
+        &mut self,
+        profile: Profile,
+        applied_profile_name: Option<&str>,
+    ) -> Result<(), String> {
         let mut next = self.saved.clone();
-        next.config.active = name.to_string();
+        next.last_fan = Some(profile_store::fan_only(&profile));
+        if let Some(name) = applied_profile_name {
+            next.config.active = name.to_string();
+        }
+        if next == self.saved {
+            return Ok(());
+        }
         self.commit(next)
     }
 
@@ -225,6 +252,7 @@ impl ProfilesTab {
                     match profile_store::load(path) {
                         Ok(saved) => {
                             self.selected = saved.config.active.clone();
+                            self.restore_fan_draft = saved.restore_fan_mode;
                             self.startup_draft = saved.apply_at_startup;
                             self.switch_draft = saved.switch_on_power_change;
                             self.resume_draft = saved.reapply_on_resume;
@@ -306,12 +334,19 @@ impl ProfilesTab {
         ui.add_space(12.0);
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            section_title(ui, "Automatic switching");
-            ui.label("Automation runs while this app is open. It starts disabled and never runs a temperature-based fan loop.");
+            section_title(ui, "Fan mode memory and automatic switching");
+            ui.label("Successful fan changes are remembered automatically, including fixed speeds and custom curves. The ten-second Max test does not replace this preference.");
             ui.add_enabled_ui(self.load_error.is_none(), |ui| {
-                ui.checkbox(&mut self.startup_draft, "Apply saved profile when the app opens");
+                ui.checkbox(&mut self.restore_fan_draft, "Restore the last fan mode when the app opens and after sleep");
+                if let Some(profile) = self.saved.last_fan.as_ref().or_else(|| self.saved.config.profile(&self.saved.config.active)) {
+                    ui.label(RichText::new(format!("Remembered fan mode: {:?}", profile.fan_mode)).color(MUTED));
+                }
+                ui.label("Fan restoration leaves CPU presets and charging settings alone. Enable Windows startup below to restore it automatically after signing in.");
+                ui.add_space(8.0);
+                ui.label("Optional full-profile rules take priority over fan-only restoration:");
+                ui.checkbox(&mut self.startup_draft, "Apply the full saved profile when the app opens");
                 ui.checkbox(&mut self.switch_draft, "Switch profile when the charger is connected or disconnected");
-                ui.checkbox(&mut self.resume_draft, "Reapply the saved profile after sleep");
+                ui.checkbox(&mut self.resume_draft, "Reapply the full saved profile after sleep");
                 ui.checkbox(&mut self.tray_draft, "Keep running in the notification area when the window is closed");
                 if !self.tray_draft {
                     self.minimized_draft = false;
@@ -331,6 +366,7 @@ impl ProfilesTab {
                 power_profile_choice(ui, "battery_profile", "On battery", &mut self.dc_draft, &names);
                 if ui.add(secondary_button("Save automation")).clicked() {
                     let mut next = self.saved.clone();
+                    next.restore_fan_mode = self.restore_fan_draft;
                     next.apply_at_startup = self.startup_draft;
                     next.switch_on_power_change = self.switch_draft;
                     next.reapply_on_resume = self.resume_draft;
@@ -441,6 +477,7 @@ mod tests {
         assert!(tab.startup_profile(Some(true)).is_none());
         assert!(tab.automation_profile(true).is_none());
         assert!(tab.resume_profile(Some(false)).is_none());
+        assert!(tab.fan_restore_profile().is_none());
     }
 
     #[test]
@@ -452,5 +489,119 @@ mod tests {
         assert_eq!(tab.automation_profile(true).unwrap().name, "Gaming");
         assert_eq!(tab.resume_profile(Some(false)).unwrap().name, "Quiet");
         assert!(tab.startup_profile(Some(true)).is_none());
+    }
+
+    #[test]
+    fn fan_memory_is_independent_of_named_profile_selection_and_full_automation() {
+        let mut tab = ProfilesTab::new(true);
+        let gaming = tab.saved.config.profile("Gaming").unwrap().clone();
+        tab.remember_fan(gaming, None).unwrap();
+        assert_eq!(tab.saved.config.active, "Normal");
+        assert!(!tab.saved.apply_at_startup && !tab.saved.reapply_on_resume);
+        assert_eq!(tab.fan_restore_profile().unwrap().fan_mode, FanMode::Gaming);
+        let quiet = tab.saved.config.profile("Quiet").unwrap().clone();
+        tab.remember_fan(quiet, Some("Quiet")).unwrap();
+        assert_eq!(tab.saved.config.active, "Quiet");
+        assert_eq!(tab.fan_restore_profile().unwrap().fan_mode, FanMode::Quiet);
+        tab.saved.restore_fan_mode = false;
+        assert!(tab.fan_restore_profile().is_none());
+    }
+
+    #[test]
+    fn upgrade_restores_only_the_fan_part_of_the_legacy_active_profile() {
+        let mut tab = ProfilesTab::new(true);
+        tab.saved.config.active = "Gaming".into();
+        let profile = tab
+            .saved
+            .config
+            .profiles
+            .iter_mut()
+            .find(|p| p.name == "Gaming")
+            .unwrap();
+        profile.cpu_power_preset = Some(aero_core::CpuPowerPreset::Level5);
+        profile.charge_policy = Some(4);
+        profile.charge_limit = Some(80);
+        let fan = tab.fan_restore_profile().unwrap();
+        assert_eq!(fan.fan_mode, FanMode::Gaming);
+        assert_eq!(fan.cpu_power_preset, None);
+        assert_eq!(fan.charge_policy, None);
+        tab.saved.apply_at_startup = true;
+        assert_eq!(
+            tab.startup_profile(None).unwrap().cpu_power_preset,
+            Some(aero_core::CpuPowerPreset::Level5)
+        );
+    }
+
+    #[test]
+    fn a_simulated_cold_boot_reapplies_gaming_from_the_persisted_preference() {
+        use crate::session::{BackendChoice, FanSession};
+        use std::time::{Duration, Instant};
+
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "fan-boot-{}-{}.toml",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        let mut tab = ProfilesTab::new(true);
+        tab.path = Some(path.clone());
+        let mut apply = crate::app::apply_state::ApplyState {
+            pending_mode: Some(FanMode::Gaming),
+            ..Default::default()
+        };
+        tab.remember_fan(apply.complete(Some(true)).unwrap(), None)
+            .unwrap();
+        let mut restarted = ProfilesTab::new(true);
+        restarted.saved = profile_store::load(&path).unwrap();
+        let session = FanSession::start(BackendChoice::Mock);
+        assert_eq!(
+            session
+                .initial_sensors
+                .as_ref()
+                .unwrap()
+                .power
+                .as_ref()
+                .unwrap()
+                .fan_state
+                .as_ref()
+                .unwrap()
+                .mode,
+            FanMode::Normal
+        );
+        session.profile(
+            restarted.fan_restore_profile().unwrap(),
+            aero_core::ApplyReason::Startup,
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let result = loop {
+            if let Some(event) = session.poll() {
+                if event.fan_result.is_some() {
+                    break event;
+                }
+            }
+            assert!(Instant::now() < deadline, "Fan restoration timed out");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(result.fan_result, Some(true));
+        assert_eq!(result.gpu_request, Some(Ok(true)));
+        assert!(result.cpu_power.is_none());
+        assert_eq!(
+            result
+                .sensors
+                .unwrap()
+                .power
+                .unwrap()
+                .fan_state
+                .unwrap()
+                .mode,
+            FanMode::Gaming
+        );
+        drop(session);
+        std::fs::remove_file(path).unwrap();
     }
 }

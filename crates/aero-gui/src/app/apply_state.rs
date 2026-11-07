@@ -1,6 +1,6 @@
 //! Confirmed fan state and the request currently waiting for verification.
 
-use aero_core::{CurvePoint, FanMode};
+use aero_core::{CurvePoint, CurvePointToml, FanMode, Profile};
 
 #[derive(Default)]
 pub(super) struct ApplyState {
@@ -10,6 +10,7 @@ pub(super) struct ApplyState {
     pub pending_curve: Option<Vec<CurvePoint>>,
     pub applied_fixed_raw: Option<u8>,
     pub pending_fixed_raw: Option<u8>,
+    pub pending_temporary: bool,
 }
 
 impl ApplyState {
@@ -39,11 +40,12 @@ impl ApplyState {
     }
 
     /// Progress, sensor and power events have no fan completion result.
-    pub fn complete(&mut self, result: Option<bool>) {
-        let Some(succeeded) = result else { return };
+    pub fn complete(&mut self, result: Option<bool>) -> Option<Profile> {
+        let succeeded = result?;
         let Some(mode) = self.pending_mode.take() else {
-            return;
+            return None;
         };
+        let temporary = std::mem::take(&mut self.pending_temporary);
         let curve = self.pending_curve.take();
         let fixed_raw = self.pending_fixed_raw.take();
         if succeeded {
@@ -58,6 +60,38 @@ impl ApplyState {
             self.applied_curve.clear();
             self.applied_fixed_raw = None;
         }
+        if succeeded && !temporary {
+            self.fan_profile("Last fan settings".into())
+        } else {
+            None
+        }
+    }
+
+    pub fn fan_profile(&self, name: String) -> Option<Profile> {
+        let mode = self.active_mode?;
+        let mut profile = aero_core::builtin_config().profile("Normal")?.clone();
+        profile.name = name;
+        profile.fan_mode = mode;
+        profile.notes = "Saved from confirmed fan settings in aero-control.".into();
+        if mode == FanMode::Fixed {
+            profile.fixed_duty_raw = Some(self.applied_fixed_raw?);
+            profile.expert_mode = self.applied_fixed_raw.is_some_and(|raw| raw < 80);
+        }
+        if mode == FanMode::Custom {
+            if self.applied_curve.is_empty() {
+                return None;
+            }
+            profile.curve = self
+                .applied_curve
+                .iter()
+                .map(|point| CurvePointToml {
+                    temp_c: point.temp_c,
+                    duty_percent: Some(aero_core::raw_to_percent(point.duty_raw)),
+                    duty_raw: Some(point.duty_raw),
+                })
+                .collect();
+        }
+        Some(profile)
     }
 }
 
@@ -132,7 +166,7 @@ mod tests {
             pending_curve: Some(requested_curve()),
             ..Default::default()
         };
-        state.complete(None);
+        assert!(state.complete(None).is_none());
         assert_eq!(state.active_mode, Some(FanMode::Normal));
         assert_eq!(state.pending_mode, Some(FanMode::Custom));
         assert_eq!(state.applied_curve, previous);
@@ -146,7 +180,10 @@ mod tests {
             pending_curve: Some(curve.clone()),
             ..Default::default()
         };
-        state.complete(Some(true));
+        let remembered = state.complete(Some(true)).unwrap();
+        assert_eq!(remembered.fan_curve().unwrap().points(), curve);
+        assert_eq!(remembered.cpu_power_preset, None);
+        assert_eq!(remembered.charge_policy, None);
         assert_eq!(state.active_mode, Some(FanMode::Custom));
         assert_eq!(state.applied_curve, curve);
         assert!(state.pending_mode.is_none());
@@ -162,10 +199,57 @@ mod tests {
             pending_curve: Some(requested_curve()),
             ..Default::default()
         };
-        state.complete(Some(false));
+        assert!(state.complete(Some(false)).is_none());
         assert!(state.active_mode.is_none());
         assert!(state.pending_mode.is_none());
         assert!(state.pending_curve.is_none());
         assert!(state.applied_curve.is_empty());
+    }
+
+    #[test]
+    fn fixed_duty_memory_uses_verified_raw_bytes_and_preserves_expert_floor() {
+        let mut state = ApplyState {
+            active_mode: Some(FanMode::Fixed),
+            applied_fixed_raw: Some(114),
+            pending_mode: Some(FanMode::Fixed),
+            pending_fixed_raw: Some(79),
+            ..Default::default()
+        };
+        let profile = state.complete(Some(true)).unwrap();
+        assert_eq!(profile.fan_mode, FanMode::Fixed);
+        assert_eq!(profile.fixed_duty_raw, Some(79));
+        assert!(profile.expert_mode);
+        assert!(crate::profile_store::validate_profile(&profile).is_ok());
+        assert!(state.complete(Some(true)).is_none());
+    }
+
+    #[test]
+    fn max_test_completion_updates_the_display_without_replacing_the_preference() {
+        let mut state = ApplyState {
+            active_mode: Some(FanMode::Gaming),
+            pending_mode: Some(FanMode::Normal),
+            pending_temporary: true,
+            ..Default::default()
+        };
+        assert!(state.complete(None).is_none());
+        assert!(state.pending_temporary);
+        assert!(state.complete(Some(true)).is_none());
+        assert_eq!(state.active_mode, Some(FanMode::Normal));
+        assert!(!state.pending_temporary);
+        state.pending_mode = Some(FanMode::Quiet);
+        assert_eq!(state.complete(Some(true)).unwrap().fan_mode, FanMode::Quiet);
+    }
+
+    #[test]
+    fn a_readback_without_a_local_command_never_becomes_a_saved_preference() {
+        let mut state = ApplyState::from_readback(&crate::fan_state::RecognizedFanState {
+            mode: FanMode::Normal,
+            fixed_raw: None,
+            note: None,
+        });
+        assert!(state.complete(None).is_none());
+        assert!(state.complete(Some(true)).is_none());
+        state.active_mode = Some(FanMode::Custom);
+        assert!(state.fan_profile("Unknown curve".into()).is_none());
     }
 }

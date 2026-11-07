@@ -14,6 +14,8 @@ static SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SavedProfiles {
     pub config: Config,
+    pub restore_fan_mode: bool,
+    pub last_fan: Option<Profile>,
     pub apply_at_startup: bool,
     pub switch_on_power_change: bool,
     pub reapply_on_resume: bool,
@@ -29,6 +31,8 @@ impl Default for SavedProfiles {
     fn default() -> Self {
         Self {
             config: aero_core::builtin_config(),
+            restore_fan_mode: true,
+            last_fan: None,
             apply_at_startup: false,
             switch_on_power_change: false,
             reapply_on_resume: false,
@@ -72,8 +76,25 @@ pub fn load(path: &Path) -> Result<SavedProfiles, String> {
 
 pub fn parse(text: &str) -> Result<SavedProfiles, String> {
     let root: toml::Table = toml::from_str(text).map_err(|error| error.to_string())?;
+    let last_fan = root
+        .get("last_fan")
+        .map(|value| {
+            value
+                .clone()
+                .try_into::<Profile>()
+                .map_err(|error| format!("Invalid last fan settings: {error}"))
+        })
+        .transpose()?;
+    if let Some(profile) = &last_fan {
+        validate_profile(profile)?;
+    }
     let saved = SavedProfiles {
         config: Config::from_toml(text).map_err(|error| error.to_string())?,
+        // Older files only opted into full-profile automation. Fan-only
+        // restoration now defaults on, including for those existing files.
+        restore_fan_mode: !root.contains_key("restore_fan_mode")
+            || top_level_flag(&root, "restore_fan_mode")?,
+        last_fan: last_fan.as_ref().map(fan_only),
         apply_at_startup: top_level_flag(&root, "apply_at_startup")?,
         switch_on_power_change: top_level_flag(&root, "switch_on_power_change")?,
         reapply_on_resume: top_level_flag(&root, "reapply_on_resume")?,
@@ -98,6 +119,9 @@ fn top_level_flag(root: &toml::Table, key: &str) -> Result<bool, String> {
 }
 
 pub fn validate(saved: &SavedProfiles) -> Result<(), String> {
+    if let Some(profile) = &saved.last_fan {
+        validate_profile(profile)?;
+    }
     if saved.start_minimized && !saved.keep_in_tray {
         return Err(
             "Starting in the notification area requires keeping the app in the notification area."
@@ -128,6 +152,33 @@ pub fn validate(saved: &SavedProfiles) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// A fan preference must never implicitly restore CPU, charging or standalone
+/// GPU overrides. The fan mode itself still sends its official GPU request.
+pub fn fan_only(profile: &Profile) -> Profile {
+    let mut fan = profile.clone();
+    fan.name = "Last fan settings".into();
+    fan.notes = "Last successfully applied fan settings.".into();
+    fan.dynamic_boost = None;
+    fan.nv_power_config = None;
+    fan.nv_thermal_target = None;
+    fan.ai_boost = None;
+    fan.charge_limit = None;
+    fan.charge_policy = None;
+    fan.cpu_pl1_w = None;
+    fan.cpu_pl2_w = None;
+    fan.cpu_power_preset = None;
+    if fan.fan_mode != FanMode::Custom {
+        fan.curve.clear();
+        fan.curve_pairs.clear();
+    }
+    if fan.fan_mode != FanMode::Fixed {
+        fan.fixed_duty_percent = None;
+        fan.fixed_duty_raw = None;
+        fan.expert_mode = false;
+    }
+    fan
 }
 
 pub fn validate_profile(profile: &Profile) -> Result<(), String> {
@@ -209,6 +260,7 @@ pub fn save(path: &Path, saved: &SavedProfiles) -> Result<(), String> {
         toml::from_str(&saved.config.to_toml().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
     for (name, enabled) in [
+        ("restore_fan_mode", saved.restore_fan_mode),
         ("apply_at_startup", saved.apply_at_startup),
         ("switch_on_power_change", saved.switch_on_power_change),
         ("reapply_on_resume", saved.reapply_on_resume),
@@ -219,6 +271,12 @@ pub fn save(path: &Path, saved: &SavedProfiles) -> Result<(), String> {
         ("display_off_hotkey", saved.display_off_hotkey),
     ] {
         root.insert(name.into(), enabled.into());
+    }
+    if let Some(profile) = &saved.last_fan {
+        root.insert(
+            "last_fan".into(),
+            toml::Value::try_from(fan_only(profile)).map_err(|error| error.to_string())?,
+        );
     }
     saved.display.write_table(&mut root);
     let body = format!(
@@ -416,5 +474,64 @@ mod tests {
         assert_eq!(load(&path).unwrap(), loaded);
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn old_full_profile_opt_out_does_not_disable_new_fan_only_restoration() {
+        let mut config = SavedProfiles::default().config;
+        config.active = "Gaming".into();
+        let text = format!(
+            "apply_at_startup = false\nreapply_on_resume = false\n{}",
+            config.to_toml().unwrap()
+        );
+        let saved = parse(&text).unwrap();
+        assert_eq!(saved.config.active, "Gaming");
+        assert!(saved.restore_fan_mode);
+        assert!(!saved.apply_at_startup && !saved.reapply_on_resume);
+        assert!(saved.last_fan.is_none());
+        assert!(
+            !parse(&format!("restore_fan_mode = false\n{text}"))
+                .unwrap()
+                .restore_fan_mode
+        );
+        assert!(parse(&format!("restore_fan_mode = \"true\"\n{text}")).is_err());
+    }
+
+    #[test]
+    fn remembered_curve_survives_a_restart_with_exact_bytes_and_no_power_settings() {
+        let path = test_path();
+        let mut saved = SavedProfiles::default();
+        let mut full_profile = saved.config.profile("Deep Control").unwrap().clone();
+        full_profile.cpu_power_preset = Some(aero_core::CpuPowerPreset::Level5);
+        full_profile.charge_policy = Some(4);
+        full_profile.charge_limit = Some(80);
+        full_profile.nv_power_config = Some(0);
+        full_profile.nv_thermal_target = Some(1);
+        full_profile.ai_boost = Some(1);
+        full_profile.dynamic_boost = Some(true);
+        saved.last_fan = Some(fan_only(&full_profile));
+        save(&path, &saved).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded, saved);
+        let fan = loaded.last_fan.unwrap();
+        assert_eq!(
+            fan.fan_curve().unwrap().points(),
+            full_profile.fan_curve().unwrap().points()
+        );
+        assert_eq!(fan.cpu_power_preset, None);
+        assert_eq!(fan.charge_policy, None);
+        assert_eq!(fan.charge_limit, None);
+        assert_eq!(fan.nv_power_config, None);
+        assert_eq!(fan.nv_thermal_target, None);
+        assert!(!fan.has_deferred_fields());
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn malformed_or_invalid_remembered_fans_block_loading() {
+        let config = SavedProfiles::default().config.to_toml().unwrap();
+        assert!(parse(&format!("last_fan = false\n{config}")).is_err());
+        assert!(parse(&format!("{config}\n[last_fan]\nname = 'Saved'\nfan_mode = 'custom'\ncurve_pairs = [[0, 50], [70, 25]]\n")).is_err());
     }
 }

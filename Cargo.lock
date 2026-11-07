@@ -116,7 +116,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "aero-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aero-wmi",
  "serde",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "aero-gui"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aero-core",
  "aero-kbd",
@@ -141,14 +141,14 @@ dependencies = [
 
 [[package]]
 name = "aero-kbd"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "windows 0.59.0",
 ]
 
 [[package]]
 name = "aero-probe"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aero-wmi",
  "serde",
@@ -157,7 +157,7 @@ dependencies = [
 
 [[package]]
 name = "aero-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aero-core",
  "serde",
@@ -166,7 +166,7 @@ dependencies = [
 
 [[package]]
 name = "aero-svc"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aero-core",
  "aero-proto",
@@ -176,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "aero-wmi"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "thiserror 1.0.69",
