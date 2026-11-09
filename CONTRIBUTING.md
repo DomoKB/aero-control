@@ -18,6 +18,8 @@ Use `-Offline` on the GUI helper when all dependencies are cached. The productio
 
 Run `aero-gui.exe --mock` for interface work. Unit tests and the fake-SDK bridge test do not intentionally control physical hardware. The workflow in `.github/workflows/ci.yml` uses the upstream [checkout](https://github.com/actions/checkout) and [Rust toolchain](https://github.com/dtolnay/rust-toolchain) actions and builds/tests on Windows; it cannot establish laptop compatibility.
 
+After building the GUI tests, check the tray/window lifecycle on an interactive Windows desktop with `./target/gui-tests/aero-gui-tests.exe --ignored --exact app::native_lifecycle::native_tray_exit_stops_the_process --nocapture`. It uses real Windows windows, renderer and tray registration with simulated hardware and isolated settings. It injects the same commands as tray Open/Exit and the title-bar X, checks fan changes while the window is closed, and verifies that each child process terminates and releases the controller lock. A timeout terminates only that test's mock child. This complements a manual click-through of the actual tray menu; it does not test physical fan behaviour.
+
 ## Hardware changes
 
 Describe the supported model/BIOS, exact method or report, source evidence, parameter layout and expected readback. Add meaningful failure coverage when changing firmware sequences. Preserve explicit unknown states; a transport success, a changed UI highlight or a transient request is not proof of effective hardware behaviour.

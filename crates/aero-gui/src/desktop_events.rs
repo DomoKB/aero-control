@@ -185,6 +185,11 @@ impl DesktopEvents {
         self.test_events.send(event).unwrap();
     }
 
+    #[cfg(test)]
+    pub fn test_sender(&self) -> mpsc::Sender<DesktopEvent> {
+        self.test_events.clone()
+    }
+
     pub fn last_error(&self) -> Option<String> {
         self.error.lock().ok().and_then(|error| error.clone())
     }

@@ -27,7 +27,7 @@ try {
 
     # These are the GUI's direct dependencies. Select only artifacts from this
     # Cargo build, including the direct windows/toml versions in Cargo.toml.
-    foreach ($name in @('aero_core', 'aero_wmi', 'aero_kbd', 'eframe', 'windows', 'toml')) {
+    foreach ($name in @('aero_core', 'aero_wmi', 'aero_kbd', 'eframe', 'windows', 'toml', 'winit')) {
         $artifacts = @($events | Where-Object {
             $_.reason -eq 'compiler-artifact' -and $_.target.name -eq $name -and
             ($name -ne 'windows' -or $_.package_id -match 'windows@0\.59\.') -and

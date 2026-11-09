@@ -83,20 +83,42 @@ fn main() -> Result<(), eframe::Error> {
             elevated: elevate::is_elevated(),
         }
     };
-    let mut app = app::AeroApp::new(choice, background, instance);
-    if background {
-        let context = egui::Context::default();
-        loop {
-            match app.poll_background(&context) {
-                app::BackgroundAction::Wait => {
-                    std::thread::sleep(std::time::Duration::from_millis(100))
+    let app = app::AeroApp::new(choice, background, instance);
+    run_controller(app, background, run_window)
+}
+
+fn run_controller(
+    mut app: app::AeroApp,
+    mut background: bool,
+    mut open_window: impl FnMut(&mut app::AeroApp) -> Result<(), eframe::Error>,
+) -> Result<(), eframe::Error> {
+    let context = egui::Context::default();
+    loop {
+        if background {
+            loop {
+                match app.poll_background(&context) {
+                    app::BackgroundAction::Wait => {
+                        std::thread::sleep(std::time::Duration::from_millis(100))
+                    }
+                    app::BackgroundAction::Open => break,
+                    app::BackgroundAction::Exit => return Ok(()),
                 }
-                app::BackgroundAction::Open => break,
-                app::BackgroundAction::Exit => return Ok(()),
             }
         }
+        open_window(&mut app)?;
+        if !app.keep_running_after_window_close() {
+            return Ok(());
+        }
+        app.enter_background();
+        background = true;
     }
+}
+
+fn run_window(app: &mut app::AeroApp) -> Result<(), eframe::Error> {
     let native_options = eframe::NativeOptions {
+        // Closing a tray-enabled window returns control to our background
+        // loop. Windows does not reliably repaint a hidden native window.
+        run_and_return: true,
         viewport: egui::ViewportBuilder::default()
             .with_title("aero-control")
             .with_inner_size([1280.0, 820.0])
@@ -111,8 +133,7 @@ fn main() -> Result<(), eframe::Error> {
             app.attach_window(&cc.egui_ctx);
             Ok(Box::new(app))
         }),
-    )?;
-    Ok(())
+    )
 }
 
 fn launch_error(message: String) -> eframe::Error {

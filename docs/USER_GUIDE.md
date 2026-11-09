@@ -46,7 +46,7 @@ Profiles may use `cpu_power_preset` values `level-1` through `level-5`, `default
 
 ## Closing the app
 
-With tray operation enabled and a registered icon, closing the window hides it instead of exiting. Windows background startup always uses this behaviour for its running session. Use the tray's Exit command to end the session. Background automation needs the app running; exiting stops resume handling until the next launch or Windows sign-in. Disabling the startup task prevents future automatic launches but does not stop the current session.
+With tray operation enabled and a registered icon, the **X** closes the control window and leaves the controller running in the notification area. Windows background startup always uses this behaviour for its running session. **Open aero-control** brings back the window; **Exit** shuts down the controller and removes its tray icon. Exit works whether the window is open or closed. It does not erase the saved fan choice or disable Windows startup. Background automation needs the app running; exiting stops resume handling until the next launch or Windows sign-in. Disabling the startup task prevents future automatic launches but does not stop the current session.
 
 Normal, Quiet, Gaming and an uploaded hardware curve run in firmware. Normal exit attempts the Normal sequence after Fixed or Max. This cleanup does not erase the remembered preference: reopening restores Fixed or Max if that was the last successful selection and fan restoration remains enabled. Recovery can fail and cannot run after a force-kill or crash. CPU limits are not automatically restored on exit. Keyboard lighting can remain in the device after closing.
 

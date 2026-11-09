@@ -27,6 +27,8 @@ mod gauge;
 mod kbd_preview;
 mod keyboard;
 mod live_duty;
+#[cfg(all(test, windows))]
+mod native_lifecycle;
 mod profiles;
 mod startup;
 mod system_controls;
@@ -106,6 +108,9 @@ pub struct AeroApp {
     startup: startup::StartupTab,
     background_launch: bool,
     open_window_requested: bool,
+    return_to_tray: bool,
+    window_has_opened: bool,
+    dismissed_report_error: Option<String>,
     // Drop ownership only after the hardware session and desktop worker stop.
     instance: crate::instance::Instance,
 }
@@ -319,6 +324,9 @@ impl AeroApp {
             startup: startup::StartupTab::new(mock),
             background_launch: background,
             open_window_requested: false,
+            return_to_tray: false,
+            window_has_opened: false,
+            dismissed_report_error: None,
             instance,
         };
         if let Some(snapshot) = initial {
@@ -343,7 +351,20 @@ impl AeroApp {
     }
 
     pub fn attach_window(&mut self, ctx: &egui::Context) {
+        self.window_has_opened = true;
         install_theme(ctx);
+    }
+
+    pub fn keep_running_after_window_close(&self) -> bool {
+        self.return_to_tray && !self.exit_requested
+    }
+
+    pub fn enter_background(&mut self) {
+        self.return_to_tray = false;
+        self.open_window_requested = false;
+        // A problem already shown to the user must not immediately reopen a
+        // window they just closed. New failures and a lost tray still surface.
+        self.dismissed_report_error = self.report_error.then(|| self.report.clone());
     }
 
     /// No native control window or renderer exists during this loop. The same
@@ -353,12 +374,16 @@ impl AeroApp {
             self.poll_session();
             self.poll_automation(ctx);
         });
+        if !self.report_error {
+            self.dismissed_report_error = None;
+        }
         if self.exit_requested {
             BackgroundAction::Exit
         } else if self.open_window_requested
-            || self.report_error
-            || self.profiles.load_error().is_some()
-            || !self.session.writes_enabled
+            || (self.report_error
+                && self.dismissed_report_error.as_deref() != Some(self.report.as_str()))
+            || (!self.window_has_opened
+                && (self.profiles.load_error().is_some() || !self.session.writes_enabled))
             || self.desktop.last_error().is_some()
             || (!self.desktop.can_hide_to_tray()
                 && self.started.elapsed() > Duration::from_secs(10))
@@ -732,6 +757,9 @@ impl AeroApp {
     }
 
     fn poll_automation(&mut self, ctx: &egui::Context) {
+        if self.exit_requested {
+            return;
+        }
         self.setup_startup_once(!cfg!(debug_assertions));
         if let Some(result) = self.startup.poll() {
             let saved = result.and_then(|remember_choice| {
@@ -833,14 +861,17 @@ impl AeroApp {
                 }
                 crate::desktop_events::DesktopEvent::Exit => {
                     self.exit_requested = true;
+                    self.queued_profile = None;
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    return;
                 }
             }
         }
         if self.startup_hide_pending {
             if self.desktop.can_hide_to_tray() {
                 self.startup_hide_pending = false;
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.return_to_tray = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
             } else if !tray_requested || self.desktop.last_error().is_some() {
                 self.startup_hide_pending = false;
             }
@@ -920,12 +951,15 @@ impl eframe::App for AeroApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_session();
         self.poll_automation(ctx);
-        if !self.exit_requested
-            && self.desktop.can_hide_to_tray()
-            && ctx.input(|input| input.viewport().close_requested())
+        if self.exit_requested {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
+        if self.desktop.can_hide_to_tray() && ctx.input(|input| input.viewport().close_requested())
         {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            // Let eframe destroy the window and return to the renderer-free
+            // controller loop. Hiding it here starves tray events on Windows.
+            self.return_to_tray = true;
         }
         self.push_live_duty(ctx);
         self.push_curve();
@@ -1018,6 +1052,14 @@ impl eframe::App for AeroApp {
                         }
                     });
             });
+    }
+}
+
+// The controller outlives the native window, including its hardware session,
+// desktop listener and single-instance guard.
+impl eframe::App for &mut AeroApp {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        <AeroApp as eframe::App>::update(self, ctx, frame);
     }
 }
 
@@ -2349,6 +2391,54 @@ mod background_tests {
         app.desktop
             .inject_event(crate::desktop_events::DesktopEvent::Exit);
         assert_eq!(app.poll_background(&ctx), BackgroundAction::Exit);
+    }
+
+    #[test]
+    fn returning_to_tray_consumes_show_and_dismisses_only_the_existing_error() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        finish(&mut app, &ctx, FanMode::Normal);
+        app.attach_window(&ctx);
+        app.open_window_requested = true;
+        app.return_to_tray = true;
+        app.report = "Existing error".into();
+        app.report_error = true;
+        assert!(app.keep_running_after_window_close());
+        app.enter_background();
+        assert_eq!(app.poll_background(&ctx), BackgroundAction::Wait);
+        app.report = "New error".into();
+        assert_eq!(app.poll_background(&ctx), BackgroundAction::Open);
+        app.enter_background();
+        app.report_error = false;
+        assert_eq!(app.poll_background(&ctx), BackgroundAction::Wait);
+        app.report_error = true;
+        assert_eq!(app.poll_background(&ctx), BackgroundAction::Open);
+    }
+
+    #[test]
+    fn exit_cancels_queued_automation_and_ignores_later_desktop_actions() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        finish(&mut app, &ctx, FanMode::Normal);
+        app.queued_profile = Some(QueuedApply::FanRestore(aero_core::ApplyReason::Resume));
+        app.return_to_tray = true;
+        for event in [
+            crate::desktop_events::DesktopEvent::Exit,
+            crate::desktop_events::DesktopEvent::FanMode(FanMode::Gaming),
+            crate::desktop_events::DesktopEvent::Show,
+        ] {
+            app.desktop.inject_event(event);
+        }
+        assert_eq!(app.poll_background(&ctx), BackgroundAction::Exit);
+        assert_eq!(app.poll_background(&ctx), BackgroundAction::Exit);
+        assert!(app.queued_profile.is_none());
+        assert!(!app.busy);
+        assert!(!app.open_window_requested);
+        assert!(!app.keep_running_after_window_close());
+        assert_eq!(
+            app.profiles.fan_restore_profile().unwrap().fan_mode,
+            FanMode::Normal
+        );
     }
 
     #[test]

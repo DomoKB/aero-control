@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.2 — 2026-11-09
+
+- Fix tray Exit and Open becoming unresponsive after closing the control window. Closing now returns the same controller to its background loop, so tray commands and resume handling do not depend on Windows repainting a hidden window.
+- Keep the saved fan choice and Windows startup enabled when exiting. Stop queued automation once Exit is requested, and preserve the controller and settings when reopening its window.
+- Add native Windows regression tests for process exit from background, visible and closed windows, repeated reopening, fan changes while in the tray, and closing without tray operation.
+
 ## 0.2.1 — 2026-11-08
 
 - Remember successful fan-mode changes, fixed duties and exact custom curves automatically, and restore them when the app opens or resumes from sleep, matching Control Center's manual fan lifecycle.

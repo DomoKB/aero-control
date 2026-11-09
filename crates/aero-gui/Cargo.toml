@@ -41,3 +41,6 @@ windows = { version = "0.59", features = [
 
 [build-dependencies]
 winresource = "0.1"
+
+[target.'cfg(windows)'.dev-dependencies]
+winit = "0.30"
