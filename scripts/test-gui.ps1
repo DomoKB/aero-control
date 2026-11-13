@@ -22,8 +22,18 @@ try {
     $events = @(Get-Content -LiteralPath $buildLog | ForEach-Object { $_ | ConvertFrom-Json })
     $testBinary = Join-Path $testDirectory 'aero-gui-tests.exe'
     $compilerArgs = @('--edition=2021', '--test', (Join-Path $repoRoot 'crates/aero-gui/src/main.rs'),
-        '--crate-name', 'aero_gui_tests', '-L', ('dependency=' + (Join-Path $metadata.target_directory 'debug/deps')),
-        '-o', $testBinary)
+        '--crate-name', 'aero_gui_tests', '-o', $testBinary)
+
+    # Cargo's intermediate layout is not stable (it changed in Rust 1.100).
+    # Locate transitive libraries and proc macros from this build's artifacts,
+    # just as we locate the direct dependencies below.
+    $dependencyDirectories = @($events | Where-Object reason -eq 'compiler-artifact' |
+        ForEach-Object filenames | Where-Object { [IO.Path]::GetExtension($_) -in @('.rlib', '.rmeta', '.dll') } |
+        ForEach-Object { Split-Path -Parent $_ } | Select-Object -Unique)
+    if ($dependencyDirectories.Count -eq 0) { throw 'Cargo reported no Rust dependency directories.' }
+    foreach ($directory in $dependencyDirectories) {
+        $compilerArgs += @('-L', ('dependency=' + $directory))
+    }
 
     # These are the GUI's direct dependencies. Select only artifacts from this
     # Cargo build, including the direct windows/toml versions in Cargo.toml.

@@ -4,6 +4,7 @@
 
 - Fix the frozen window left behind when closing a startup/tray session. Process deferred Windows window destruction after the renderer exits and continue servicing those messages in the background.
 - Test the actual Windows close-message path, verify the old native window is destroyed before reopening, and cover repeated close/open and tray Exit with simulated fan hardware.
+- Locate GUI test dependencies through Cargo's reported artifacts, supporting Rust 1.100's changed build directory layout as well as older toolchains.
 
 ## 0.2.4
 
