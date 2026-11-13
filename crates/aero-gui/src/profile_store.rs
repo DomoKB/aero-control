@@ -14,6 +14,8 @@ static SAVE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SavedProfiles {
     pub config: Config,
+    /// Explicit model selection, used only when the AERO BIOS omits identity.
+    pub confirmed_aero_17_yb: bool,
     pub restore_fan_mode: bool,
     pub last_fan: Option<Profile>,
     /// Successful setup or explicit choice; later opt-outs are not undone.
@@ -33,6 +35,7 @@ impl Default for SavedProfiles {
     fn default() -> Self {
         Self {
             config: aero_core::builtin_config(),
+            confirmed_aero_17_yb: false,
             restore_fan_mode: true,
             last_fan: None,
             startup_setup_complete: false,
@@ -93,6 +96,7 @@ pub fn parse(text: &str) -> Result<SavedProfiles, String> {
     }
     let saved = SavedProfiles {
         config: Config::from_toml(text).map_err(|error| error.to_string())?,
+        confirmed_aero_17_yb: top_level_flag(&root, "confirmed_aero_17_yb")?,
         // Older files only opted into full-profile automation. Fan-only
         // restoration now defaults on, including for those existing files.
         restore_fan_mode: !root.contains_key("restore_fan_mode")
@@ -264,6 +268,7 @@ pub fn save(path: &Path, saved: &SavedProfiles) -> Result<(), String> {
         toml::from_str(&saved.config.to_toml().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())?;
     for (name, enabled) in [
+        ("confirmed_aero_17_yb", saved.confirmed_aero_17_yb),
         ("restore_fan_mode", saved.restore_fan_mode),
         ("startup_setup_complete", saved.startup_setup_complete),
         ("apply_at_startup", saved.apply_at_startup),
@@ -322,6 +327,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn model_confirmation_defaults_off_and_rejects_non_booleans() {
+        let config = aero_core::builtin_config().to_toml().unwrap();
+        assert!(!parse(&config).unwrap().confirmed_aero_17_yb);
+        assert!(parse(&format!("confirmed_aero_17_yb = \"true\"\n{config}")).is_err());
+        assert!(
+            parse(&format!("confirmed_aero_17_yb = true\n{config}"))
+                .unwrap()
+                .confirmed_aero_17_yb
+        );
+    }
+
+    #[test]
     fn cpu_preset_roundtrips_and_conflicting_legacy_limits_are_rejected() {
         let mut saved = SavedProfiles::default();
         saved.config.profiles[0].cpu_power_preset = Some(aero_core::CpuPowerPreset::Battery);
@@ -376,6 +393,7 @@ mod tests {
         original.keep_in_tray = true;
         original.start_minimized = true;
         original.startup_setup_complete = true;
+        original.confirmed_aero_17_yb = true;
         save(&path, &original).unwrap();
         let loaded = load(&path).unwrap();
         assert_eq!(loaded, original);

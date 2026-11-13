@@ -10,6 +10,7 @@ mod device_identity;
 mod display_controls;
 mod elevate;
 mod fan_state;
+mod gpu;
 mod instance;
 mod log_file;
 mod profile_store;
@@ -72,7 +73,13 @@ fn main() -> Result<(), eframe::Error> {
         );
         return Ok(());
     }
-    let Some(instance) = instance::Instance::acquire(background, mock).map_err(launch_error)?
+    let Some(instance) = instance::Instance::acquire(background, mock).map_err(|message| {
+        if background {
+            eframe::Error::AppCreation(Box::new(std::io::Error::other(message)))
+        } else {
+            launch_error(message)
+        }
+    })?
     else {
         return Ok(());
     };
@@ -96,6 +103,9 @@ fn run_controller(
     loop {
         if background {
             loop {
+                if !pump_controller_messages() {
+                    return Ok(());
+                }
                 match app.poll_background(&context) {
                     app::BackgroundAction::Wait => {
                         std::thread::sleep(std::time::Duration::from_millis(100))
@@ -105,13 +115,48 @@ fn run_controller(
                 }
             }
         }
-        open_window(&mut app)?;
-        if !app.keep_running_after_window_close() {
+        let result = open_window(&mut app);
+        // Winit posts its native window destruction to the owning thread.
+        // run_native has already stopped pumping when it drops that window.
+        // Dispatch the queued cleanup even when the renderer returned an error.
+        let keep_running = pump_controller_messages();
+        result?;
+        if !keep_running || !app.keep_running_after_window_close() {
             return Ok(());
         }
         app.enter_background();
         background = true;
     }
+}
+
+/// Service this thread's native windows between renderer runs. Without this,
+/// closing to the tray can leave a visible, unresponsive HWND behind.
+#[cfg(windows)]
+fn pump_controller_messages() -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_QUIT,
+    };
+    let mut message = MSG::default();
+    // Keep a busy message queue from starving fan/tray commands. Any remainder
+    // is handled on the next background tick, on the same owning thread.
+    for _ in 0..64 {
+        unsafe {
+            if !PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                break;
+            }
+            if message.message == WM_QUIT {
+                return false;
+            }
+            let _ = TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    true
+}
+
+#[cfg(not(windows))]
+fn pump_controller_messages() -> bool {
+    true
 }
 
 fn run_window(app: &mut app::AeroApp) -> Result<(), eframe::Error> {

@@ -32,6 +32,22 @@ pub enum ApplyReason {
     Drift,
 }
 
+/// Whether the NVIDIA power-request interface is available for this session.
+/// The EC thermal-profile and fan commands remain usable without the GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuPower {
+    Available,
+    Unavailable,
+}
+
+const GPU_POWER_SKIPPED: &str = "NVIDIA GPU unavailable; GPU power request skipped.";
+
+fn note_gpu_power_skipped(warnings: &mut Vec<String>) {
+    if !warnings.iter().any(|warning| warning == GPU_POWER_SKIPPED) {
+        warnings.push(GPU_POWER_SKIPPED.to_string());
+    }
+}
+
 pub fn reason_for(event: PowerEvent) -> ApplyReason {
     match event {
         PowerEvent::ResumeAutomatic | PowerEvent::ResumeSuspend => ApplyReason::Resume,
@@ -110,9 +126,17 @@ pub enum ApplyError {
 
 struct Gate {
     started: bool,
+    gpu: GpuPower,
 }
 
 impl Gate {
+    fn new(gpu: GpuPower) -> Self {
+        Self {
+            started: false,
+            gpu,
+        }
+    }
+
     fn before<P: Pacer>(&mut self, pacer: &mut P) {
         if self.started {
             pacer.pause();
@@ -124,6 +148,7 @@ impl Gate {
 fn guarded<W, P, T>(
     writer: &mut W,
     pacer: &mut P,
+    gpu: GpuPower,
     body: impl FnOnce(&mut W, &mut P) -> Result<T, ApplyError>,
 ) -> Result<T, ApplyError>
 where
@@ -133,9 +158,9 @@ where
     let outcome = catch_unwind(AssertUnwindSafe(|| body(writer, pacer)));
     match outcome {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(err)) => Err(finish_error(writer, pacer, err)),
+        Ok(Err(err)) => Err(finish_error(writer, pacer, gpu, err)),
         Err(payload) => {
-            let _ = restore_firmware_auto(writer, pacer);
+            let _ = restore_firmware_auto_with_gpu(writer, pacer, gpu);
             resume_unwind(payload);
         }
     }
@@ -144,9 +169,10 @@ where
 fn finish_error<W: AcpiWriter, P: Pacer>(
     writer: &mut W,
     pacer: &mut P,
+    gpu: GpuPower,
     err: ApplyError,
 ) -> ApplyError {
-    match restore_firmware_auto(writer, pacer) {
+    match restore_firmware_auto_with_gpu(writer, pacer, gpu) {
         Ok(()) => ApplyError::Restored {
             reason: err.to_string(),
         },
@@ -161,7 +187,15 @@ pub fn restore_firmware_auto<W: AcpiWriter, P: Pacer>(
     writer: &mut W,
     pacer: &mut P,
 ) -> Result<(), ApplyError> {
-    let mut gate = Gate { started: false };
+    restore_firmware_auto_with_gpu(writer, pacer, GpuPower::Available)
+}
+
+pub fn restore_firmware_auto_with_gpu<W: AcpiWriter, P: Pacer>(
+    writer: &mut W,
+    pacer: &mut P,
+    gpu: GpuPower,
+) -> Result<(), ApplyError> {
+    let mut gate = Gate::new(gpu);
     let mut warnings = Vec::new();
     run_script(
         writer,
@@ -190,14 +224,17 @@ pub fn upload_curve<W: AcpiWriter, P: Pacer>(
     pacer: &mut P,
     curve: &FanCurve,
 ) -> Result<ApplyReport, ApplyError> {
-    guarded(writer, pacer, |writer, pacer| {
-        upload_inner(
-            writer,
-            pacer,
-            &mut Gate { started: false },
-            Vec::new(),
-            curve,
-        )
+    upload_curve_with_gpu(writer, pacer, curve, GpuPower::Available)
+}
+
+pub fn upload_curve_with_gpu<W: AcpiWriter, P: Pacer>(
+    writer: &mut W,
+    pacer: &mut P,
+    curve: &FanCurve,
+    gpu: GpuPower,
+) -> Result<ApplyReport, ApplyError> {
+    guarded(writer, pacer, gpu, |writer, pacer| {
+        upload_inner(writer, pacer, &mut Gate::new(gpu), Vec::new(), curve)
     })
 }
 
@@ -206,8 +243,17 @@ pub fn update_curve<W: AcpiWriter, P: Pacer>(
     pacer: &mut P,
     curve: &FanCurve,
 ) -> Result<ApplyReport, ApplyError> {
-    guarded(writer, pacer, |writer, pacer| {
-        let mut gate = Gate { started: false };
+    update_curve_with_gpu(writer, pacer, curve, GpuPower::Available)
+}
+
+pub fn update_curve_with_gpu<W: AcpiWriter, P: Pacer>(
+    writer: &mut W,
+    pacer: &mut P,
+    curve: &FanCurve,
+    gpu: GpuPower,
+) -> Result<ApplyReport, ApplyError> {
+    guarded(writer, pacer, gpu, |writer, pacer| {
+        let mut gate = Gate::new(gpu);
         let mut warnings = Vec::new();
         for write in fan_point_writes(curve) {
             exec_write(writer, pacer, &mut gate, &write, &mut warnings)?;
@@ -317,6 +363,17 @@ pub fn apply_mode<W: AcpiWriter, P: Pacer>(
     fixed_raw: u8,
     expert: bool,
 ) -> Result<ApplyReport, ApplyError> {
+    apply_mode_with_gpu(writer, pacer, mode, fixed_raw, expert, GpuPower::Available)
+}
+
+pub fn apply_mode_with_gpu<W: AcpiWriter, P: Pacer>(
+    writer: &mut W,
+    pacer: &mut P,
+    mode: FanMode,
+    fixed_raw: u8,
+    expert: bool,
+    gpu: GpuPower,
+) -> Result<ApplyReport, ApplyError> {
     if mode == FanMode::Custom {
         return Err(ApplyError::CurveRequired);
     }
@@ -325,15 +382,8 @@ pub fn apply_mode<W: AcpiWriter, P: Pacer>(
         FanMode::Fixed => clamp_fixed_duty(fixed_raw, expert),
         _ => fixed_raw,
     };
-    guarded(writer, pacer, |writer, pacer| {
-        apply_mode_inner(
-            writer,
-            pacer,
-            &mut Gate { started: false },
-            Vec::new(),
-            mode,
-            duty,
-        )
+    guarded(writer, pacer, gpu, |writer, pacer| {
+        apply_mode_inner(writer, pacer, &mut Gate::new(gpu), Vec::new(), mode, duty)
     })
 }
 
@@ -343,9 +393,19 @@ pub fn apply_fixed_duty<W: AcpiWriter, P: Pacer>(
     fixed_raw: u8,
     expert: bool,
 ) -> Result<ApplyReport, ApplyError> {
+    apply_fixed_duty_with_gpu(writer, pacer, fixed_raw, expert, GpuPower::Available)
+}
+
+pub fn apply_fixed_duty_with_gpu<W: AcpiWriter, P: Pacer>(
+    writer: &mut W,
+    pacer: &mut P,
+    fixed_raw: u8,
+    expert: bool,
+    gpu: GpuPower,
+) -> Result<ApplyReport, ApplyError> {
     let duty = clamp_fixed_duty(fixed_raw, expert);
-    guarded(writer, pacer, |writer, pacer| {
-        let mut gate = Gate { started: false };
+    guarded(writer, pacer, gpu, |writer, pacer| {
+        let mut gate = Gate::new(gpu);
         let mut warnings = Vec::new();
         run_script(
             writer,
@@ -500,6 +560,10 @@ fn exec_write<W: AcpiWriter, P: Pacer>(
     write: &PlannedWrite,
     warnings: &mut Vec<String>,
 ) -> Result<(), ApplyError> {
+    if gate.gpu == GpuPower::Unavailable && write.method == "SetNvPowerConfig" {
+        note_gpu_power_skipped(warnings);
+        return Ok(());
+    }
     gate.before(pacer);
     debug!(method = write.method, "WMI set");
     match writer.set(write.method, &write.params) {
@@ -532,6 +596,16 @@ pub fn apply_profile<W: AcpiWriter, P: Pacer>(
     profile: &Profile,
     reason: ApplyReason,
 ) -> Result<ApplyReport, ApplyError> {
+    apply_profile_with_gpu(writer, pacer, profile, reason, GpuPower::Available)
+}
+
+pub fn apply_profile_with_gpu<W: AcpiWriter, P: Pacer>(
+    writer: &mut W,
+    pacer: &mut P,
+    profile: &Profile,
+    reason: ApplyReason,
+    gpu: GpuPower,
+) -> Result<ApplyReport, ApplyError> {
     if profile.cpu_power_preset.is_some() {
         return Err(ApplyError::CpuBridgeRequired);
     }
@@ -560,13 +634,13 @@ pub fn apply_profile<W: AcpiWriter, P: Pacer>(
     let mut report = match profile.fan_mode {
         FanMode::Custom => {
             let curve = profile.fan_curve().map_err(ApplyError::InvalidCurve)?;
-            upload_curve(writer, pacer, &curve)?
+            upload_curve_with_gpu(writer, pacer, &curve, gpu)?
         }
         mode => {
             let raw = profile
                 .fixed_duty_raw
                 .unwrap_or_else(|| crate::percent_to_raw(profile.fixed_duty_percent.unwrap_or(50)));
-            apply_mode(writer, pacer, mode, raw, profile.expert_mode)?
+            apply_mode_with_gpu(writer, pacer, mode, raw, profile.expert_mode, gpu)?
         }
     };
     if profile.cpu_pl1_w.is_some() || profile.cpu_pl2_w.is_some() {
@@ -574,14 +648,18 @@ pub fn apply_profile<W: AcpiWriter, P: Pacer>(
             .warnings
             .push("Legacy CPU PL1/PL2 fields are stored only; select a CPU power preset in the desktop app".to_string());
     }
-    guarded(writer, pacer, |writer, pacer| {
+    guarded(writer, pacer, gpu, |writer, pacer| {
         if let Some(value) = profile.nv_thermal_target {
             pacer.pause();
             crate::set_nv_thermal_target(writer, pacer, value == 1)?;
         }
         if let Some(value) = profile.nv_power_config {
-            pacer.pause();
-            crate::set_nv_power_config(writer, pacer, value == 1)?;
+            if gpu == GpuPower::Available {
+                pacer.pause();
+                crate::set_nv_power_config(writer, pacer, value == 1)?;
+            } else {
+                note_gpu_power_skipped(&mut report.warnings);
+            }
         }
         if profile.charge_policy == Some(0) {
             pacer.pause();
@@ -645,6 +723,235 @@ mod tests {
 
     fn methods(mock: &MockAcpi) -> Vec<String> {
         mock.calls.iter().map(|call| call.method.clone()).collect()
+    }
+
+    fn without_gpu() -> MockAcpi {
+        let mut mock = MockAcpi::aero_17_yb_fixture();
+        mock.throw_setters.insert("SetNvPowerConfig".into());
+        mock
+    }
+
+    fn assert_no_gpu_power_calls(mock: &MockAcpi) {
+        assert_eq!(mock.calls_named("SetNvPowerConfig").count(), 0);
+        assert_eq!(mock.calls_named("GetNvPowerConfig").count(), 0);
+        assert_eq!(mock.calls_named("SetAIBoostStatus").count(), 0);
+    }
+
+    #[test]
+    fn unavailable_gpu_preserves_fan_sequences_and_thermal_verification() {
+        for mode in [
+            FanMode::Normal,
+            FanMode::Quiet,
+            FanMode::Gaming,
+            FanMode::Fixed,
+            FanMode::Max,
+        ] {
+            let mut available = MockAcpi::aero_17_yb_fixture();
+            apply_mode(&mut available, &mut NoPacer, mode, 120, false).unwrap();
+            let mut explicit_available = MockAcpi::aero_17_yb_fixture();
+            apply_mode_with_gpu(
+                &mut explicit_available,
+                &mut NoPacer,
+                mode,
+                120,
+                false,
+                GpuPower::Available,
+            )
+            .unwrap();
+            assert_eq!(available.calls, explicit_available.calls);
+
+            let mut unavailable = without_gpu();
+            let mut pacer = CountPacer::default();
+            let report = apply_mode_with_gpu(
+                &mut unavailable,
+                &mut pacer,
+                mode,
+                120,
+                false,
+                GpuPower::Unavailable,
+            )
+            .unwrap();
+            let expected: Vec<_> = available
+                .calls
+                .into_iter()
+                .filter(|call| call.method != "SetNvPowerConfig")
+                .collect();
+            assert_eq!(unavailable.calls, expected, "{mode:?}");
+            assert_eq!(pacer.pauses, unavailable.calls.len() - 1);
+            assert_eq!(report.warnings, [GPU_POWER_SKIPPED]);
+            assert_eq!(
+                unavailable.nv_thermal_target,
+                u8::from(mode == FanMode::Quiet)
+            );
+            assert_eq!(unavailable.calls_named("GetNvThermalTarget").count(), 1);
+            assert_no_gpu_power_calls(&unavailable);
+        }
+    }
+
+    #[test]
+    fn unavailable_gpu_supports_curve_uploads_edits_and_fixed_duty_fallback() {
+        let mut mock = without_gpu();
+        let report =
+            upload_curve_with_gpu(&mut mock, &mut NoPacer, &sample(), GpuPower::Unavailable)
+                .unwrap();
+        assert_eq!(report.warnings, [GPU_POWER_SKIPPED]);
+        assert_eq!(
+            (mock.auto, mock.fixed, mock.step, mock.nv_thermal_target),
+            (0, 0, 1, 0)
+        );
+        assert_eq!(mock.calls_named("SetNvThermalTarget").count(), 1);
+        assert_eq!(mock.calls_named("GetFanIndexValue").count(), 15);
+        mock.calls.clear();
+        update_curve_with_gpu(&mut mock, &mut NoPacer, &sample(), GpuPower::Unavailable).unwrap();
+        assert_eq!(mock.calls_named("SetFanIndexValue").count(), 15);
+        assert_eq!(mock.calls_named("GetNvThermalTarget").count(), 1);
+        assert_no_gpu_power_calls(&mock);
+
+        // The fast duty path must keep the same GPU policy when it discovers
+        // that the controller needs the full fixed-mode sequence instead.
+        let report =
+            apply_fixed_duty_with_gpu(&mut mock, &mut NoPacer, 120, false, GpuPower::Unavailable)
+                .unwrap();
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning == GPU_POWER_SKIPPED));
+        assert_eq!((mock.fixed_speed, mock.gpu_duty), (120, 120));
+        assert_no_gpu_power_calls(&mock);
+        mock.calls.clear();
+        apply_fixed_duty_with_gpu(&mut mock, &mut NoPacer, 150, false, GpuPower::Unavailable)
+            .unwrap();
+        assert_eq!((mock.fixed_speed, mock.gpu_duty), (150, 150));
+        assert_no_gpu_power_calls(&mock);
+
+        // Curve edits also retain the policy when a full upload is needed.
+        update_curve_with_gpu(&mut mock, &mut NoPacer, &sample(), GpuPower::Unavailable).unwrap();
+        assert_eq!((mock.auto, mock.fixed, mock.step), (0, 0, 1));
+        assert_no_gpu_power_calls(&mock);
+    }
+
+    #[test]
+    fn unavailable_gpu_skips_profile_power_override_without_skipping_other_fields() {
+        for name in ["Normal", "Gaming", "Deep Control"] {
+            let mut profile = crate::builtin_config().profile(name).unwrap().clone();
+            profile.nv_power_config = Some(1);
+            profile.nv_thermal_target = Some(1);
+            profile.charge_limit = Some(80);
+            let mut mock = without_gpu();
+            let report = apply_profile_with_gpu(
+                &mut mock,
+                &mut NoPacer,
+                &profile,
+                ApplyReason::Startup,
+                GpuPower::Unavailable,
+            )
+            .unwrap();
+            assert_eq!(report.warnings, [GPU_POWER_SKIPPED]);
+            assert_eq!(mock.nv_thermal_target, 1);
+            assert_eq!(mock.charge_stop, 80);
+            assert!(mock.calls_named("GetNvThermalTarget").count() >= 1);
+            assert_no_gpu_power_calls(&mock);
+        }
+    }
+
+    #[test]
+    fn unavailable_gpu_profile_recovery_preserves_policy_after_the_fan_apply() {
+        let mut profile = crate::builtin_config().profile("Fixed").unwrap().clone();
+        profile.nv_power_config = Some(1);
+        profile.charge_limit = Some(80);
+        for panic in [false, true] {
+            let mut mock = without_gpu();
+            if panic {
+                mock.panic_on_set = Some("SetChargeStop".into());
+            } else {
+                mock.throw_setters.insert("SetChargeStop".into());
+            }
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                apply_profile_with_gpu(
+                    &mut mock,
+                    &mut NoPacer,
+                    &profile,
+                    ApplyReason::Resume,
+                    GpuPower::Unavailable,
+                )
+            }));
+            if panic {
+                assert!(outcome.is_err());
+            } else {
+                assert!(matches!(outcome.unwrap(), Err(ApplyError::Restored { .. })));
+            }
+            assert_eq!(
+                (mock.auto, mock.fixed, mock.step, mock.nv_thermal_target),
+                (0, 0, 0, 0)
+            );
+            assert_no_gpu_power_calls(&mock);
+        }
+    }
+
+    #[test]
+    fn unavailable_gpu_keeps_thermal_mismatch_and_restoration_checks() {
+        let mut mock = without_gpu();
+        mock.ignored_setters.insert("SetNvThermalTarget".into());
+        let error = apply_mode_with_gpu(
+            &mut mock,
+            &mut NoPacer,
+            FanMode::Quiet,
+            0,
+            false,
+            GpuPower::Unavailable,
+        )
+        .unwrap_err();
+        assert!(matches!(error, ApplyError::Restored { .. }));
+        assert!(error.to_string().contains("GetNvThermalTarget"));
+        assert_eq!(mock.calls_named("SetNvThermalTarget").count(), 3);
+        assert_eq!(
+            (mock.auto, mock.fixed, mock.step, mock.nv_thermal_target),
+            (0, 0, 0, 0)
+        );
+        assert_no_gpu_power_calls(&mock);
+    }
+
+    #[test]
+    fn unavailable_gpu_restores_after_curve_errors_and_panics() {
+        for failure in ["setter", "readback", "panic"] {
+            let mut mock = without_gpu();
+            match failure {
+                "setter" => {
+                    mock.throw_setters.insert("SetFanIndexValue".into());
+                }
+                "readback" => mock.corrupt_fan_index_reads = 1_000,
+                "panic" => mock.panic_on_set = Some("SetFanIndexValue".into()),
+                _ => unreachable!(),
+            }
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                upload_curve_with_gpu(&mut mock, &mut NoPacer, &sample(), GpuPower::Unavailable)
+            }));
+            if failure == "panic" {
+                assert!(outcome.is_err());
+            } else {
+                assert!(matches!(outcome.unwrap(), Err(ApplyError::Restored { .. })));
+            }
+            assert_eq!(
+                (mock.auto, mock.fixed, mock.step, mock.nv_thermal_target),
+                (0, 0, 0, 0)
+            );
+            assert_no_gpu_power_calls(&mock);
+        }
+    }
+
+    #[test]
+    fn unavailable_gpu_restoration_does_not_depend_on_nvidia_power_requests() {
+        let mut mock = without_gpu();
+        mock.fixed = 1;
+        mock.step = 1;
+        mock.nv_thermal_target = 1;
+        restore_firmware_auto_with_gpu(&mut mock, &mut NoPacer, GpuPower::Unavailable).unwrap();
+        assert_eq!(
+            (mock.auto, mock.fixed, mock.step, mock.nv_thermal_target),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(mock.calls_named("GetNvThermalTarget").count(), 1);
+        assert_no_gpu_power_calls(&mock);
     }
 
     #[test]

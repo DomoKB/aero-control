@@ -20,6 +20,8 @@ pub enum DesktopEvent {
 
 enum DesktopCommand {
     Tray(bool),
+    #[cfg(all(test, windows))]
+    FailNextTrayRegistration,
     FanHotkey(bool),
     WifiHotkey(bool),
     DisplayOffHotkey(bool),
@@ -190,6 +192,13 @@ impl DesktopEvents {
         self.test_events.clone()
     }
 
+    #[cfg(all(test, windows))]
+    pub fn fail_next_tray_registration(&self) {
+        self.commands
+            .send(DesktopCommand::FailNextTrayRegistration)
+            .unwrap();
+    }
+
     pub fn last_error(&self) -> Option<String> {
         self.error.lock().ok().and_then(|error| error.clone())
     }
@@ -221,7 +230,11 @@ impl DesktopEvents {
 
     /// Mock mode has no real notification icon from which to reopen the app.
     pub fn can_hide_to_tray(&self) -> bool {
-        !self.mock && self.tray_enabled()
+        self.uses_native_tray() && self.tray_enabled()
+    }
+
+    pub fn uses_native_tray(&self) -> bool {
+        cfg!(windows) && !self.mock
     }
 
     /// Opts in to the known Gigabyte vendor-HID Fn fan report. No ordinary
@@ -320,7 +333,7 @@ mod native {
     use super::*;
     use std::cell::Cell;
     use std::sync::atomic::AtomicU64;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use windows::core::{w, PCWSTR};
     use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -350,6 +363,7 @@ mod native {
     static NEXT_WINDOW_ID: AtomicU64 = AtomicU64::new(0);
     const TRAY_MESSAGE: u32 = WM_APP + 1;
     const TRAY_ID: u32 = 1;
+    const TRAY_RETRY_INTERVAL: Duration = Duration::from_secs(1);
     const MENU_STOP_TIMER: usize = 1;
     const NIN_KEYSELECT: u32 = NIN_SELECT | NINF_KEY;
 
@@ -360,6 +374,9 @@ mod native {
         tray_confirmed: Arc<AtomicBool>,
         tray_desired: Cell<bool>,
         tray_present: Cell<bool>,
+        tray_retry_at: Cell<Option<Instant>>,
+        #[cfg(test)]
+        fail_next_tray_registration: Cell<bool>,
         menu_open: Cell<bool>,
         taskbar_created: u32,
         taskbar_message_allowed: Cell<bool>,
@@ -400,6 +417,7 @@ mod native {
 
         fn set_tray(&self, hwnd: HWND, enabled: bool) {
             self.tray_desired.set(enabled);
+            self.tray_retry_at.set(None);
             if !enabled {
                 self.remove_tray(hwnd);
                 return;
@@ -409,7 +427,6 @@ mod native {
                     "Notification area recovery messages are unavailable; keep the app open."
                         .into(),
                 );
-                let _ = self.tx.send(DesktopEvent::Show);
                 return;
             }
             if self.tray_present.get() {
@@ -430,21 +447,33 @@ mod native {
             for (slot, ch) in data.szTip.iter_mut().zip("aero-control".encode_utf16()) {
                 *slot = ch;
             }
-            if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
-                self.report_error("Windows could not add the notification icon.".into());
+            #[cfg(test)]
+            let simulate_failure = self.fail_next_tray_registration.replace(false);
+            #[cfg(not(test))]
+            let simulate_failure = false;
+            if simulate_failure || !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
+                self.retry_tray("Windows could not add the notification icon.");
                 return;
             }
             self.tray_present.set(true);
             data.Anonymous.uVersion = NOTIFYICON_VERSION_4;
             if !unsafe { Shell_NotifyIconW(NIM_SETVERSION, &data) }.as_bool() {
                 self.remove_tray(hwnd);
-                self.report_error("Windows could not enable notification icon actions.".into());
+                self.retry_tray("Windows could not enable notification icon actions.");
                 return;
             }
             self.tray_confirmed.store(true, Ordering::Release);
             if let Ok(mut error) = self.error.lock() {
                 *error = None;
             }
+        }
+
+        fn retry_tray(&self, message: &str) {
+            // Explorer can start after the logon task. Keep pumping messages
+            // and retry without blocking firmware restoration or opening UI.
+            self.tray_retry_at
+                .set(Some(Instant::now() + TRAY_RETRY_INTERVAL));
+            self.report_error(message.into());
         }
 
         fn set_hotkey(&self, hwnd: HWND, enabled: bool) {
@@ -791,6 +820,9 @@ mod native {
             tray_confirmed,
             tray_desired: Cell::new(false),
             tray_present: Cell::new(false),
+            tray_retry_at: Cell::new(None),
+            #[cfg(test)]
+            fail_next_tray_registration: Cell::new(false),
             menu_open: Cell::new(false),
             taskbar_created,
             taskbar_message_allowed: Cell::new(false),
@@ -830,7 +862,6 @@ mod native {
                 state.report_error(format!(
                     "Could not allow Explorer recovery notifications: {err}"
                 ));
-                let _ = state.tx.send(DesktopEvent::Show);
             }
         }
         let mut message = MSG::default();
@@ -838,12 +869,23 @@ mod native {
             while let Ok(command) = commands.try_recv() {
                 match command {
                     DesktopCommand::Tray(enabled) => state.set_tray(hwnd, enabled),
+                    #[cfg(test)]
+                    DesktopCommand::FailNextTrayRegistration => {
+                        state.fail_next_tray_registration.set(true);
+                    }
                     DesktopCommand::FanHotkey(enabled) => state.set_hotkey(hwnd, enabled),
                     DesktopCommand::WifiHotkey(enabled) => state.set_wifi_hotkey(hwnd, enabled),
                     DesktopCommand::DisplayOffHotkey(enabled) => {
                         state.set_display_off_hotkey(hwnd, enabled)
                     }
                 }
+            }
+            if state
+                .tray_retry_at
+                .get()
+                .is_some_and(|retry_at| Instant::now() >= retry_at)
+            {
+                state.set_tray(hwnd, true);
             }
             while !stop.load(Ordering::Acquire)
                 && unsafe { PeekMessageW(&mut message, None, 0, 0, PM_REMOVE) }.as_bool()
@@ -904,9 +946,6 @@ mod native {
                 state.tray_confirmed.store(false, Ordering::Release);
                 if state.tray_desired.get() {
                     state.set_tray(hwnd, true);
-                    if !state.tray_confirmed.load(Ordering::Acquire) {
-                        let _ = state.tx.send(DesktopEvent::Show);
-                    }
                 }
                 return LRESULT(0);
             }

@@ -45,9 +45,14 @@ impl CpuPowerTab {
         can_write: bool,
         busy: bool,
         identity: &aero_wmi::SkuInfo,
+        confirmed_model: bool,
     ) -> Option<Option<CpuPowerPreset>> {
-        let model = crate::device_identity::model_name(identity);
-        if !crate::device_identity::has_yb_command_set(identity) {
+        let model = if crate::device_identity::uses_confirmed_yb(identity, confirmed_model) {
+            "AERO 17 YB (selected)"
+        } else {
+            crate::device_identity::model_name(identity)
+        };
+        if !crate::device_identity::supports_yb(identity, confirmed_model) {
             self.refresh_needed = false;
             card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
@@ -116,7 +121,7 @@ mod tests {
         let mut action = None;
         let _ = ctx.run(Default::default(), |ctx| {
             egui::CentralPanel::default().show(ctx, |ui| {
-                action = tab.ui(ui, true, false, &identity);
+                action = tab.ui(ui, true, false, &identity, true);
             });
         });
         assert_eq!(action, None);
@@ -132,7 +137,7 @@ mod tests {
             let mut action = None;
             let _ = ctx.run(Default::default(), |ctx| {
                 egui::CentralPanel::default().show(ctx, |ui| {
-                    action = tab.ui(ui, true, false, &crate::device_identity::read(true));
+                    action = tab.ui(ui, true, false, &crate::device_identity::read(true), false);
                 });
             });
             assert_eq!(action, expected);

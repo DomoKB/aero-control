@@ -45,6 +45,26 @@ pub fn has_yb_command_set(identity: &SkuInfo) -> bool {
         .any(|value| matches!(value.as_str(), "AERO17YB" | "P77YB"))
 }
 
+/// A manual selection can fill missing identity, never override a different
+/// reported model. Keep the raw firmware fields intact for diagnostics.
+pub fn can_confirm_yb(identity: &SkuInfo) -> bool {
+    useful(identity.manufacturer.as_deref())
+        .is_some_and(|value| value.eq_ignore_ascii_case("GIGABYTE"))
+        && useful(identity.system_family.as_deref())
+            .is_some_and(|value| value.eq_ignore_ascii_case("AERO"))
+        && useful(identity.model.as_deref()).is_none()
+        && useful(identity.system_sku.as_deref()).is_none()
+        && useful(identity.baseboard_product.as_deref()).is_none()
+}
+
+pub fn uses_confirmed_yb(identity: &SkuInfo, confirmed: bool) -> bool {
+    confirmed && can_confirm_yb(identity)
+}
+
+pub fn supports_yb(identity: &SkuInfo, confirmed: bool) -> bool {
+    has_yb_command_set(identity) || uses_confirmed_yb(identity, confirmed)
+}
+
 pub fn support_note(identity: &SkuInfo) -> String {
     let model = model_name(identity);
     if has_yb_command_set(identity) {
@@ -88,5 +108,35 @@ mod tests {
         assert_eq!(model_name(&identity), "Unknown model");
         assert!(support_note(&identity).contains("Unknown model"));
         assert!(!has_yb_command_set(&identity));
+    }
+
+    #[test]
+    fn confirmation_fills_only_missing_aero_identity() {
+        let mut identity = read(true);
+        identity.manufacturer = Some("GIGABYTE".into());
+        identity.model = None;
+        identity.system_sku = None;
+        identity.baseboard_product = None;
+        identity.system_family = Some("AERO".into());
+        assert!(can_confirm_yb(&identity));
+        assert!(!supports_yb(&identity, false));
+        assert!(supports_yb(&identity, true));
+        assert_eq!(model_name(&identity), "Unknown model");
+        for (model, sku, board) in [
+            (Some("AERO 15 XE4"), None, None),
+            (None, Some("P65XE4"), None),
+            (None, None, Some("Other board")),
+        ] {
+            let mut other = identity.clone();
+            other.model = model.map(str::to_string);
+            other.system_sku = sku.map(str::to_string);
+            other.baseboard_product = board.map(str::to_string);
+            assert!(!supports_yb(&other, true));
+        }
+        identity.manufacturer = None;
+        assert!(!supports_yb(&identity, true));
+        identity.manufacturer = Some("GIGABYTE".into());
+        identity.system_family = Some("AORUS".into());
+        assert!(!supports_yb(&identity, true));
     }
 }

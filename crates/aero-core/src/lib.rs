@@ -22,8 +22,10 @@ mod scale;
 mod registry;
 
 pub use apply::{
-    apply_fixed_duty, apply_mode, apply_profile, curve_drift, reason_for, restore_firmware_auto,
-    update_curve, upload_curve, ApplyError, ApplyReason, ApplyReport, PowerEvent, SlotDiff,
+    apply_fixed_duty, apply_fixed_duty_with_gpu, apply_mode, apply_mode_with_gpu, apply_profile,
+    apply_profile_with_gpu, curve_drift, reason_for, restore_firmware_auto,
+    restore_firmware_auto_with_gpu, update_curve, update_curve_with_gpu, upload_curve,
+    upload_curve_with_gpu, ApplyError, ApplyReason, ApplyReport, GpuPower, PowerEvent, SlotDiff,
 };
 pub use cpu_power::CpuPowerPreset;
 pub use curve::{

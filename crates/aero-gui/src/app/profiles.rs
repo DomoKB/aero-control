@@ -84,6 +84,12 @@ impl ProfilesTab {
         &self.saved
     }
 
+    pub fn confirm_aero_17_yb(&mut self, confirmed: bool) -> Result<(), String> {
+        let mut next = self.saved.clone();
+        next.confirmed_aero_17_yb = confirmed;
+        self.commit(next)
+    }
+
     pub fn mark_startup_setup_complete(&mut self) -> Result<(), String> {
         if self.saved.startup_setup_complete {
             return Ok(());

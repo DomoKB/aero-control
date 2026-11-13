@@ -56,6 +56,7 @@ const HOT: Color32 = Color32::from_rgb(220, 72, 64);
 pub struct AeroApp {
     session: FanSession,
     identity: aero_wmi::SkuInfo,
+    gpu_status: crate::gpu::GpuStatus,
     elevated: bool,
     busy: bool,
     report_error: bool,
@@ -266,6 +267,7 @@ impl AeroApp {
         let mut app = Self {
             session,
             identity,
+            gpu_status: crate::gpu::GpuStatus::Unknown("Not checked yet.".into()),
             elevated: matches!(choice, BackendChoice::Real { elevated: true }),
             busy: false,
             report_error: false,
@@ -332,7 +334,9 @@ impl AeroApp {
         if let Some(snapshot) = initial {
             app.apply_snapshot(snapshot);
         }
-        if crate::device_identity::has_yb_command_set(&app.identity) {
+        app.session
+            .set_model_confirmation(app.profiles.settings().confirmed_aero_17_yb);
+        if app.supports_yb_commands() {
             if let Some(power) = &app.firmware_power {
                 if let Ok(state) = &power.fan_state {
                     app.fan_apply = apply_state::ApplyState::from_readback(state);
@@ -379,17 +383,22 @@ impl AeroApp {
         }
         if self.exit_requested {
             BackgroundAction::Exit
-        } else if self.open_window_requested
-            || (self.report_error
-                && self.dismissed_report_error.as_deref() != Some(self.report.as_str()))
+        } else if self.open_window_requested {
+            BackgroundAction::Open
+        } else if self.background_launch && self.desktop.uses_native_tray() {
+            // Logon sessions stay quiet even during a failed restoration or
+            // delayed tray registration. Opening the executable again also
+            // reaches this session, including when its icon is unavailable.
+            BackgroundAction::Wait
+        } else if (self.report_error
+            && self.dismissed_report_error.as_deref() != Some(self.report.as_str()))
             || (!self.window_has_opened
                 && (self.profiles.load_error().is_some() || !self.session.writes_enabled))
             || self.desktop.last_error().is_some()
             || (!self.desktop.can_hide_to_tray()
                 && self.started.elapsed() > Duration::from_secs(10))
         {
-            // Fail visibly instead of leaving an inaccessible process or a
-            // silently failed restoration in the notification area.
+            // A manual or simulated session can show problems directly.
             BackgroundAction::Open
         } else {
             BackgroundAction::Wait
@@ -447,6 +456,10 @@ impl AeroApp {
 
     fn apply_snapshot(&mut self, snapshot: SensorSnapshot) {
         let t = self.started.elapsed().as_secs_f64();
+        self.gpu_status = snapshot.gpu_status;
+        if !self.gpu_status.allows_commands() {
+            self.last_gpu_request = None;
+        }
         self.sensors.cpu = snapshot.cpu;
         self.sensors.gpu = snapshot.gpu;
         self.sensors.gpu2 = snapshot.gpu2;
@@ -481,7 +494,7 @@ impl AeroApp {
     }
 
     fn reconcile_fan_readback(&mut self) {
-        if self.busy || !crate::device_identity::has_yb_command_set(&self.identity) {
+        if self.busy || !self.supports_yb_commands() {
             return;
         }
         let Some(power) = &self.firmware_power else {
@@ -499,7 +512,7 @@ impl AeroApp {
 
     fn writes_allowed(&self) -> bool {
         self.session.writes_enabled
-            && crate::device_identity::has_yb_command_set(&self.identity)
+            && self.supports_yb_commands()
             && !self.busy
             && self.fan_apply.pending_mode.is_none()
     }
@@ -508,7 +521,7 @@ impl AeroApp {
         if !self.writes_allowed() {
             self.report = if self.busy {
                 "A firmware command is already running.".to_string()
-            } else if !crate::device_identity::has_yb_command_set(&self.identity) {
+            } else if !self.supports_yb_commands() {
                 "Fan commands are not verified for the detected laptop model.".to_string()
             } else {
                 "Fan writes are off. Run aero-gui as Administrator.".to_string()
@@ -720,6 +733,9 @@ impl AeroApp {
                 }
                 profiles::ProfileAction::AutomationChanged => {
                     self.queued_profile = None;
+                    self.session
+                        .set_model_confirmation(self.profiles.settings().confirmed_aero_17_yb);
+                    self.startup_setup_checked = false;
                     if let Err(error) = self
                         .display
                         .set_settings(self.profiles.settings().display.clone())
@@ -747,7 +763,7 @@ impl AeroApp {
             if release_build
                 && self.elevated
                 && self.session.writes_enabled
-                && crate::device_identity::has_yb_command_set(&self.identity)
+                && self.supports_yb_commands()
                 && self.profiles.load_error().is_none()
                 && !self.profiles.settings().startup_setup_complete
             {
@@ -1064,6 +1080,76 @@ impl eframe::App for &mut AeroApp {
 }
 
 impl AeroApp {
+    fn uses_confirmed_model(&self) -> bool {
+        crate::device_identity::uses_confirmed_yb(
+            &self.identity,
+            self.profiles.settings().confirmed_aero_17_yb,
+        )
+    }
+
+    fn supports_yb_commands(&self) -> bool {
+        crate::device_identity::supports_yb(
+            &self.identity,
+            self.profiles.settings().confirmed_aero_17_yb,
+        )
+    }
+
+    fn model_note(&self) -> String {
+        if self.uses_confirmed_model() {
+            "Using your AERO 17 YB model selection because the BIOS does not report a model or SKU. The original firmware identity remains unchanged.".into()
+        } else {
+            crate::device_identity::support_note(&self.identity)
+        }
+    }
+
+    fn set_model_confirmation(&mut self, confirmed: bool) {
+        if confirmed && !crate::device_identity::can_confirm_yb(&self.identity) {
+            return;
+        }
+        match self.profiles.confirm_aero_17_yb(confirmed) {
+            Ok(()) => {
+                self.session.set_model_confirmation(confirmed);
+                self.startup_setup_checked = false;
+                self.reconcile_fan_readback();
+                self.report = if confirmed {
+                    "AERO 17 YB selected. Fan controls are available.".into()
+                } else {
+                    "Model selection cleared. Automatic model detection is required.".into()
+                };
+                self.report_error = false;
+            }
+            Err(error) => {
+                self.report = format!("Could not save the model selection: {error}");
+                self.report_error = true;
+            }
+        }
+    }
+
+    fn model_selection_ui(&mut self, ui: &mut egui::Ui) {
+        if self.uses_confirmed_model() {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("AERO 17 YB · model selected by you").color(MUTED));
+                if ui
+                    .add_enabled(!self.busy, secondary_button("Clear model selection"))
+                    .clicked()
+                {
+                    self.set_model_confirmation(false);
+                }
+            });
+            ui.add_space(12.0);
+        } else if crate::device_identity::can_confirm_yb(&self.identity) {
+            card().show(ui, |ui| {
+                section_title(ui, "Laptop model not reported");
+                ui.label("The BIOS reports a Gigabyte AERO, but its model fields are blank. Confirm the model from your laptop’s label to enable its controls.");
+                if ui.add_enabled(!self.busy && self.session.writes_enabled, primary_button("This laptop is an AERO 17 YB")).clicked() {
+                    self.set_model_confirmation(true);
+                }
+                ui.label(RichText::new("This selection is remembered for startup and is ignored if the BIOS reports a different model.").size(13.0).color(MUTED));
+            });
+            ui.add_space(12.0);
+        }
+    }
+
     fn top_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(
@@ -1078,12 +1164,16 @@ impl AeroApp {
                     .color(MUTED),
             );
             ui.label(
-                RichText::new(crate::device_identity::model_name(&self.identity))
-                    .size(13.0)
-                    .color(MUTED),
+                RichText::new(if self.uses_confirmed_model() {
+                    "AERO 17 YB (selected)"
+                } else {
+                    crate::device_identity::model_name(&self.identity)
+                })
+                .size(13.0)
+                .color(MUTED),
             )
-            .on_hover_text(crate::device_identity::support_note(&self.identity));
-            if !crate::device_identity::has_yb_command_set(&self.identity) {
+            .on_hover_text(self.model_note());
+            if !self.supports_yb_commands() {
                 ui.colored_label(WARN, "Model not verified");
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1134,11 +1224,16 @@ impl AeroApp {
 
     fn fans_ui(&mut self, ui: &mut egui::Ui) {
         page_header(ui, "Fans", "Live readings. The firmware controls the fans.");
+        self.model_selection_ui(ui);
+        if !self.gpu_status.allows_commands() {
+            ui.label(RichText::new(self.gpu_status.explanation()).color(MUTED));
+            ui.add_space(12.0);
+        }
         if let Some(error) = &self.sensor_error {
             banner(ui, error, DANGER);
             ui.add_space(12.0);
         }
-        if !crate::device_identity::has_yb_command_set(&self.identity) {
+        if !self.supports_yb_commands() && !crate::device_identity::can_confirm_yb(&self.identity) {
             banner(
                 ui,
                 &crate::device_identity::support_note(&self.identity),
@@ -1172,9 +1267,13 @@ impl AeroApp {
             1
         };
         let col_w = (width - gap * (cols as f32 - 1.0)) / cols as f32;
-        let gpu2 = parse_temp(&self.sensors.gpu2)
-            .filter(|c| *c > 0.0)
-            .map(|c| format!("sensor 2  {c:.0}°C"));
+        let gpu2 = if self.gpu_status.allows_commands() {
+            parse_temp(&self.sensors.gpu2)
+                .filter(|c| *c > 0.0)
+                .map(|c| format!("sensor 2  {c:.0}°C"))
+        } else {
+            Some(self.gpu_status.label().to_string())
+        };
         let rpm_note = |raw: &str| raw.ends_with('?').then(|| "byte order guessed".to_string());
         let cards = [
             (
@@ -1587,7 +1686,13 @@ impl AeroApp {
             "CPU power limits, GPU performance and the Windows power plan.",
         );
         let allow_cpu = self.writes_allowed();
-        if let Some(preset) = self.cpu_power.ui(ui, allow_cpu, self.busy, &self.identity) {
+        if let Some(preset) = self.cpu_power.ui(
+            ui,
+            allow_cpu,
+            self.busy,
+            &self.identity,
+            self.profiles.settings().confirmed_aero_17_yb,
+        ) {
             self.busy = true;
             self.report = if preset.is_some() {
                 "Applying and verifying CPU power limits…"
@@ -1648,12 +1753,17 @@ impl AeroApp {
             .firmware_power
             .as_ref()
             .map(|power| power.nv_power_config.clone());
+        let gpu_allow = allow && self.gpu_status.allows_commands();
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             section_title(ui, "GPU performance");
+            if !self.gpu_status.allows_commands() {
+                ui.label(self.gpu_status.explanation());
+                return;
+            }
             ui.add_space(10.0);
             let on = self.last_gpu_request.map(usize::from);
-            let items = [("Level 1 · Standard", "", allow), ("Level 2 · Maximum", "", allow)];
+            let items = [("Level 1 · Standard", "", gpu_allow), ("Level 2 · Maximum", "", gpu_allow)];
             if let Some(index) = segmented(ui, "nv_power", &items, on, None) {
                 self.send_power(PowerWrite::NvPowerConfig(index == 1));
             }
@@ -1680,12 +1790,16 @@ impl AeroApp {
         card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             section_title(ui, "GPU thermal profile");
+            if !self.gpu_status.allows_commands() {
+                ui.label("GPU thermal controls are unavailable. The Quiet fan mode remains available and uses the firmware’s quiet fan setting.");
+                return;
+            }
             ui.label("Choose the standard target or the quieter target used by Control Center.");
             ui.horizontal_wrapped(|ui| {
-                if ui.add_enabled(allow, secondary_button("Apply Standard")).clicked() {
+                if ui.add_enabled(gpu_allow, secondary_button("Apply Standard")).clicked() {
                     self.send_power(PowerWrite::ThermalTarget(false));
                 }
-                if ui.add_enabled(allow, secondary_button("Apply Quiet")).clicked() {
+                if ui.add_enabled(gpu_allow, secondary_button("Apply Quiet")).clicked() {
                     self.send_power(PowerWrite::ThermalTarget(true));
                 }
             });
@@ -1703,7 +1817,7 @@ impl AeroApp {
         info_card(
             ui,
             "Model support",
-            &format!("{} CPU presets require a supported processor and a compatible Intel XTU installation. AI and Pantone integrations are excluded. MUX and Dynamic Boost controls are not implemented.", crate::device_identity::support_note(&self.identity)),
+            &format!("{} CPU presets require a supported processor and a compatible Intel XTU installation. AI and Pantone integrations are excluded. MUX and Dynamic Boost controls are not implemented.", self.model_note()),
         );
     }
 
@@ -1816,7 +1930,7 @@ impl AeroApp {
 
     fn send_power(&mut self, write: PowerWrite) {
         if !self.writes_allowed() {
-            self.report = if !crate::device_identity::has_yb_command_set(&self.identity) {
+            self.report = if !self.supports_yb_commands() {
                 "Firmware writes are not verified for the detected laptop model.".to_string()
             } else {
                 "Battery and power writes need an elevated aero-gui and an idle session."
@@ -2308,6 +2422,71 @@ mod background_tests {
     }
 
     #[test]
+    fn missing_model_selection_restores_controls_without_inventing_identity() {
+        let mut app = app();
+        app.identity.manufacturer = Some("GIGABYTE".into());
+        app.identity.model = None;
+        app.identity.system_sku = None;
+        app.identity.baseboard_product = None;
+        app.identity.system_family = Some("AERO".into());
+        app.gpu_status = crate::gpu::GpuStatus::Unavailable;
+        assert!(!app.writes_allowed());
+        app.set_model_confirmation(true);
+        assert!(app.writes_allowed());
+        assert!(app.uses_confirmed_model());
+        assert!(app.profiles.settings().confirmed_aero_17_yb);
+        assert_eq!(
+            crate::device_identity::model_name(&app.identity),
+            "Unknown model"
+        );
+        app.identity.model = Some("AERO 15 XE4".into());
+        assert!(!app.writes_allowed());
+        app.identity.model = None;
+        app.set_model_confirmation(false);
+        assert!(!app.writes_allowed());
+    }
+
+    #[test]
+    fn confirming_missing_model_rechecks_first_launch_startup_eligibility() {
+        let mut app = app();
+        app.identity.manufacturer = Some("GIGABYTE".into());
+        app.elevated = true;
+        app.identity.model = None;
+        app.identity.system_sku = None;
+        app.identity.baseboard_product = None;
+        app.identity.system_family = Some("AERO".into());
+        app.setup_startup_once(true);
+        assert!(app.startup_setup_checked);
+        assert!(!app.profiles.settings().startup_setup_complete);
+        app.set_model_confirmation(true);
+        assert!(!app.startup_setup_checked);
+        app.setup_startup_once(true);
+        let ctx = egui::Context::default();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !app.profiles.settings().startup_setup_complete {
+            app.poll_automation(&ctx);
+            assert!(Instant::now() < deadline, "{}", app.report);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn unavailable_gpu_clears_power_selection_but_not_fan_controls() {
+        let mut app = app();
+        app.last_gpu_request = Some(true);
+        let mut snapshot = app.session.initial_sensors.clone().unwrap();
+        snapshot.gpu_status = crate::gpu::GpuStatus::Unavailable;
+        app.apply_snapshot(snapshot.clone());
+        assert_eq!(app.last_gpu_request, None);
+        assert!(app.writes_allowed());
+        assert!(!app.gpu_status.allows_commands());
+        snapshot.gpu_status = crate::gpu::GpuStatus::Available;
+        app.apply_snapshot(snapshot);
+        assert!(app.writes_allowed());
+        assert!(app.gpu_status.allows_commands());
+    }
+
+    #[test]
     fn first_launch_setup_completes_through_the_app_without_opening_profiles() {
         let mut app = app();
         // Simulate the real launch eligibility while keeping task registration
@@ -2444,25 +2623,33 @@ mod background_tests {
     #[test]
     #[cfg(windows)]
     #[ignore = "Requires an interactive Windows desktop for the real notification icon"]
-    fn native_tray_keeps_mock_restoration_accessible_without_a_control_window() {
+    fn native_tray_retries_logon_registration_without_opening_a_window() {
         let mut app = app();
         // Exercise the real desktop/tray integration, with all hardware and
         // saved settings still isolated in the mock backend.
         app.desktop = crate::desktop_events::DesktopEvents::new(false);
+        app.desktop.fail_next_tray_registration();
         let ctx = egui::Context::default();
         let gaming = aero_core::builtin_config()
             .profile("Gaming")
             .unwrap()
             .clone();
         app.profiles.remember_fan(gaming, None).unwrap();
-        finish(&mut app, &ctx, FanMode::Gaming);
         let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_registration_failure = false;
         while !app.desktop.can_hide_to_tray() {
             assert_eq!(app.poll_background(&ctx), BackgroundAction::Wait);
+            saw_registration_failure |= app.desktop.last_error().as_deref()
+                == Some("Windows could not add the notification icon.");
             assert!(Instant::now() < deadline, "{:?}", app.desktop.last_error());
             std::thread::sleep(Duration::from_millis(20));
         }
+        assert!(saw_registration_failure);
+        assert!(app.desktop.last_error().is_none());
+        finish(&mut app, &ctx, FanMode::Gaming);
         assert!(!app.open_window_requested);
+        app.report_error = true;
+        assert_eq!(app.poll_background(&ctx), BackgroundAction::Wait);
         app.desktop
             .inject_event(crate::desktop_events::DesktopEvent::Show);
         assert_eq!(app.poll_background(&ctx), BackgroundAction::Open);

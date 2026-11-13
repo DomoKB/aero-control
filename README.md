@@ -4,7 +4,7 @@ A native Rust desktop control panel for supported Gigabyte AERO laptops, built a
 
 Control firmware fan modes and curves, request GPU performance levels, manage charging, adjust keyboard lighting, and use everyday Windows controls from one interface. **The firmware backend does not require Gigabyte's `acpimof.dll`, Control Center, or registration of Gigabyte MOF classes.** It opens the laptop's WMI firmware blocks directly through Windows APIs.
 
-**Version: 0.2.1 — pre-release.** Current hardware support targets the **AERO 17 YB / P77YB, BIOS FB10, Intel Core i7-10875H and RTX 2080 Super Max-Q**. Other model names are detected and displayed, but their fan and firmware power writes remain disabled until their command sets are verified.
+**Version: 0.2.5 — pre-release.** Current hardware support targets the **AERO 17 YB / P77YB, BIOS FB10, Intel Core i7-10875H and RTX 2080 Super Max-Q**. Fan control also works with the NVIDIA GPU disabled. Other model names are detected and displayed, but their fan and firmware power writes remain disabled until their command sets are verified.
 
 ![aero-control v0.2.0 Fans tab](docs/images/fans.png)
 

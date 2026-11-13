@@ -9,9 +9,10 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use aero_core::{
-    apply_fixed_duty, apply_mode, apply_profile, clamp_fixed_duty, restore_firmware_auto,
-    set_charge_policy, set_nv_power_config, set_nv_thermal_target, update_curve, upload_curve,
-    ApplyError, ApplyReason, ChargePolicy, CurvePoint, FanCurve, FanMode, Profile,
+    apply_fixed_duty_with_gpu, apply_mode_with_gpu, apply_profile_with_gpu, clamp_fixed_duty,
+    restore_firmware_auto_with_gpu, set_charge_policy, set_nv_power_config, set_nv_thermal_target,
+    update_curve_with_gpu, upload_curve_with_gpu, ApplyError, ApplyReason, ChargePolicy,
+    CurvePoint, FanCurve, FanMode, GpuPower, Profile,
 };
 #[cfg(windows)]
 use aero_wmi::FixedPacer;
@@ -20,6 +21,7 @@ use aero_wmi::{
     SetOutcome, SkuInfo, SkuSource, WmiError, WmiOutput, WriteParams,
 };
 
+use crate::gpu::GpuStatus;
 use crate::log_file::{format_call, CallLog};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +44,7 @@ impl BackendChoice {
 
 #[derive(Clone, Debug)]
 pub struct SensorSnapshot {
+    pub gpu_status: GpuStatus,
     pub cpu: String,
     pub gpu: String,
     pub gpu2: String,
@@ -109,6 +112,9 @@ enum Command {
     Power(PowerWrite),
     RefreshPower,
     CpuPower(Option<aero_core::CpuPowerPreset>),
+    ModelConfirmation(bool),
+    #[cfg(test)]
+    MockGpuStatus(GpuStatus),
     Shutdown,
 }
 
@@ -191,6 +197,15 @@ impl FanSession {
     pub fn refresh_power(&self) {
         let _ = self.tx.send(Command::RefreshPower);
     }
+
+    pub fn set_model_confirmation(&self, confirmed: bool) {
+        let _ = self.tx.send(Command::ModelConfirmation(confirmed));
+    }
+
+    #[cfg(test)]
+    pub fn set_mock_gpu_status(&self, status: GpuStatus) {
+        let _ = self.tx.send(Command::MockGpuStatus(status));
+    }
 }
 
 impl Drop for FanSession {
@@ -250,6 +265,7 @@ fn worker(choice: BackendChoice, rx: Receiver<Command>, tx: Sender<SessionEvent>
         #[cfg(windows)]
         Live::Write(backend) => backend.log.path().display().to_string(),
     };
+    live.refresh_gpu_status();
     let _ = tx.send(SessionEvent {
         sensors: read_sensors_and_power(&mut live),
         message: Some(hello_line(&live, &log_path)),
@@ -267,7 +283,11 @@ fn worker(choice: BackendChoice, rx: Receiver<Command>, tx: Sender<SessionEvent>
     );
     let mut restore_on_exit = false;
     loop {
-        match rx.recv_timeout(Duration::from_secs(2)) {
+        let command = rx.recv_timeout(Duration::from_secs(2));
+        // Refresh before an operation, never part-way through its verification
+        // or recovery. PnP detection does not open the NVIDIA driver.
+        live.refresh_gpu_status();
+        match command {
             Ok(Command::Profile(mut profile, reason)) => {
                 let _ = tx.send(busy());
                 if let Err(error) = crate::profile_store::validate_profile(&profile) {
@@ -303,15 +323,23 @@ fn worker(choice: BackendChoice, rx: Receiver<Command>, tx: Sender<SessionEvent>
                     }
                     cpu_snapshot = Some(outcome);
                 }
+                // CPU preflight can take time. Recheck availability immediately
+                // before the fan sequence, then freeze it through verification.
+                live.refresh_gpu_status();
                 let outcome = catch_unwind(AssertUnwindSafe(|| {
+                    let gpu = live.gpu_power();
                     let report = match &mut live {
                         Live::Mock(backend) => {
-                            apply_profile(backend, &mut NoPacer, &profile, reason)?
+                            apply_profile_with_gpu(backend, &mut NoPacer, &profile, reason, gpu)?
                         }
                         #[cfg(windows)]
-                        Live::Write(backend) => {
-                            apply_profile(backend, &mut FixedPacer::standard(), &profile, reason)?
-                        }
+                        Live::Write(backend) => apply_profile_with_gpu(
+                            backend,
+                            &mut FixedPacer::standard(),
+                            &profile,
+                            reason,
+                            gpu,
+                        )?,
                         #[cfg(windows)]
                         Live::Read(_) => {
                             return Err(ApplyError::Wmi(WmiError::NotAvailable(
@@ -364,6 +392,21 @@ fn worker(choice: BackendChoice, rx: Receiver<Command>, tx: Sender<SessionEvent>
                     cpu_power: Some(outcome),
                     message: Some(message),
                     error,
+                    ..idle()
+                });
+            }
+            Ok(Command::ModelConfirmation(confirmed)) => {
+                let mock = matches!(choice, BackendChoice::Mock);
+                let identity = crate::device_identity::read(mock);
+                cpu.set_supported_model(crate::device_identity::supports_yb(&identity, confirmed));
+            }
+            #[cfg(test)]
+            Ok(Command::MockGpuStatus(status)) => {
+                if let Live::Mock(backend) = &mut live {
+                    backend.gpu_status = status;
+                }
+                let _ = tx.send(SessionEvent {
+                    sensors: read_sensors_and_power(&mut live),
                     ..idle()
                 });
             }
@@ -513,7 +556,11 @@ fn worker(choice: BackendChoice, rx: Receiver<Command>, tx: Sender<SessionEvent>
                         continue;
                     }
                 }
-                if wait_or_shutdown(&rx, &tx, &mut live, Duration::from_secs(10)) {
+                let shutdown = wait_or_shutdown(&rx, &tx, &mut live, Duration::from_secs(10));
+                // The adapter may have been disabled during the test. Recovery
+                // is a new sequence and must use its current availability.
+                live.refresh_gpu_status();
+                if shutdown {
                     let _ = restore_any(&mut live);
                     break;
                 }
@@ -533,10 +580,12 @@ fn worker(choice: BackendChoice, rx: Receiver<Command>, tx: Sender<SessionEvent>
                     error: failed,
                     busy: false,
                     fan_result: Some(!failed),
-                    gpu_request: Some(if failed {
-                        Err("Max recovery failed.".into())
-                    } else {
-                        Ok(false)
+                    gpu_request: live.gpu_status().allows_commands().then(|| {
+                        if failed {
+                            Err("Max recovery failed.".into())
+                        } else {
+                            Ok(false)
+                        }
                     }),
                     cpu_power: None,
                 });
@@ -686,6 +735,23 @@ mod cpu_profile_tests {
             52_000
         );
     }
+
+    #[test]
+    fn model_confirmation_changes_keep_current_cpu_limits() {
+        let session = FanSession::start(BackendChoice::Mock);
+        session.cpu_power(Some(aero_core::CpuPowerPreset::Level5));
+        assert_eq!(
+            completed(&session).cpu_power.unwrap().unwrap().pl1_mw,
+            62_000
+        );
+        session.set_model_confirmation(true);
+        session.set_model_confirmation(false);
+        session.cpu_power(None);
+        assert_eq!(
+            completed(&session).cpu_power.unwrap().unwrap().pl1_mw,
+            62_000
+        );
+    }
 }
 
 fn busy() -> SessionEvent {
@@ -763,6 +829,229 @@ mod completion_tests {
     }
 }
 
+#[cfg(test)]
+mod gpu_session_tests {
+    use super::*;
+
+    fn completed(session: &FanSession) -> SessionEvent {
+        loop {
+            let event = session
+                .rx
+                .recv_timeout(Duration::from_secs(3))
+                .expect("mock command completes");
+            if !event.busy {
+                return event;
+            }
+        }
+    }
+
+    fn with_disabled_gpu(action: impl FnOnce(&mut Live)) {
+        let dir = std::env::temp_dir().join(format!(
+            "aero-disabled-gpu-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut backend = Logged::new(
+            MockAcpi::aero_17_yb_fixture(),
+            CallLog::open_in(&dir).unwrap(),
+        );
+        backend.gpu_status = GpuStatus::Unavailable;
+        backend
+            .inner
+            .throw_setters
+            .insert("SetNvPowerConfig".into());
+        let mut live = Live::Mock(backend);
+        action(&mut live);
+        let Live::Mock(backend) = &live else {
+            unreachable!()
+        };
+        assert!(backend.inner.calls.iter().all(|call| !matches!(
+            call.method.as_str(),
+            "SetNvPowerConfig" | "GetNvPowerConfig" | "getGpuTemp1" | "getGpuTemp2"
+        )));
+        drop(live);
+        std::fs::remove_file(dir.join("aero-control.log")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn unavailable_and_unknown_gpus_keep_cpu_and_fan_readings_without_gpu_queries() {
+        for status in [
+            GpuStatus::Unavailable,
+            GpuStatus::Unknown("PnP failed".into()),
+        ] {
+            let mut reader = MockAcpi::aero_17_yb_fixture();
+            let sensors = snapshot(&mut reader, &status);
+            let power = power_snapshot(&mut reader, &status);
+            assert_eq!(sensors.gpu_status, status);
+            assert_eq!(sensors.gpu, "Unavailable");
+            assert_eq!(sensors.gpu2, "Unavailable");
+            assert!(sensors.error.is_none());
+            assert!(sensors.cpu.ends_with("°C"));
+            assert!(sensors.rpm1.contains("RPM"));
+            assert!(sensors.rpm2.contains("RPM"));
+            assert!(power.nv_power_config.is_err());
+            assert!(power.nv_thermal_target.is_ok());
+            assert!(power.fan_state.is_ok());
+            assert!(reader.calls.iter().all(|call| !matches!(
+                call.method.as_str(),
+                "GetNvPowerConfig" | "getGpuTemp1" | "getGpuTemp2"
+            )));
+        }
+    }
+
+    #[test]
+    fn all_fan_modes_curves_and_fixed_duty_work_without_nvidia_power_access() {
+        with_disabled_gpu(|live| {
+            for mode in [
+                FanMode::Normal,
+                FanMode::Quiet,
+                FanMode::Gaming,
+                FanMode::Fixed,
+                FanMode::Max,
+            ] {
+                let outcome = Ok(apply_any(live, mode, 120, false));
+                let event =
+                    finish_fan_apply(live, &mut false, outcome, Some(mode == FanMode::Gaming));
+                assert_eq!(event.fan_result, Some(true), "{:?}", event.message);
+                assert_eq!(event.gpu_request, None);
+                assert_eq!(
+                    event
+                        .sensors
+                        .unwrap()
+                        .power
+                        .unwrap()
+                        .fan_state
+                        .unwrap()
+                        .mode,
+                    mode
+                );
+            }
+            fixed_duty_any(live, 140, false).unwrap();
+            let curve = aero_core::quiet_curve().points().to_vec();
+            upload_any(live, curve.clone(), false).unwrap();
+            upload_any(live, curve, true).unwrap();
+            restore_any(live).unwrap();
+        });
+    }
+
+    #[test]
+    fn disabled_gpu_recovery_and_rejected_direct_requests_do_not_access_nvidia() {
+        with_disabled_gpu(|live| {
+            apply_any(live, FanMode::Quiet, 0, false).unwrap();
+            let Live::Mock(backend) = live else {
+                unreachable!()
+            };
+            let calls_before = backend.inner.calls.len();
+            assert!(power_any(live, PowerWrite::NvPowerConfig(true)).is_err());
+            let Live::Mock(backend) = live else {
+                unreachable!()
+            };
+            assert_eq!(backend.inner.calls.len(), calls_before);
+            assert_eq!(backend.inner.nv_thermal_target, 1);
+            backend
+                .inner
+                .ignored_setters
+                .insert("SetAutoFanStatus".into());
+            let outcome = Ok(apply_any(live, FanMode::Gaming, 0, false));
+            let event = finish_fan_apply(live, &mut false, outcome, Some(true));
+            assert_eq!(event.fan_result, Some(false));
+            assert_eq!(event.gpu_request, None);
+            assert!(event.message.unwrap().contains("auto was restored"));
+            assert_eq!(
+                event
+                    .sensors
+                    .unwrap()
+                    .power
+                    .unwrap()
+                    .fan_state
+                    .unwrap()
+                    .mode,
+                FanMode::Normal
+            );
+        });
+    }
+
+    #[test]
+    fn worker_profiles_restore_fans_without_gpu_requests_and_resume_requests_when_available() {
+        let session = FanSession::start(BackendChoice::Mock);
+        session.set_mock_gpu_status(GpuStatus::Unavailable);
+        assert_eq!(
+            completed(&session).sensors.unwrap().gpu_status,
+            GpuStatus::Unavailable
+        );
+        let mut profile = aero_core::builtin_config()
+            .profile("Gaming")
+            .unwrap()
+            .clone();
+        profile.nv_power_config = Some(1);
+        session.profile(profile.clone(), ApplyReason::Startup);
+        let event = completed(&session);
+        assert_eq!(event.fan_result, Some(true));
+        assert_eq!(event.gpu_request, None);
+        assert_eq!(
+            event
+                .sensors
+                .unwrap()
+                .power
+                .unwrap()
+                .fan_state
+                .unwrap()
+                .mode,
+            FanMode::Gaming
+        );
+        session.power(PowerWrite::NvPowerConfig(true));
+        let event = completed(&session);
+        assert!(event.error);
+        assert_eq!(event.fan_result, None);
+        assert_eq!(
+            event
+                .sensors
+                .unwrap()
+                .power
+                .unwrap()
+                .fan_state
+                .unwrap()
+                .mode,
+            FanMode::Gaming
+        );
+        session.set_mock_gpu_status(GpuStatus::Available);
+        assert_eq!(
+            completed(&session).sensors.unwrap().gpu_status,
+            GpuStatus::Available
+        );
+        session.profile(profile, ApplyReason::Resume);
+        let event = completed(&session);
+        assert_eq!(event.fan_result, Some(true));
+        assert_eq!(event.gpu_request, Some(Ok(true)));
+    }
+
+    #[test]
+    fn max_test_shutdown_restores_firmware_auto_without_gpu_access() {
+        with_disabled_gpu(|live| {
+            apply_any(live, FanMode::Max, 229, false).unwrap();
+            let (command_tx, command_rx) = mpsc::channel();
+            let (event_tx, _event_rx) = mpsc::channel();
+            command_tx.send(Command::Shutdown).unwrap();
+            assert!(wait_or_shutdown(
+                &command_rx,
+                &event_tx,
+                live,
+                Duration::from_secs(10)
+            ));
+            restore_any(live).unwrap();
+            let sensors = read_sensors_and_power(live).unwrap();
+            assert_eq!(
+                sensors.power.unwrap().fan_state.unwrap().mode,
+                FanMode::Normal
+            );
+        });
+    }
+}
+
 fn finish_fan_apply(
     live: &mut Live,
     restore_on_exit: &mut bool,
@@ -770,7 +1059,9 @@ fn finish_fan_apply(
     requested_gpu: Option<bool>,
 ) -> SessionEvent {
     let mut event = finish_apply(live, restore_on_exit, outcome);
-    event.gpu_request = if event.error {
+    event.gpu_request = if !live.gpu_status().allows_commands() {
+        None
+    } else if event.error {
         Some(Err("The GPU request is unconfirmed after recovery.".into()))
     } else {
         requested_gpu.map(Ok)
@@ -875,6 +1166,37 @@ enum Live {
 }
 
 impl Live {
+    fn gpu_status(&self) -> &GpuStatus {
+        match self {
+            Self::Mock(backend) => &backend.gpu_status,
+            #[cfg(windows)]
+            Self::Read(backend) => &backend.gpu_status,
+            #[cfg(windows)]
+            Self::Write(backend) => &backend.gpu_status,
+        }
+    }
+
+    fn gpu_power(&self) -> GpuPower {
+        if self.gpu_status().allows_commands() {
+            GpuPower::Available
+        } else {
+            GpuPower::Unavailable
+        }
+    }
+
+    fn refresh_gpu_status(&mut self) {
+        // Mock status is controlled by its fixture, never by the host machine.
+        #[cfg(windows)]
+        if !matches!(self, Self::Mock(_)) {
+            let status = crate::gpu::detect(false);
+            match self {
+                Self::Read(backend) => backend.gpu_status = status,
+                Self::Write(backend) => backend.gpu_status = status,
+                Self::Mock(_) => unreachable!(),
+            }
+        }
+    }
+
     fn label(&self) -> &'static str {
         match self {
             Self::Mock(_) => "MOCK",
@@ -943,11 +1265,12 @@ fn open_backend(choice: BackendChoice, log: Option<CallLog>) -> Result<Live, Str
 }
 
 fn apply_any(live: &mut Live, mode: FanMode, raw: u8, expert: bool) -> Result<String, ApplyError> {
+    let gpu = live.gpu_power();
     let report = match live {
-        Live::Mock(backend) => apply_mode(backend, &mut NoPacer, mode, raw, expert)?,
+        Live::Mock(backend) => apply_mode_with_gpu(backend, &mut NoPacer, mode, raw, expert, gpu)?,
         #[cfg(windows)]
         Live::Write(backend) => {
-            apply_mode(backend, &mut FixedPacer::standard(), mode, raw, expert)?
+            apply_mode_with_gpu(backend, &mut FixedPacer::standard(), mode, raw, expert, gpu)?
         }
         #[cfg(windows)]
         Live::Read(_) => {
@@ -964,11 +1287,12 @@ fn apply_any(live: &mut Live, mode: FanMode, raw: u8, expert: bool) -> Result<St
 }
 
 fn fixed_duty_any(live: &mut Live, raw: u8, expert: bool) -> Result<String, ApplyError> {
+    let gpu = live.gpu_power();
     let report = match live {
-        Live::Mock(backend) => apply_fixed_duty(backend, &mut NoPacer, raw, expert)?,
+        Live::Mock(backend) => apply_fixed_duty_with_gpu(backend, &mut NoPacer, raw, expert, gpu)?,
         #[cfg(windows)]
         Live::Write(backend) => {
-            apply_fixed_duty(backend, &mut FixedPacer::standard(), raw, expert)?
+            apply_fixed_duty_with_gpu(backend, &mut FixedPacer::standard(), raw, expert, gpu)?
         }
         #[cfg(windows)]
         Live::Read(_) => {
@@ -991,15 +1315,18 @@ fn upload_any(
     slots_only: bool,
 ) -> Result<String, ApplyError> {
     let curve = FanCurve::try_new(points).map_err(ApplyError::InvalidCurve)?;
+    let gpu = live.gpu_power();
     let report = match (live, slots_only) {
-        (Live::Mock(backend), false) => upload_curve(backend, &mut NoPacer, &curve)?,
-        (Live::Mock(backend), true) => update_curve(backend, &mut NoPacer, &curve)?,
+        (Live::Mock(backend), false) => upload_curve_with_gpu(backend, &mut NoPacer, &curve, gpu)?,
+        (Live::Mock(backend), true) => update_curve_with_gpu(backend, &mut NoPacer, &curve, gpu)?,
         #[cfg(windows)]
         (Live::Write(backend), false) => {
-            upload_curve(backend, &mut FixedPacer::standard(), &curve)?
+            upload_curve_with_gpu(backend, &mut FixedPacer::standard(), &curve, gpu)?
         }
         #[cfg(windows)]
-        (Live::Write(backend), true) => update_curve(backend, &mut FixedPacer::standard(), &curve)?,
+        (Live::Write(backend), true) => {
+            update_curve_with_gpu(backend, &mut FixedPacer::standard(), &curve, gpu)?
+        }
         #[cfg(windows)]
         (Live::Read(_), _) => {
             return Err(ApplyError::Wmi(WmiError::NotAvailable(
@@ -1015,6 +1342,11 @@ fn upload_any(
 }
 
 fn power_any(live: &mut Live, write: PowerWrite) -> Result<String, ApplyError> {
+    if matches!(write, PowerWrite::NvPowerConfig(_)) && !live.gpu_status().allows_commands() {
+        return Err(ApplyError::Wmi(WmiError::NotAvailable(
+            "NVIDIA power control is unavailable while the GPU is off or its status is unknown",
+        )));
+    }
     match live {
         Live::Mock(backend) => run_power(backend, &mut NoPacer, write),
         #[cfg(windows)]
@@ -1210,7 +1542,7 @@ mod firmware_control_tests {
         reader.sleep_usb_charge = 1;
         reader.hibernation_usb_charge = 0;
         reader.nv_thermal_target = 1;
-        let power = power_snapshot(&mut reader);
+        let power = power_snapshot(&mut reader, &GpuStatus::Available);
         assert_eq!(power.camera, Ok(0));
         assert_eq!(power.sleep_usb_charge, Ok(1));
         assert_eq!(power.hibernation_usb_charge, Ok(0));
@@ -1225,7 +1557,7 @@ mod firmware_control_tests {
     #[test]
     fn ordinary_sensor_polls_do_not_repeat_device_or_identity_reads() {
         let mut reader = MockAcpi::aero_17_yb_fixture();
-        snapshot(&mut reader);
+        snapshot(&mut reader, &GpuStatus::Available);
         assert!(reader.calls.iter().all(|call| ![
             "GetCamera",
             "GetSleepUSBCharge",
@@ -1247,10 +1579,13 @@ mod firmware_control_tests {
 }
 
 fn restore_any(live: &mut Live) -> Result<(), ApplyError> {
+    let gpu = live.gpu_power();
     match live {
-        Live::Mock(backend) => restore_firmware_auto(backend, &mut NoPacer),
+        Live::Mock(backend) => restore_firmware_auto_with_gpu(backend, &mut NoPacer, gpu),
         #[cfg(windows)]
-        Live::Write(backend) => restore_firmware_auto(backend, &mut FixedPacer::standard()),
+        Live::Write(backend) => {
+            restore_firmware_auto_with_gpu(backend, &mut FixedPacer::standard(), gpu)
+        }
         #[cfg(windows)]
         Live::Read(_) => Err(ApplyError::Wmi(WmiError::NotAvailable(
             "recovery requires elevation",
@@ -1259,22 +1594,24 @@ fn restore_any(live: &mut Live) -> Result<(), ApplyError> {
 }
 
 fn read_sensors(live: &mut Live) -> Option<SensorSnapshot> {
+    let gpu_status = live.gpu_status().clone();
     match live {
-        Live::Mock(backend) => Some(snapshot(backend)),
+        Live::Mock(backend) => Some(snapshot(backend, &gpu_status)),
         #[cfg(windows)]
-        Live::Read(backend) => Some(snapshot(backend)),
+        Live::Read(backend) => Some(snapshot(backend, &gpu_status)),
         #[cfg(windows)]
-        Live::Write(backend) => Some(snapshot(backend)),
+        Live::Write(backend) => Some(snapshot(backend, &gpu_status)),
     }
 }
 
 fn read_sensors_and_power(live: &mut Live) -> Option<SensorSnapshot> {
+    let gpu_status = live.gpu_status().clone();
     let power = match live {
-        Live::Mock(backend) => power_snapshot(backend),
+        Live::Mock(backend) => power_snapshot(backend, &gpu_status),
         #[cfg(windows)]
-        Live::Read(backend) => power_snapshot(backend),
+        Live::Read(backend) => power_snapshot(backend, &gpu_status),
         #[cfg(windows)]
-        Live::Write(backend) => power_snapshot(backend),
+        Live::Write(backend) => power_snapshot(backend, &gpu_status),
     };
     read_sensors(live).map(|sensors| SensorSnapshot {
         power: Some(power),
@@ -1282,7 +1619,10 @@ fn read_sensors_and_power(live: &mut Live) -> Option<SensorSnapshot> {
     })
 }
 
-fn power_snapshot<R: AcpiReader + SkuSource>(reader: &mut R) -> PowerSnapshot {
+fn power_snapshot<R: AcpiReader + SkuSource>(
+    reader: &mut R,
+    gpu_status: &GpuStatus,
+) -> PowerSnapshot {
     let mut read = |method: &str| {
         reader
             .get(method, &[])
@@ -1294,7 +1634,11 @@ fn power_snapshot<R: AcpiReader + SkuSource>(reader: &mut R) -> PowerSnapshot {
     let charge_policy = read("GetChargePolicy");
     let charge_stop = read("GetChargeStop");
     let battery_health = read("GetBatteryHealth");
-    let nv_power_config = read("GetNvPowerConfig");
+    let nv_power_config = if gpu_status.allows_commands() {
+        read("GetNvPowerConfig")
+    } else {
+        Err("NVIDIA GPU is off or unavailable; its power flag was not read.".into())
+    };
     let nv_thermal_target = read("GetNvThermalTarget");
     let camera = read("GetCamera");
     let sleep_usb_charge = read("GetSleepUSBCharge");
@@ -1315,11 +1659,17 @@ fn power_snapshot<R: AcpiReader + SkuSource>(reader: &mut R) -> PowerSnapshot {
     }
 }
 
-fn snapshot<R: AcpiReader>(reader: &mut R) -> SensorSnapshot {
+fn snapshot<R: AcpiReader>(reader: &mut R, gpu_status: &GpuStatus) -> SensorSnapshot {
     let mut errors = Vec::new();
     let cpu = read_temp(reader, "getCpuTemp", &mut errors);
-    let gpu = read_temp(reader, "getGpuTemp1", &mut errors);
-    let gpu2 = read_temp(reader, "getGpuTemp2", &mut errors);
+    let (gpu, gpu2) = if gpu_status.allows_commands() {
+        (
+            read_temp(reader, "getGpuTemp1", &mut errors),
+            read_temp(reader, "getGpuTemp2", &mut errors),
+        )
+    } else {
+        ("Unavailable".into(), "Unavailable".into())
+    };
     let rpm1 = read_rpm(reader, "getRpm1", &mut errors);
     let rpm2 = read_rpm(reader, "getRpm2", &mut errors);
     let flags = format!(
@@ -1330,6 +1680,7 @@ fn snapshot<R: AcpiReader>(reader: &mut R) -> SensorSnapshot {
         read_flag(reader, "GetFanAdjustStatus", &mut errors),
     );
     SensorSnapshot {
+        gpu_status: gpu_status.clone(),
         cpu,
         gpu,
         gpu2,
@@ -1397,11 +1748,18 @@ fn read_flag<R: AcpiReader>(reader: &mut R, method: &str, errors: &mut Vec<Strin
 struct Logged<T> {
     inner: T,
     log: CallLog,
+    gpu_status: GpuStatus,
 }
 
 impl<T> Logged<T> {
     fn new(inner: T, log: CallLog) -> Self {
-        Self { inner, log }
+        Self {
+            inner,
+            log,
+            // The real worker replaces this with a PnP reading before its
+            // first snapshot; mocks keep the enabled-GPU fixture by default.
+            gpu_status: GpuStatus::Available,
+        }
     }
 }
 

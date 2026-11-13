@@ -44,6 +44,10 @@ impl CpuPower {
         }
     }
 
+    pub fn set_supported_model(&mut self, supported: bool) {
+        self.supported_model = supported;
+    }
+
     pub fn read(&self) -> Result<CpuPowerSnapshot, String> {
         self.check_model()?;
         if self.mock {

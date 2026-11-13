@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.5 — 2026-11-13
+
+- Fix the frozen window left behind when closing a startup/tray session. Process deferred Windows window destruction after the renderer exits and continue servicing those messages in the background.
+- Test the actual Windows close-message path, verify the old native window is destroyed before reopening, and cover repeated close/open and tray Exit with simulated fan hardware.
+
+## 0.2.4
+
+- Detect NVIDIA availability through the Windows device tree. Keep fan modes, saved-mode restoration and recovery working when the GPU is disabled or unavailable, without NVIDIA power requests or GPU temperature queries. Preserve the official sequence when the GPU is available.
+- Retain the firmware quiet/thermal flag in both configurations because it controls the embedded controller’s fan state independently of the GPU. Show GPU availability and withhold GPU performance controls when unavailable.
+- Allow a remembered AERO 17 YB model selection when a Gigabyte AERO BIOS leaves model, SKU and baseboard fields blank. Keep original identity readings visible and ignore the selection if another model is reported.
+
+## 0.2.3
+
+- Keep Windows sign-in launches in the notification area. Retry adding the icon while Explorer starts, and show the control window when the user opens it from the icon or launches aero-control manually.
+
 ## 0.2.2 — 2026-11-09
 
 - Fix tray Exit and Open becoming unresponsive after closing the control window. Closing now returns the same controller to its background loop, so tray commands and resume handling do not depend on Windows repainting a hidden window.

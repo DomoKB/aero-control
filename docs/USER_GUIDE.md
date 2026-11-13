@@ -4,13 +4,17 @@
 
 Run the release executable directly and approve Windows administrator access when using real firmware controls. The header shows the detected model and app version. Unsupported models retain their own name and show unavailable controls. Simulation is labelled explicitly; successful administrator access is not shown as a badge during normal use.
 
+If the BIOS reports a Gigabyte AERO but leaves its model, SKU and baseboard fields blank, Fans offers **This laptop is an AERO 17 YB**. Select this only for that model. The app remembers your selection, labels it as selected, and leaves the original firmware readings unchanged. **Clear model selection** removes it. A different model reported by the BIOS overrides this selection and retains its normal support checks.
+
 Extract the app to a permanent folder before this first launch. On supported hardware, the release automatically configures background startup using the same administrator approval; there is no separate setup button to find. Choose a fan mode and it is remembered for later Windows sign-ins. You can disable startup on Profiles. Simulation, debug builds, unsupported hardware, non-elevated sessions and invalid saved settings never trigger automatic registration.
 
 Use one hardware-control app at a time while comparing behaviour. aero-control does not uninstall or disable Control Center, its services, or Intel XTU.
 
 ## Fans and curves
 
-Choose Normal, Quiet or Gaming for the corresponding firmware mode. Gaming also sends GPU Level 2 and uses the Standard thermal profile. A later fan-mode selection can replace a manually selected GPU request.
+Choose Normal, Quiet or Gaming for the corresponding firmware mode. With an available NVIDIA GPU, Gaming also sends GPU Level 2 and uses the Standard thermal profile. A later fan-mode selection can replace a manually selected GPU request.
+
+Fan control works with the NVIDIA GPU enabled or disabled. The app detects availability without opening the GPU driver. When it is unavailable, fan modes and their restoration still work, NVIDIA power requests and GPU temperature queries are skipped, and GPU performance controls are unavailable. Quiet retains the firmware quiet fan setting. This does not enable the GPU or change the BIOS graphics setting. Re-enabling the GPU in the BIOS restores the usual NVIDIA requests on the next launch; device availability is also checked while the app runs.
 
 Fixed sets the same duty for both fans. The normal fixed-duty floor is 35%; Expert mode permits lower fixed values. Max requires confirmation and requests full-scale duty. The separate ten-second Max test restores Normal afterward.
 
@@ -40,7 +44,9 @@ Cold-boot restoration is configured automatically on the first supported release
 
 Keep the registered executable path stable. If moving an installation, disable the task using the old copy and inspect/remove the old task in Windows Task Scheduler before enabling startup from the new copy; an existing task pointing elsewhere is never silently taken over. For deployment, `aero-gui.exe --enable-startup` registers or upgrades the task and exits without touching fan hardware; `--disable-startup` disables it.
 
-Opening aero-control again brings up the running controller instead of starting a second one. Startup failures, invalid saved settings or an unavailable tray icon open the window so the problem is visible. Simulation has no real tray icon and falls back to a visible window.
+At sign-in, the control window stays closed while aero-control restores the saved fan mode and waits for Windows to accept its notification icon. Open the app from the icon to review its status or change settings. If the icon is unavailable, launch aero-control manually to open the existing controller and see any startup errors. Simulation opens a visible window because it has no notification icon.
+
+In a Windows-startup session, **X** closes the control window and leaves the notification icon running. **Exit** from that icon stops the app. A manual launch with **Keep in notification area** off exits when you click **X**. Closing must remove the window promptly; a visible frozen window is an error, not normal tray behaviour.
 
 Profiles may use `cpu_power_preset` values `level-1` through `level-5`, `default` or `battery`. Legacy `cpu_pl1_w` / `cpu_pl2_w` entries are retained as data but do not apply arbitrary CPU limits; do not combine them with a preset. CPU is applied before a profile's firmware writes. CPU failure prevents those writes. If firmware application later fails, its recovery runs and the already-applied CPU preset remains, as the report explains.
 
