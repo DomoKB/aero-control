@@ -6,9 +6,15 @@ Control firmware fan modes and curves, request GPU performance levels, manage ch
 
 **Version: 0.2.5 — pre-release.** Current hardware support targets the **AERO 17 YB / P77YB, BIOS FB10, Intel Core i7-10875H and RTX 2080 Super Max-Q**. Fan control also works with the NVIDIA GPU disabled. Other model names are detected and displayed, but their fan and firmware power writes remain disabled until their command sets are verified.
 
+[Download the Windows release](https://github.com/DomoKB/aero-control/releases/tag/v0.2.5) (ZIP and SHA-256 checksum).
+
 ![aero-control v0.2.0 Fans tab](docs/images/fans.png)
 
-*Fans tab in Simulation mode. Readings shown are sample data.*
+*Fans tab from v0.2.0 in Simulation mode. Readings shown are sample data.*
+
+## Recent updates
+
+Since v0.2.2, Windows sign-in launches stay in the notification area while restoring the saved fan mode, including when Explorer is slow to start. Fan control now supports the NVIDIA GPU being enabled or disabled, and a remembered model selection is available when a Gigabyte AERO BIOS omits its model identifiers. Version 0.2.5 fixes the frozen window left behind when closing a startup/tray session. See the [changelog](CHANGELOG.md) for the full history.
 
 ## Features
 
@@ -32,7 +38,7 @@ The desktop app, firmware transport, fan logic, keyboard HID implementation and 
 
 Optional **CPU power tuning is an exception**: a small embedded PowerShell bridge calls the signed Intel XTU SDK already installed on the machine. It needs a compatible Intel service and processor configuration. CPU tuning can be unavailable while the rest of the app works. Intel binaries are not bundled, installed or replaced by aero-control.
 
-Normal Windows libraries, device drivers and the NVIDIA driver are still used. "No Gigabyte DLL required" does not mean the executable has no operating-system dependencies.
+Normal Windows libraries and device drivers are still used; GPU power features also depend on the NVIDIA driver. "No Gigabyte DLL required" does not mean the executable has no operating-system dependencies.
 
 ## Build and run
 
@@ -57,6 +63,8 @@ Simulation is clearly labelled and uses in-memory hardware and settings. A Windo
 
 If using a packaged release, extract the whole ZIP to a permanent folder and launch `aero-gui.exe`. Keep that path stable: the app registers it for Windows background startup. Close older copies before opening an updated build.
 
+If the BIOS identifies a Gigabyte AERO but leaves its model, SKU and baseboard fields blank, the Fans page offers **This laptop is an AERO 17 YB**. Use this only for that model. The selection is remembered and labelled as selected; original firmware readings remain unchanged. **Clear model selection** removes it. A different model reported by the BIOS takes precedence and retains its support checks.
+
 On its first supported release launch, the app automatically sets up Windows background startup after the normal administrator prompt. Choose your fan mode; future Windows sign-ins restore it silently. Quitting the app does not disable startup. To opt out, use **Profiles → Start with Windows → Disable logon startup**; later launches respect that choice. Simulation, debug builds, unsupported hardware and invalid settings do not trigger automatic setup. Setup errors are shown rather than reported as success.
 
 ## How fan control works
@@ -65,7 +73,7 @@ The app sends a mode or curve to the embedded controller; **the firmware runs th
 
 - **Normal** uses the official normal firmware sequence.
 - **Quiet** selects the quiet thermal profile and official quiet fan settings.
-- **Gaming** enables the firmware boost fan curve, selects the Standard thermal profile and sends a GPU Level 2 request.
+- **Gaming** enables the firmware boost fan curve and selects the Standard thermal profile. It also sends a GPU Level 2 request when the NVIDIA GPU is available.
 - **Fixed** sets one duty for both fans. **Max** requests raw duty 229, the protocol's full-scale value.
 - **Custom** uploads the validated firmware curve. Once Custom is active, valid editor changes apply automatically when editing finishes.
 
@@ -76,6 +84,8 @@ Mode and curve operations check durable fan/thermal settings and curve bytes. Fa
 ## GPU and CPU power
 
 **GPU Level 1 and Level 2 are requests, not wattage sliders.** The NVIDIA request flag can clear within milliseconds after a command. It is not used as a permanent confirmation of the GPU's active power budget. The UI shows the last request sent in the current session; it starts unknown after restart. The thermal profile has a separate, durable Standard/Quiet getter. Actual GPU power and performance under load are not yet validated.
+
+NVIDIA availability is detected through the Windows device tree. When the GPU is disabled, unavailable or its availability cannot be determined, fan modes, curves, restoration and recovery continue without NVIDIA power requests or GPU temperature queries. GPU performance controls are unavailable. The firmware's Standard/Quiet setting is retained because it also controls embedded-controller fan state. This does not enable the GPU or change BIOS graphics settings; verified GPU availability restores the usual NVIDIA request sequence.
 
 The supported i7 CPU presets match Control Center's reference table:
 
@@ -93,6 +103,8 @@ CPU changes require an explicit Apply or an explicitly enabled profile action. T
 ## Profiles and everyday use
 
 Successful fan changes are remembered automatically and restored when the app opens or resumes from sleep, matching Control Center's manual-mode lifecycle. This includes exact fixed duties and custom curves. Failed requests and the ten-second Max test do not replace the remembered preference. Fan restoration is enabled by default, including when upgrading existing settings; it can be disabled on **Profiles**. Windows startup is set up automatically on the first supported release launch and keeps aero-control in the notification area without creating the control window. Opening the app later brings up that same running controller. Startup can be disabled or re-enabled on **Profiles**.
+
+Restoration happens **after Windows sign-in**, using the background app; the saved preference is not permanently stored in the firmware. In a Windows-startup session, **X** closes the control window and leaves the tray icon running. **Exit** from the tray menu stops the app without erasing the saved fan choice or disabling the next sign-in launch. A manual launch with **Keep in notification area** off exits when you click **X**. If the tray icon is missing, launch the app manually to open the existing controller and review its status.
 
 Named profiles also store an available CPU preset, the last locally requested GPU level and the charging policy. Saving a profile does not apply it. Full-profile startup/resume rules, charger switching and laptop hotkeys remain opt-in. Enabled full-profile rules take priority over fan-only restoration. Background resume handling, profile switching and tray operation require the app to remain running.
 
@@ -121,7 +133,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\test-gui.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\crates\aero-gui\tests\cpu_power_bridge.tests.ps1
 ```
 
-The GUI test helper compiles the actual GUI/session source into a test-only executable without the production administrator manifest. Tests use simulated hardware. Windows CI runs these checks and builds the release GUI; it does not validate laptop hardware. See [CONTRIBUTING.md](CONTRIBUTING.md).
+The GUI test helper compiles the actual GUI/session source into a test-only executable without the production administrator manifest. It locates dependencies from Cargo's reported artifacts, supporting the changed Rust 1.100 build layout as well as older toolchains. The default test run uses simulated hardware; separate opt-in Windows tests cover native window/tray lifecycle and read-only device/startup checks. Windows CI runs the default checks and builds the release GUI; it does not validate laptop hardware. See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 - [User guide](docs/USER_GUIDE.md)
 - [Architecture and implementation](docs/ARCHITECTURE.md)
